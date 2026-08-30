@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
 use crate::protocol::{is_found, parse_request, Request};
+
+const MAX_LINE_BYTES: u64 = 8192;
 
 pub struct Proxy {
     pub listen: String,
@@ -54,8 +56,16 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
 
     loop {
         line.clear();
-        let n = reader.read_until(b'\n', &mut line).await?;
+        let n = (&mut reader)
+            .take(MAX_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await?;
         if n == 0 {
+            break;
+        }
+
+        if !line.ends_with(b"\n") {
+            warn!(?peer, len = line.len(), "request line too long or missing newline");
             break;
         }
 

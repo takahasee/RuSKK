@@ -1,4 +1,7 @@
 /target
 /launchd/config.env
 .DS_Store
+._*
 *.log
+.vscode/
+.idea/
