@@ -1,10 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use clap::Parser;
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use skk_proxy::bayesian::BayesianPredictor;
 use skk_proxy::config::Args;
+use skk_proxy::frequency::FrequencyPredictor;
 use skk_proxy::proxy::Proxy;
 
 #[tokio::main]
@@ -19,8 +20,8 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let history_path = std::env::var("HOME")
         .ok()
-        .map(|h| std::path::PathBuf::from(h).join(".skk-proxy-bayesian.json"));
-    let predictor = Arc::new(Mutex::new(BayesianPredictor::new(history_path)));
+        .map(|h| std::path::PathBuf::from(h).join(".skk-proxy-frequency.json"));
+    let predictor = Arc::new(Mutex::new(FrequencyPredictor::new(history_path)));
 
     let proxy = Proxy {
         listen: args.listen.clone(),
@@ -31,4 +32,3 @@ async fn main() -> anyhow::Result<()> {
 
     proxy.run().await
 }
-

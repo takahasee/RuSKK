@@ -99,6 +99,9 @@ do_install() {
   render_plist "${ROOT}/launchd/com.skkproxy.skkserv.plist" \
     "${LAUNCH_AGENTS}/com.skkproxy.skkserv.plist"
 
+  bootout_if_loaded "com.skkproxy.yaskkserv2"
+  bootout_if_loaded "com.skkproxy.skkserv"
+
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.skkproxy.yaskkserv2.plist"
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.skkproxy.skkserv.plist"
 

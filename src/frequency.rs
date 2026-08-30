@@ -1,32 +1,53 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex;
 use tracing::debug;
 
-/// Bayesian frequency-based predictor for candidate ranking.
+const SAVE_INTERVAL: u32 = 10;
+const LEGACY_HISTORY_FILE: &str = ".skk-proxy-bayesian.json";
+
+/// Frequency-based predictor for completion candidate ranking.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-pub struct BayesianPredictor {
+pub struct FrequencyPredictor {
     /// Mapping of midashi -> (candidate -> count)
     pub frequencies: HashMap<String, HashMap<String, u64>>,
     #[serde(skip)]
     pub storage_path: Option<PathBuf>,
+    #[serde(skip)]
+    pending_saves: u32,
 }
 
-impl BayesianPredictor {
+impl FrequencyPredictor {
     pub fn new(storage_path: Option<PathBuf>) -> Self {
         let mut predictor = Self {
             frequencies: HashMap::new(),
             storage_path,
+            pending_saves: 0,
         };
         if let Some(ref path) = predictor.storage_path.clone() {
-            if let Err(err) = predictor.load(path) {
-                debug!(error = %err, "no existing bayesian data loaded, starting fresh");
+            if let Err(err) = predictor.load_with_legacy_fallback(path) {
+                debug!(error = %err, "no existing frequency data loaded, starting fresh");
             }
         }
         predictor
+    }
+
+    fn load_with_legacy_fallback(&mut self, path: &Path) -> anyhow::Result<()> {
+        if path.exists() {
+            return self.load(path);
+        }
+        if let Some(home) = path.parent() {
+            let legacy = home.join(LEGACY_HISTORY_FILE);
+            if legacy.exists() {
+                debug!(from = %legacy.display(), to = %path.display(), "migrating legacy history file");
+                return self.load(&legacy);
+            }
+        }
+        Ok(())
     }
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
@@ -50,14 +71,18 @@ impl BayesianPredictor {
         Ok(())
     }
 
-    /// Record selection of candidate for midashi
+    /// Record an implicit selection when lookup returns exactly one candidate.
     pub fn observe(&mut self, midashi: &str, candidate: &str) {
         let entry = self
             .frequencies
             .entry(midashi.to_string())
             .or_insert_with(HashMap::new);
         *entry.entry(candidate.to_string()).or_insert(0) += 1;
-        let _ = self.save();
+        self.pending_saves += 1;
+        if self.pending_saves >= SAVE_INTERVAL {
+            let _ = self.save();
+            self.pending_saves = 0;
+        }
     }
 
     /// Rank candidates according to historical selection frequencies.
@@ -78,29 +103,29 @@ impl BayesianPredictor {
             })
             .collect();
 
-        // Sort descending by count, then ascending by original index (stable sort)
         indexed_cands.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-        indexed_cands.into_iter().map(|(_, cand, _)| cand.clone()).collect()
+        indexed_cands
+            .into_iter()
+            .map(|(_, cand, _)| cand.clone())
+            .collect()
     }
 }
 
-pub type SharedPredictor = Arc<Mutex<BayesianPredictor>>;
+pub type SharedPredictor = Arc<Mutex<FrequencyPredictor>>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_predictor_ranking() {
-        let mut predictor = BayesianPredictor::new(None);
+    fn predictor_ranking_by_frequency() {
+        let mut predictor = FrequencyPredictor::new(None);
         let candidates = vec!["愛".to_string(), "相".to_string(), "藍".to_string()];
 
-        // Initial ranking should preserve original order
         let ranked = predictor.rank_candidates("あい", &candidates);
         assert_eq!(ranked, vec!["愛", "相", "藍"]);
 
-        // Observe "相" twice and "藍" 5 times
         predictor.observe("あい", "相");
         predictor.observe("あい", "相");
         predictor.observe("あい", "藍");

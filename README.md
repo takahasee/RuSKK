@@ -10,7 +10,9 @@ macSKK  →  skk-proxy(:1178)  →  azoo-key-skkserv(:1180)   # primary
 
 ## 特徴
 
-- 順次フォールバック（azookey → yaskkserv2）
+- 順次フォールバック（azookey → yaskkserv2）— opcode `1`（変換）
+- opcode `4`（補完）は両バックエンドを並列照会し、候補をマージ・重複除去
+- 補完候補は過去の選択頻度で並べ替え（`~/.skk-proxy-frequency.json`）
 - クライアントへの応答は **UTF-8**
 - azoo-key-skkserv の UTF-8 応答はそのまま転送
 - yaskkserv2 の EUC-JP 応答は UTF-8 に変換
@@ -97,10 +99,11 @@ skk-proxy は azooKey SKKServ (:1180) と yaskkserv2 (:1179) の起動を待っ�
 | opcode | 動作 |
 |--------|------|
 | `0` | 切断 |
-| `1` | 変換候補検索（フォールバック付き） |
+| `1` | 変換候補検索（順次フォールバック: azookey → yaskkserv2） |
 | `2` | `skk-proxy/0.1.0 ` を返却 |
 | `3` | ホスト情報を返却 |
-| `4` | サーバー補完（フォールバック付き） |
+| `4` | サーバー補完（両バックエンドを並列照会 → マージ → 頻度で並べ替え） |
 
-primary がタイムアウト・接続失敗・`4`（未検出）の場合に fallback を照会します。  
-両方失敗した場合は `4\n` を返します。
+opcode `1` では primary がタイムアウト・接続失敗・`4`（未検出）の場合に fallback を照会します。  
+opcode `4` では両方の結果を統合し、過去に候補が1件だけ返った変換（暗黙の選択）を学習して補完候補を並べ替えます。  
+履歴は `~/.skk-proxy-frequency.json` に保存されます（旧 `~/.skk-proxy-bayesian.json` から自動移行）。

@@ -72,7 +72,10 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 
-/// Parse a UTF-8 candidate response (e.g. `1/cand1/cand2/\n`) into a list of candidate strings.
+/// Decode a midashi from request bytes (EUC-JP or UTF-8) into UTF-8.
+pub fn decode_midashi(bytes: &[u8]) -> String {
+    decode_euc_or_utf8(bytes)
+}
 pub fn parse_candidates(response: &[u8]) -> Vec<String> {
     if !response.starts_with(b"1") {
         return Vec::new();
@@ -138,6 +141,13 @@ mod tests {
     #[test]
     fn response_not_found_plain() {
         assert_eq!(response_euc_to_utf8(b"4\n"), b"4\n");
+    }
+
+    #[test]
+    fn decode_midashi_euc_jp() {
+        // "あい" in EUC-JP
+        let midashi = [0xA4, 0xA2, 0xA4, 0xA4];
+        assert_eq!(decode_midashi(&midashi), "あい");
     }
 
     #[test]

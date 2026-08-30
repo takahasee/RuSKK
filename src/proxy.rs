@@ -5,8 +5,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
-use crate::bayesian::SharedPredictor;
-use crate::encoding::{format_candidates_response, merge_candidates, parse_candidates};
+use crate::encoding::{decode_midashi, format_candidates_response, merge_candidates, parse_candidates};
+use crate::frequency::SharedPredictor;
 use crate::protocol::{is_found, parse_request, Request};
 
 const MAX_LINE_BYTES: u64 = 8192;
@@ -93,9 +93,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 break;
             }
             Request::Version => {
-                writer
-                    .write_all(b"skk-proxy/0.1.0 ")
-                    .await?;
+                writer.write_all(b"skk-proxy/0.1.0 ").await?;
             }
             Request::Host => {
                 let host = format!("skk-proxy/{}: ", proxy.listen);
@@ -104,13 +102,12 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
             Request::Lookup(ref midashi) => {
                 let response = lookup_with_fallback(&proxy, &request).await;
                 if is_found(&response) {
-                    if let Ok(midashi_str) = std::str::from_utf8(midashi) {
-                        let cands = parse_candidates(&response);
-                        if let Some(first) = cands.first() {
-                            if let Ok(mut guard) = proxy.predictor.lock() {
-                                guard.observe(midashi_str, first);
-                            }
-                        }
+                    let cands = parse_candidates(&response);
+                    // Only learn when there is a single candidate (implicit selection).
+                    if cands.len() == 1 {
+                        let midashi_str = decode_midashi(midashi);
+                        let mut guard = proxy.predictor.lock().await;
+                        guard.observe(&midashi_str, &cands[0]);
                     }
                 }
                 writer.write_all(&response).await?;
@@ -137,7 +134,7 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
                 backend = %proxy.primary.name,
                 "miss, trying fallback"
             );
-            let _ = response; // not-found; fall through
+            let _ = response;
         }
         Err(err) => {
             warn!(
@@ -170,8 +167,8 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
 
 async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8> {
     let midashi_str = match request {
-        Request::Completion(midashi) => std::str::from_utf8(midashi).unwrap_or(""),
-        _ => "",
+        Request::Completion(midashi) => decode_midashi(midashi),
+        _ => String::new(),
     };
 
     let primary_fut = proxy.primary.query(request);
@@ -195,8 +192,8 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8
 
     let merged = merge_candidates(&primary_cands, &fallback_cands);
     let ranked = {
-        let guard = proxy.predictor.lock().unwrap();
-        guard.rank_candidates(midashi_str, &merged)
+        let guard = proxy.predictor.lock().await;
+        guard.rank_candidates(&midashi_str, &merged)
     };
 
     debug!(
@@ -208,5 +205,3 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8
 
     format_candidates_response(&ranked)
 }
-
-
