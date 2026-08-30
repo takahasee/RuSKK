@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.skkproxy.skkserv</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@WAIT_SCRIPT@</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SKK_PROXY_BIN</key>
+        <string>@SKK_PROXY_BIN@</string>
+        <key>AZOOKEY_HOST</key>
+        <string>127.0.0.1</string>
+        <key>AZOOKEY_PORT</key>
+        <string>1180</string>
+        <key>YASKKSERV2_HOST</key>
+        <string>127.0.0.1</string>
+        <key>YASKKSERV2_PORT</key>
+        <string>1179</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/skk-proxy.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/skk-proxy.err.log</string>
+</dict>
+</plist>

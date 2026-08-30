@@ -1,0 +1,4 @@
+/target
+/launchd/config.env
+.DS_Store
+*.log

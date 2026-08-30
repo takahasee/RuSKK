@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.skkproxy.yaskkserv2</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@YASKKSERV2_BIN@</string>
+        <string>--port</string>
+        <string>1179</string>
+        <string>--google-suggest</string>
+        <string>@YASKKSERV2_DICTIONARY@</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/yaskkserv2.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/yaskkserv2.err.log</string>
+</dict>
+</plist>
