@@ -5,6 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
+use crate::encoding::{format_candidates_response, merge_candidates, parse_candidates};
 use crate::protocol::{is_found, parse_request, Request};
 
 const MAX_LINE_BYTES: u64 = 8192;
@@ -98,8 +99,12 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let host = format!("skk-proxy/{}: ", proxy.listen);
                 writer.write_all(host.as_bytes()).await?;
             }
-            Request::Lookup(_) | Request::Completion(_) => {
+            Request::Lookup(_) => {
                 let response = lookup_with_fallback(&proxy, &request).await;
+                writer.write_all(&response).await?;
+            }
+            Request::Completion(_) => {
+                let response = completion_with_aggregation(&proxy, &request).await;
                 writer.write_all(&response).await?;
             }
         }
@@ -150,3 +155,35 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
         }
     }
 }
+
+async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8> {
+    let primary_fut = proxy.primary.query(request);
+    let fallback_fut = proxy.fallback.query(request);
+
+    let (primary_res, fallback_res) = tokio::join!(primary_fut, fallback_fut);
+
+    let primary_cands = match primary_res {
+        Ok(resp) if is_found(&resp) => parse_candidates(&resp),
+        _ => Vec::new(),
+    };
+
+    let fallback_cands = match fallback_res {
+        Ok(resp) if is_found(&resp) => parse_candidates(&resp),
+        _ => Vec::new(),
+    };
+
+    if primary_cands.is_empty() && fallback_cands.is_empty() {
+        return b"4\n".to_vec();
+    }
+
+    let merged = merge_candidates(&primary_cands, &fallback_cands);
+    debug!(
+        primary_count = primary_cands.len(),
+        fallback_count = fallback_cands.len(),
+        merged_count = merged.len(),
+        "completion candidates aggregated"
+    );
+
+    format_candidates_response(&merged)
+}
+

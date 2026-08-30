@@ -72,6 +72,49 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
     bytes.strip_suffix(b"\n").unwrap_or(bytes)
 }
 
+/// Parse a UTF-8 candidate response (e.g. `1/cand1/cand2/\n`) into a list of candidate strings.
+pub fn parse_candidates(response: &[u8]) -> Vec<String> {
+    if !response.starts_with(b"1") {
+        return Vec::new();
+    }
+    let body = trim_trailing_newline(&response[1..]);
+    body.split(|&b| b == b'/')
+        .skip(1)
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| std::str::from_utf8(part).ok().map(|s| s.to_string()))
+        .collect()
+}
+
+/// Format a list of candidates into an skkserv response (e.g. `1/cand1/cand2/\n`).
+pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
+    if candidates.is_empty() {
+        return b"4\n".to_vec();
+    }
+    let mut out = Vec::new();
+    out.push(b'1');
+    for cand in candidates {
+        out.push(b'/');
+        out.extend_from_slice(cand.as_bytes());
+    }
+    out.push(b'/');
+    out.push(b'\n');
+    out
+}
+
+/// Merge candidate lists from primary and fallback, preserving order and removing duplicates.
+pub fn merge_candidates(primary: &[String], fallback: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(primary.len() + fallback.len());
+    let mut seen = std::collections::HashSet::new();
+
+    for cand in primary.iter().chain(fallback.iter()) {
+        if seen.insert(cand) {
+            merged.push(cand.clone());
+        }
+    }
+    merged
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,4 +139,19 @@ mod tests {
     fn response_not_found_plain() {
         assert_eq!(response_euc_to_utf8(b"4\n"), b"4\n");
     }
+
+    #[test]
+    fn test_merge_candidates_dedup() {
+        let primary = vec!["あい".to_string(), "愛".to_string()];
+        let fallback = vec!["愛".to_string(), "相".to_string(), "藍".to_string()];
+        let merged = merge_candidates(&primary, &fallback);
+        assert_eq!(merged, vec!["あい", "愛", "相", "藍"]);
+
+        let formatted = format_candidates_response(&merged);
+        assert_eq!(formatted, "1/あい/愛/相/藍/\n".as_bytes());
+
+        let parsed = parse_candidates(&formatted);
+        assert_eq!(parsed, merged);
+    }
 }
+

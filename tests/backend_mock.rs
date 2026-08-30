@@ -79,3 +79,22 @@ async fn spawn_mock(handler: fn(&[u8]) -> Vec<u8>) -> SocketAddr {
     });
     addr
 }
+
+#[test]
+fn test_completion_merge_logic() {
+    let primary_resp = b"1/\xe3\x81\x82/\xe3\x81\x84/\n"; // 1/あ/い/
+    let fallback_resp = vec![b'1', b'/', 0xA4, 0xA4, b'/', 0xA4, 0xA6, b'/', b'\n']; // 1/い/う/ in EUC-JP
+
+    let primary_utf8 = skk_proxy::encoding::response_euc_to_utf8(primary_resp);
+    let fallback_utf8 = skk_proxy::encoding::response_euc_to_utf8(&fallback_resp);
+
+    let primary_cands = skk_proxy::encoding::parse_candidates(&primary_utf8);
+    let fallback_cands = skk_proxy::encoding::parse_candidates(&fallback_utf8);
+
+    let merged = skk_proxy::encoding::merge_candidates(&primary_cands, &fallback_cands);
+    assert_eq!(merged, vec!["あ", "い", "う"]);
+
+    let formatted = skk_proxy::encoding::format_candidates_response(&merged);
+    assert_eq!(formatted, "1/あ/い/う/\n".as_bytes());
+}
+
