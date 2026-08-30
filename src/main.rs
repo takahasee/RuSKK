@@ -1,6 +1,9 @@
+use std::sync::{Arc, Mutex};
+
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
+use skk_proxy::bayesian::BayesianPredictor;
 use skk_proxy::config::Args;
 use skk_proxy::proxy::Proxy;
 
@@ -14,11 +17,18 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let history_path = std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".skk-proxy-bayesian.json"));
+    let predictor = Arc::new(Mutex::new(BayesianPredictor::new(history_path)));
+
     let proxy = Proxy {
         listen: args.listen.clone(),
         primary: args.primary(),
         fallback: args.fallback(),
+        predictor,
     };
 
     proxy.run().await
 }
+

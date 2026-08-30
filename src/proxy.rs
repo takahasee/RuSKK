@@ -5,6 +5,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
+use crate::bayesian::SharedPredictor;
 use crate::encoding::{format_candidates_response, merge_candidates, parse_candidates};
 use crate::protocol::{is_found, parse_request, Request};
 
@@ -14,6 +15,7 @@ pub struct Proxy {
     pub listen: String,
     pub primary: Backend,
     pub fallback: Backend,
+    pub predictor: SharedPredictor,
 }
 
 impl Proxy {
@@ -99,8 +101,18 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let host = format!("skk-proxy/{}: ", proxy.listen);
                 writer.write_all(host.as_bytes()).await?;
             }
-            Request::Lookup(_) => {
+            Request::Lookup(ref midashi) => {
                 let response = lookup_with_fallback(&proxy, &request).await;
+                if is_found(&response) {
+                    if let Ok(midashi_str) = std::str::from_utf8(midashi) {
+                        let cands = parse_candidates(&response);
+                        if let Some(first) = cands.first() {
+                            if let Ok(mut guard) = proxy.predictor.lock() {
+                                guard.observe(midashi_str, first);
+                            }
+                        }
+                    }
+                }
                 writer.write_all(&response).await?;
             }
             Request::Completion(_) => {
@@ -157,6 +169,11 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
 }
 
 async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8> {
+    let midashi_str = match request {
+        Request::Completion(midashi) => std::str::from_utf8(midashi).unwrap_or(""),
+        _ => "",
+    };
+
     let primary_fut = proxy.primary.query(request);
     let fallback_fut = proxy.fallback.query(request);
 
@@ -177,13 +194,19 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8
     }
 
     let merged = merge_candidates(&primary_cands, &fallback_cands);
+    let ranked = {
+        let guard = proxy.predictor.lock().unwrap();
+        guard.rank_candidates(midashi_str, &merged)
+    };
+
     debug!(
         primary_count = primary_cands.len(),
         fallback_count = fallback_cands.len(),
         merged_count = merged.len(),
-        "completion candidates aggregated"
+        "completion candidates aggregated and ranked"
     );
 
-    format_candidates_response(&merged)
+    format_candidates_response(&ranked)
 }
+
 
