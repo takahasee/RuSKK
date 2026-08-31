@@ -56,6 +56,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
+    let mut session_context: Vec<String> = Vec::new();
 
     loop {
         line.clear();
@@ -103,17 +104,22 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let response = lookup_with_fallback(&proxy, &request).await;
                 if is_found(&response) {
                     let cands = parse_candidates(&response);
-                    // Only learn when there is a single candidate (implicit selection).
-                    if cands.len() == 1 {
+                    if let Some(first_cand) = cands.first() {
                         let midashi_str = decode_midashi(midashi);
                         let mut guard = proxy.predictor.lock().await;
-                        guard.observe(&midashi_str, &cands[0]);
+                        guard.observe(&session_context, &midashi_str, first_cand);
+
+                        // Record kanji context
+                        session_context.push(first_cand.clone());
+                        if session_context.len() > 3 {
+                            session_context.remove(0);
+                        }
                     }
                 }
                 writer.write_all(&response).await?;
             }
             Request::Completion(_) => {
-                let response = completion_with_aggregation(&proxy, &request).await;
+                let response = completion_with_aggregation(&proxy, &request, &session_context).await;
                 writer.write_all(&response).await?;
             }
         }
@@ -165,7 +171,7 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
     }
 }
 
-async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8> {
+async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: &[String]) -> Vec<u8> {
     let midashi_str = match request {
         Request::Completion(midashi) => decode_midashi(midashi),
         _ => String::new(),
@@ -193,7 +199,7 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8
     let merged = merge_candidates(&primary_cands, &fallback_cands);
     let ranked = {
         let guard = proxy.predictor.lock().await;
-        guard.rank_candidates(&midashi_str, &merged)
+        guard.rank_candidates(context, &midashi_str, &merged)
     };
 
     debug!(
@@ -205,3 +211,4 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request) -> Vec<u8
 
     format_candidates_response(&ranked)
 }
+
