@@ -318,11 +318,14 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
     client.write_all(b"1hontou \n").await.unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
-    // Idle for 1.2s — if any completion lookup was erroneously treated as a regular conversion,
-    // the 1.0s debounce flush would have auto-confirmed it!
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Single-char preview lookup (like typing 1st char "れ" or "か" where macSKK sends 1<char> without opcode 4)
+    client.write_all("1れ \n".as_bytes()).await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
 
-    // Verify completion lookups are NEVER observed or confirmed!
+    // Idle for 3.2s (> 3.0s debounce timeout)
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+
+    // Verify completion lookups and single-char preview are NEVER observed or confirmed!
     {
         let guard = shared_predictor.lock().await;
         assert_eq!(
@@ -340,6 +343,11 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
             0,
             "Local dict completion lookup 'hontou' must NOT be auto-confirmed"
         );
+        assert_eq!(
+            guard.frequencies.get("れ").map(|m| m.values().sum::<u64>()).unwrap_or(0),
+            0,
+            "Single-char preview lookup 'れ' must NOT be auto-confirmed"
+        );
     }
 
     // 2. Now send a REGULAR user conversion lookup "1fuku \n"
@@ -349,8 +357,8 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
     assert_eq!(resp, "1/服/\n");
 
     // Client stays connected (like macSKK connection pool).
-    // Wait for the 1.0s timeout flush to trigger!
-    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // Wait for the 3.0s timeout flush to trigger!
+    tokio::time::sleep(Duration::from_millis(3200)).await;
 
     // Verify "fuku" -> "服" was automatically flushed to predictor on idle timeout!
     {

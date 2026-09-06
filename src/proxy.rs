@@ -74,9 +74,9 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
         line.clear();
 
         // macSKK は TCP 接続を切断せず使い回すため、
-        // ユーザーが入力・確定後に放置した場合に備えて 1.0 秒無入力で自動 flush する。
+        // ユーザーが入力・確定後に放置した場合に備えて 3.0 秒無入力で自動 flush する。
         let timeout_duration = if pending.is_some() {
-            Duration::from_millis(1000)
+            Duration::from_millis(3000)
         } else {
             Duration::from_secs(3600)
         };
@@ -156,7 +156,15 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                         .map(|t| now.duration_since(t) < Duration::from_millis(200))
                         .unwrap_or(false);
 
-                let is_completion_refer = is_in_recent_completions || is_prefix_completion || is_rapid_burst;
+                // 4. macSKK がキー入力開始時（1文字目）に補完パネルを出すために自動送信してくる1文字Lookup
+                // （例: "か", "れ", "に", "ほ" 等）。送りあり（例: "きr"）は2文字なので除外されない。
+                let is_single_char_preview = midashi_str.chars().count() == 1
+                    && midashi_str.chars().next().map(|c| !c.is_ascii()).unwrap_or(false);
+
+                let is_completion_refer = is_in_recent_completions
+                    || is_prefix_completion
+                    || is_rapid_burst
+                    || is_single_char_preview;
                 last_lookup_time = Some(now);
 
                 if is_completion_refer {
@@ -165,9 +173,18 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                         in_recent = is_in_recent_completions,
                         is_prefix = is_prefix_completion,
                         is_burst = is_rapid_burst,
+                        single_char = is_single_char_preview,
                         "ignored completion refer lookup from learning"
                     );
                 } else {
+                    // もし今回の見出し語が直前の保留見出し語を延長したもの（例: "か" -> "かって"）なら、
+                    // 直前の保留は入力途中の文字に過ぎないため、確定（flush）せずに破棄する。
+                    if let Some(ref p) = pending {
+                        if midashi_str.starts_with(&p.midashi) && midashi_str != p.midashi {
+                            debug!(prev = %p.midashi, curr = %midashi_str, "discarding typing-in-progress pending without flush");
+                            pending = None;
+                        }
+                    }
                     // 通常変換（ユーザーによる明示的な変換）が来た時だけ、直前の確定候補を flush する
                     flush_pending(&proxy, &mut pending).await;
                 }
