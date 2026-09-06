@@ -256,6 +256,13 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
                         } else if req.starts_with(b"1fuku") {
                             let resp = "1/服/\n".as_bytes();
                             let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"4katte") {
+                            // Completion returning the word itself as well as candidates
+                            let resp = "1/katte/kattekimama/かって/かってきまま/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"1katte") {
+                            let resp = "1/買って/勝手/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -367,6 +374,40 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
             guard.frequencies.get("fuku").and_then(|m| m.get("服")).copied().unwrap_or(0),
             1,
             "Regular conversion 'fuku' -> '服' must be flushed on idle timeout without closing TCP connection"
+        );
+    }
+
+    // 3. User types "katte": macSKK sends completion "4katte \n"
+    client.write_all(b"4katte \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // macSKK sends background lookup for completion candidate "kattekimama"
+    client.write_all(b"1kattekimama \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // User hits Space to convert the typed word "katte" -> sends "1katte \n"
+    client.write_all(b"1katte \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("買って"));
+
+    // Wait for the 3.0s debounce flush
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+
+    // Verify:
+    // - "kattekimama" is NOT confirmed
+    // - "katte" -> "買って" IS confirmed!
+    {
+        let guard = shared_predictor.lock().await;
+        assert_eq!(
+            guard.frequencies.get("kattekimama").map(|m| m.values().sum::<u64>()).unwrap_or(0),
+            0,
+            "Completion lookup 'kattekimama' must NOT be auto-confirmed"
+        );
+        assert_eq!(
+            guard.frequencies.get("katte").and_then(|m| m.get("買って")).copied().unwrap_or(0),
+            1,
+            "Regular conversion 'katte' -> '買って' MUST be confirmed even though 4katte preceded it!"
         );
     }
 

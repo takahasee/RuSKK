@@ -66,8 +66,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
 
     // macSKK の補完（Completion）クエリを検出・除外するためのトラッキング
     let mut recent_completions: HashMap<String, Instant> = HashMap::new();
-    let mut recent_completion_prefixes: Vec<(String, Instant)> = Vec::new();
-    let mut last_completion_time: Option<Instant> = None;
+    let mut last_completion: Option<(String, Instant)> = None;
     let mut last_lookup_time: Option<Instant> = None;
 
     loop {
@@ -132,26 +131,50 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let now = Instant::now();
                 let midashi_str = decode_midashi(midashi);
 
-                // 有効期限（5秒）の切れた古い補完情報を掃除
-                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
-                recent_completion_prefixes.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(5));
+                // 有効期限（3秒）の切れた古い補完情報を掃除
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3));
+
+                let is_okuri = is_okuri_midashi(&midashi_str);
+
+                // 直近 2 秒以内の最新 Completion prefix と完全に一致するか判定
+                // （一致する場合は、ユーザーが今まさにスペースキーで確定・変換しようとしている通常変換）
+                let is_same_as_prefix = last_completion
+                    .as_ref()
+                    .map(|(prefix, time)| {
+                        now.duration_since(*time) < Duration::from_millis(2000)
+                            && &midashi_str == prefix
+                    })
+                    .unwrap_or(false);
 
                 // --- macSKK の補完クエリ（裏で自動送信される展開 Lookup）の除外判定 ---
-                // 1. 直近 5 秒以内に返した補完候補一覧に含まれているか（skkserv返却の補完候補）
-                let is_in_recent_completions = recent_completions.contains_key(&midashi_str);
+                // 1. 直近 3 秒以内に返した補完候補一覧に含まれているか（skkserv返却の補完候補）
+                // ただし、直前の prefix と一致する場合や送りあり変換は通常変換なので除外しない！
+                let is_in_recent_completions = !is_same_as_prefix
+                    && !is_okuri
+                    && recent_completions.contains_key(&midashi_str);
 
-                // 2. 直近 5 秒以内の Completion prefix に前方一致し、かつ prefix より長い単語か（ローカル辞書由来の補完候補）
-                // ※送りあり変換（末尾が英字）はユーザーの通常変換なので除外
-                let is_okuri = is_okuri_midashi(&midashi_str);
+                // 2. 直近の最新 Completion prefix より長い単語か（ローカル辞書由来の補完候補）
+                // ※直近 2 秒以内の最新 Completion 1件のみを参照。過去の prefix リストは参照しない！
+                // ※通常変換は midashi == prefix となるため除外されない。
                 let is_prefix_completion = !is_okuri
-                    && recent_completion_prefixes.iter().any(|(prefix, _)| {
-                        midashi_str.starts_with(prefix) && midashi_str != *prefix
-                    });
+                    && last_completion
+                        .as_ref()
+                        .map(|(prefix, time)| {
+                            now.duration_since(*time) < Duration::from_millis(2000)
+                                && !prefix.is_empty()
+                                && midashi_str.starts_with(prefix)
+                                && midashi_str != *prefix
+                        })
+                        .unwrap_or(false);
 
-                // 3. 直近 3 秒以内に Completion があり、かつ 200ms 未満のバースト Lookup か
-                let is_rapid_burst = last_completion_time
-                    .map(|t| now.duration_since(t) < Duration::from_secs(3))
-                    .unwrap_or(false)
+                // 3. 直近 2 秒以内に Completion があり、かつ 200ms 未満のバースト Lookup か
+                // （※prefix と一致する通常変換はバースト除外対象としない）
+                let is_rapid_burst = !is_same_as_prefix
+                    && !is_okuri
+                    && last_completion
+                        .as_ref()
+                        .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(2000))
+                        .unwrap_or(false)
                     && last_lookup_time
                         .map(|t| now.duration_since(t) < Duration::from_millis(200))
                         .unwrap_or(false);
@@ -167,13 +190,21 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                     || is_single_char_preview;
                 last_lookup_time = Some(now);
 
+                info!(
+                    midashi = %midashi_str,
+                    is_comp = is_completion_refer,
+                    same_prefix = is_same_as_prefix,
+                    in_recent = is_in_recent_completions,
+                    is_prefix = is_prefix_completion,
+                    is_burst = is_rapid_burst,
+                    single_char = is_single_char_preview,
+                    last_comp_prefix = ?last_completion.as_ref().map(|(p, _)| p),
+                    "lookup referral check"
+                );
+
                 if is_completion_refer {
                     debug!(
                         midashi = %midashi_str,
-                        in_recent = is_in_recent_completions,
-                        is_prefix = is_prefix_completion,
-                        is_burst = is_rapid_burst,
-                        single_char = is_single_char_preview,
                         "ignored completion refer lookup from learning"
                     );
                 } else {
@@ -235,22 +266,18 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let prefix_str = decode_midashi(prefix_bytes);
                 let (response, completions) = completion_with_aggregation(&proxy, &request, &session_context).await;
                 let now = Instant::now();
-                last_completion_time = Some(now);
+                last_completion = Some((prefix_str.clone(), now));
 
-                // 5秒以上経過した古いプレフィックスを削除し、最新を追加
-                recent_completion_prefixes.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(5));
-                if !prefix_str.is_empty() {
-                    recent_completion_prefixes.push((prefix_str, now));
-                }
-
-                // 5秒以上経過した古い補完候補を削除し、最新を追加
-                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
+                // 3秒以上経過した古い補完候補を削除し、最新を追加
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3));
                 for cand in completions {
                     let clean = cand.split(';').next().unwrap_or(&cand).trim().to_string();
-                    if !clean.is_empty() {
+                    if !clean.is_empty() && clean != prefix_str {
                         recent_completions.insert(clean, now);
                     }
-                    recent_completions.insert(cand, now);
+                    if cand != prefix_str {
+                        recent_completions.insert(cand, now);
+                    }
                 }
                 writer.write_all(&response).await?;
             }
