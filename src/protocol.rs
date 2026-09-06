@@ -74,6 +74,36 @@ pub fn encode_request(request: &Request) -> Vec<u8> {
     }
 }
 
+/// EUC-JP バックエンド（yaskkserv2）向けにリクエストを構築する。
+/// 見出し語を UTF-8 から EUC-JP にエンコードして送信する。
+pub fn encode_request_for_encoding(request: &Request) -> Vec<u8> {
+    use crate::encoding::encode_euc_jp;
+
+    match request {
+        Request::End => b"0 \n".to_vec(),
+        Request::Lookup(midashi) => {
+            let midashi_utf8 = String::from_utf8_lossy(midashi);
+            let euc_midashi = encode_euc_jp(&midashi_utf8);
+            let mut buf = Vec::with_capacity(euc_midashi.len() + 3);
+            buf.push(b'1');
+            buf.extend_from_slice(&euc_midashi);
+            buf.extend_from_slice(b" \n");
+            buf
+        }
+        Request::Version => b"2 \n".to_vec(),
+        Request::Host => b"3 \n".to_vec(),
+        Request::Completion(midashi) => {
+            let midashi_utf8 = String::from_utf8_lossy(midashi);
+            let euc_midashi = encode_euc_jp(&midashi_utf8);
+            let mut buf = Vec::with_capacity(euc_midashi.len() + 3);
+            buf.push(b'4');
+            buf.extend_from_slice(&euc_midashi);
+            buf.extend_from_slice(b" \n");
+            buf
+        }
+    }
+}
+
 pub fn is_found(response: &[u8]) -> bool {
     response.first() == Some(&b'1')
 }

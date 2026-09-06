@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::encoding::response_euc_to_utf8;
-use crate::protocol::{encode_request, Request};
+use crate::protocol::{encode_request, encode_request_for_encoding, Request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamEncoding {
@@ -46,7 +46,11 @@ pub enum BackendError {
 
 impl Backend {
     pub async fn query(&self, request: &Request) -> Result<Vec<u8>, BackendError> {
-        let wire = encode_request(request);
+        // EUC-JP バックエンド（yaskkserv2）の場合、見出し語を EUC-JP にエンコードして送信
+        let wire = match self.encoding {
+            UpstreamEncoding::EucJp => encode_request_for_encoding(request),
+            UpstreamEncoding::Utf8 => encode_request(request),
+        };
         debug!(
             backend = %self.name,
             addr = %self.addr,

@@ -101,22 +101,41 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 writer.write_all(host.as_bytes()).await?;
             }
             Request::Lookup(ref midashi) => {
-                let response = lookup_with_fallback(&proxy, &request).await;
-                if is_found(&response) {
+                let midashi_str = decode_midashi(midashi);
+                let (response, hit) = lookup_with_fallback(&proxy, &request).await;
+                let final_response = if is_found(&response) {
                     let cands = parse_candidates(&response);
-                    if let Some(first_cand) = cands.first() {
-                        let midashi_str = decode_midashi(midashi);
-                        let mut guard = proxy.predictor.lock().await;
-                        guard.observe(&session_context, &midashi_str, first_cand);
+                    if !cands.is_empty() {
+                        // yaskkserv2（Fallback）ヒット時のみベイズ推定で候補を並び替え。
+                        // azooKey（Primary）ヒット時は azooKey の候補順序を維持する。
+                        let ranked = if hit == BackendHit::Fallback {
+                            let guard = proxy.predictor.lock().await;
+                            guard.rank_candidates(&session_context, &midashi_str, &cands)
+                        } else {
+                            cands
+                        };
 
-                        // Record kanji context
-                        session_context.push(first_cand.clone());
-                        if session_context.len() > 3 {
-                            session_context.remove(0);
+                        if let Some(top_cand) = ranked.first() {
+                            // yaskkserv2（Fallback）ヒット時のみ履歴ファイルに学習データを記録。
+                            // azooKey の日常単語で履歴を汚染しない。
+                            if hit == BackendHit::Fallback {
+                                info!(midashi = %midashi_str, top_cand = %top_cand, context = ?session_context, "recorded yaskkserv2 selection to history");
+                                let mut guard = proxy.predictor.lock().await;
+                                guard.observe(&session_context, &midashi_str, top_cand);
+                            }
+
+                            // 直前の漢字文脈を1単語のみ保持
+                            session_context.clear();
+                            session_context.push(top_cand.clone());
                         }
+                        format_candidates_response(&ranked)
+                    } else {
+                        response
                     }
-                }
-                writer.write_all(&response).await?;
+                } else {
+                    response
+                };
+                writer.write_all(&final_response).await?;
             }
             Request::Completion(_) => {
                 let response = completion_with_aggregation(&proxy, &request, &session_context).await;
@@ -129,18 +148,27 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     Ok(())
 }
 
-async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
+/// どのバックエンドが応答したかを示す列挙型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendHit {
+    Primary,
+    Fallback,
+    None,
+}
+
+/// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
+/// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
+async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, BackendHit) {
     match proxy.primary.query(request).await {
         Ok(response) if is_found(&response) => {
             debug!(backend = %proxy.primary.name, "hit");
-            return response;
+            return (response, BackendHit::Primary);
         }
-        Ok(response) => {
+        Ok(_) => {
             debug!(
                 backend = %proxy.primary.name,
                 "miss, trying fallback"
             );
-            let _ = response;
         }
         Err(err) => {
             warn!(
@@ -153,12 +181,14 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
 
     match proxy.fallback.query(request).await {
         Ok(response) => {
-            if is_found(&response) {
+            let hit = if is_found(&response) {
                 debug!(backend = %proxy.fallback.name, "hit");
+                BackendHit::Fallback
             } else {
                 debug!(backend = %proxy.fallback.name, "miss");
-            }
-            response
+                BackendHit::None
+            };
+            (response, hit)
         }
         Err(err) => {
             warn!(
@@ -166,7 +196,7 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> Vec<u8> {
                 error = %err,
                 "fallback failed"
             );
-            b"4\n".to_vec()
+            (b"4\n".to_vec(), BackendHit::None)
         }
     }
 }
