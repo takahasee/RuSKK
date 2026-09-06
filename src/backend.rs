@@ -12,9 +12,11 @@ use crate::protocol::{encode_request, encode_request_for_encoding, Request};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamEncoding {
-    /// Responses are already UTF-8 (azoo-key-skkserv).
+    /// Request: UTF-8, Response: UTF-8
     Utf8,
-    /// Responses are EUC-JP and must be converted to UTF-8 (yaskkserv2).
+    /// Request: EUC-JP, Response: UTF-8 (azoo-key-skkserv)
+    EucJpRequestUtf8Response,
+    /// Request: EUC-JP, Response: EUC-JP (yaskkserv2)
     EucJp,
 }
 
@@ -46,9 +48,11 @@ pub enum BackendError {
 
 impl Backend {
     pub async fn query(&self, request: &Request) -> Result<Vec<u8>, BackendError> {
-        // EUC-JP バックエンド（yaskkserv2）の場合、見出し語を EUC-JP にエンコードして送信
+        // EUC-JP リクエストを必要とするバックエンドは見出し語を EUC-JP にエンコード
         let wire = match self.encoding {
-            UpstreamEncoding::EucJp => encode_request_for_encoding(request),
+            UpstreamEncoding::EucJp | UpstreamEncoding::EucJpRequestUtf8Response => {
+                encode_request_for_encoding(request)
+            }
             UpstreamEncoding::Utf8 => encode_request(request),
         };
         debug!(
@@ -62,7 +66,9 @@ impl Backend {
         match result {
             Ok(Ok(raw)) => {
                 let response = match self.encoding {
-                    UpstreamEncoding::Utf8 => ensure_trailing_newline(raw),
+                    UpstreamEncoding::Utf8 | UpstreamEncoding::EucJpRequestUtf8Response => {
+                        ensure_trailing_newline(raw)
+                    }
                     UpstreamEncoding::EucJp => {
                         ensure_trailing_newline(response_euc_to_utf8(&raw))
                     }

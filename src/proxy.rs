@@ -1,7 +1,10 @@
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
@@ -57,18 +60,41 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
     let mut session_context: Vec<String> = Vec::new();
+    // skk-bayesian.el の pending 機構に相当。
+    // Lookup 時点では observe() せず、次のリクエスト到着時または無入力タイムアウト時に確定とみなして学習する。
+    let mut pending: Option<PendingObservation> = None;
+
+    // macSKK の補完（Completion）クエリを検出・除外するためのトラッキング
+    let mut recent_completions: HashSet<String> = HashSet::new();
+    let mut last_completion_time: Option<Instant> = None;
+    let mut last_lookup_time: Option<Instant> = None;
 
     loop {
         line.clear();
-        let n = (&mut reader)
-            .take(MAX_LINE_BYTES)
-            .read_until(b'\n', &mut line)
-            .await?;
+
+        // macSKK は TCP 接続を切断せず使い回すため、
+        // ユーザーが入力・確定後に放置した場合に備えて 1.0 秒無入力で自動 flush する。
+        let timeout_duration = if pending.is_some() {
+            Duration::from_millis(1000)
+        } else {
+            Duration::from_secs(3600)
+        };
+
+        let n = tokio::select! {
+            res = reader.read_until(b'\n', &mut line) => {
+                res?
+            }
+            _ = tokio::time::sleep(timeout_duration), if pending.is_some() => {
+                flush_pending(&proxy, &mut pending).await;
+                continue;
+            }
+        };
+
         if n == 0 {
             break;
         }
 
-        if !line.ends_with(b"\n") {
+        if line.len() > MAX_LINE_BYTES as usize || !line.ends_with(b"\n") {
             warn!(?peer, len = line.len(), "request line too long or missing newline");
             break;
         }
@@ -91,6 +117,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
         match request {
             Request::End => {
                 debug!(?peer, "client end");
+                flush_pending(&proxy, &mut pending).await;
                 break;
             }
             Request::Version => {
@@ -101,32 +128,64 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 writer.write_all(host.as_bytes()).await?;
             }
             Request::Lookup(ref midashi) => {
+                let now = Instant::now();
                 let midashi_str = decode_midashi(midashi);
+
+                // --- macSKK の補完クエリ（裏で自動送信される展開 Lookup）の除外判定 ---
+                // macSKK は補完有効時、opcode 4 で返った見出しリストに対して即座に連続して 1midashi を送ってくる。
+                // また、1文字入力時にもバックグラウンドで 1 を送ってくる。
+                // これらは確定候補・文脈更新の対象から除外する。
+                let is_completion_refer = {
+                    let is_after_completion = last_completion_time
+                        .map(|t| now.duration_since(t) < Duration::from_millis(1500))
+                        .unwrap_or(false);
+                    let is_in_completions = recent_completions.contains(&midashi_str);
+                    let is_rapid_burst = last_lookup_time
+                        .map(|t| now.duration_since(t) < Duration::from_millis(120))
+                        .unwrap_or(false);
+
+                    (is_after_completion && is_in_completions) || (is_after_completion && is_rapid_burst)
+                };
+
+                last_lookup_time = Some(now);
+
+                // 通常変換（ユーザーによる明示的な変換）が来た時だけ、直前の確定候補を flush する
+                if !is_completion_refer {
+                    flush_pending(&proxy, &mut pending).await;
+                }
+
                 let (response, hit) = lookup_with_fallback(&proxy, &request).await;
                 let final_response = if is_found(&response) {
                     let cands = parse_candidates(&response);
                     if !cands.is_empty() {
-                        // yaskkserv2（Fallback）ヒット時のみベイズ推定で候補を並び替え。
-                        // azooKey（Primary）ヒット時は azooKey の候補順序を維持する。
-                        let ranked = if hit == BackendHit::Fallback {
+                        // 候補を文脈データで並び替える。
+                        // azooKey・yaskkserv2 どちらのヒットでも文脈スコアを適用する。
+                        let ranked = {
                             let guard = proxy.predictor.lock().await;
                             guard.rank_candidates(&session_context, &midashi_str, &cands)
-                        } else {
-                            cands
                         };
 
                         if let Some(top_cand) = ranked.first() {
-                            // yaskkserv2（Fallback）ヒット時のみ履歴ファイルに学習データを記録。
-                            // azooKey の日常単語で履歴を汚染しない。
-                            if hit == BackendHit::Fallback {
-                                info!(midashi = %midashi_str, top_cand = %top_cand, context = ?session_context, "recorded yaskkserv2 selection to history");
-                                let mut guard = proxy.predictor.lock().await;
-                                guard.observe(&session_context, &midashi_str, top_cand);
-                            }
+                            // 補完クエリではない通常変換の場合のみ、確定候補として保留し、直前文脈を更新する
+                            if !is_completion_refer {
+                                let backend_name = match hit {
+                                    BackendHit::Primary => proxy.primary.name.clone(),
+                                    BackendHit::Fallback => proxy.fallback.name.clone(),
+                                    BackendHit::None => "none".to_string(),
+                                };
+                                pending = Some(PendingObservation {
+                                    backend: backend_name,
+                                    midashi: midashi_str.clone(),
+                                    context: session_context.clone(),
+                                    top_candidate: top_cand.clone(),
+                                });
 
-                            // 直前の漢字文脈を1単語のみ保持
-                            session_context.clear();
-                            session_context.push(top_cand.clone());
+                                // 直前の文脈として漢字圏の文字を含む単語のみ保持する。
+                                if contains_kanji(top_cand) {
+                                    session_context.clear();
+                                    session_context.push(top_cand.clone());
+                                }
+                            }
                         }
                         format_candidates_response(&ranked)
                     } else {
@@ -138,14 +197,49 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 writer.write_all(&final_response).await?;
             }
             Request::Completion(_) => {
-                let response = completion_with_aggregation(&proxy, &request, &session_context).await;
+                let (response, completions) = completion_with_aggregation(&proxy, &request, &session_context).await;
+                last_completion_time = Some(Instant::now());
+                recent_completions.clear();
+                for cand in completions {
+                    recent_completions.insert(cand);
+                }
                 writer.write_all(&response).await?;
             }
         }
         writer.flush().await?;
     }
 
+    // クライアント切断時（EOF等）にも残っている確定候補を flush して確実に保存する。
+    flush_pending(&proxy, &mut pending).await;
+
     Ok(())
+}
+
+/// 保留中の確定候補を学習データに反映し、ファイルへ保存する。
+async fn flush_pending(proxy: &Proxy, pending: &mut Option<PendingObservation>) {
+    if let Some(obs) = pending.take() {
+        let mut guard = proxy.predictor.lock().await;
+        guard.observe(&obs.context, &obs.midashi, &obs.top_candidate);
+        if let Err(e) = guard.save() {
+            warn!(error = %e, "failed to save frequency data after observe");
+        }
+        info!(
+            backend = %obs.backend,
+            midashi = %obs.midashi,
+            top_cand = %obs.top_candidate,
+            context = ?obs.context,
+            "flushed pending observation"
+        );
+    }
+}
+
+/// 次のリクエスト到着まで保留する学習データ（skk-bayesian.el の pending 機構に相当）
+#[derive(Debug)]
+struct PendingObservation {
+    backend: String,
+    midashi: String,
+    context: Vec<String>,
+    top_candidate: String,
 }
 
 /// どのバックエンドが応答したかを示す列挙型
@@ -201,7 +295,7 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
     }
 }
 
-async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: &[String]) -> Vec<u8> {
+async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: &[String]) -> (Vec<u8>, Vec<String>) {
     let midashi_str = match request {
         Request::Completion(midashi) => decode_midashi(midashi),
         _ => String::new(),
@@ -223,7 +317,7 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: 
     };
 
     if primary_cands.is_empty() && fallback_cands.is_empty() {
-        return b"4\n".to_vec();
+        return (b"4\n".to_vec(), Vec::new());
     }
 
     let merged = merge_candidates(&primary_cands, &fallback_cands);
@@ -239,6 +333,17 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: 
         "completion candidates aggregated and ranked"
     );
 
-    format_candidates_response(&ranked)
+    (format_candidates_response(&ranked), ranked)
 }
 
+/// 文字列にCJK漢字（U+4E00–U+9FFF など）が含まれるか判定する。
+/// session_context には漢字を含む単語のみ積む（ひらがな・英数字のみは除外）。
+fn contains_kanji(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}'   // CJK統合漢字
+            | '\u{3400}'..='\u{4DBF}' // CJK統合漢字拡張A
+            | '\u{F900}'..='\u{FAFF}' // CJK互換漢字
+        )
+    })
+}

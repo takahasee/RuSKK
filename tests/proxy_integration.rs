@@ -123,7 +123,7 @@ async fn test_proxy_lookup_bayesian_ranking_skk_uppercase() {
 }
 
 #[tokio::test]
-async fn test_primary_azookey_preserves_order() {
+async fn test_primary_azookey_ranks_by_context_and_observes() {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
@@ -154,7 +154,7 @@ async fn test_primary_azookey_preserves_order() {
     });
 
     let mut predictor = FrequencyPredictor::new(None);
-    // Pre-observe context "服" -> "着る" (which would normally flip order if Bayesian re-ranking was applied)
+    // Pre-observe context "服" -> "着る"
     predictor.observe(&["服".to_string()], "kiru", "着る");
     predictor.observe(&["服".to_string()], "kiru", "着る");
 
@@ -193,24 +193,155 @@ async fn test_primary_azookey_preserves_order() {
     client.write_all(b"1fuku \n").await.unwrap();
     let _n = client.read(&mut buf).await.unwrap();
 
-    // Primary hits MUST preserve azooKey's original candidate order ("1/切る/着る/\n")
+    // rank_candidates IS applied to Primary (azooKey) results.
+    // The predictor has "服" -> "着る" observed twice, so "着る" should rank first
+    // even though azooKey returns "切る/着る" by default.
     client.write_all(b"1kiru \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/切る/着る/\n", "Primary azooKey order must be preserved!");
+    assert_eq!(resp, "1/着る/切る/\n", "rank_candidates must reorder Primary results by context!");
 
     drop(client);
+    // Give a short moment for EOF handling and pending observation flush
+    tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Verify Primary hits did NOT write to predictor observation counts
+    // Both "服" and "着る" should be observed in the predictor now
     {
         let guard = shared_predictor.lock().await;
         assert_eq!(
             guard.frequencies.get("fuku").and_then(|m| m.get("服")).copied().unwrap_or(0),
-            0,
-            "Primary hit '服' should not be observed"
+            1,
+            "Primary hit '服' should be observed on subsequent lookup"
+        );
+        assert_eq!(
+            guard.frequencies.get("kiru").and_then(|m| m.get("着る")).copied().unwrap_or(0),
+            3, // Initial 2 + 1 newly observed
+            "Primary hit '着る' should be observed on client disconnect flush"
         );
     }
 
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+#[tokio::test]
+async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with(b"4ho") {
+                            // Completion returns multiple completion keys
+                            let resp = "1/ほぞん/ほぞんうんどう/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"1hozonundou") {
+                            let resp = "1/保存運動/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"1hozon") {
+                            let resp = "1/保存/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"1fuku") {
+                            let resp = "1/服/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "fallback".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        predictor: shared_predictor.clone(),
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. macSKK completion flow: opcode 4 followed immediately by burst 1s
+    client.write_all(b"4ho \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // Burst lookups for completion preview
+    client.write_all(b"1hozon \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    client.write_all(b"1hozonundou \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // Verify completion burst lookups are NOT observed!
+    {
+        let guard = shared_predictor.lock().await;
+        assert_eq!(
+            guard.frequencies.get("hozon").and_then(|m| m.get("保存")).copied().unwrap_or(0),
+            0,
+            "Completion lookup 'hozon' must NOT be observed"
+        );
+        assert_eq!(
+            guard.frequencies.get("hozonundou").and_then(|m| m.get("保存運動")).copied().unwrap_or(0),
+            0,
+            "Completion lookup 'hozonundou' must NOT be observed"
+        );
+    }
+
+    // 2. Wait 1.6s so completion time window expires, then send regular conversion lookup "1fuku \n"
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    client.write_all(b"1fuku \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/服/\n");
+
+    // Client stays connected (like macSKK connection pool).
+    // Wait for the 1.0s timeout flush to trigger!
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Verify "fuku" -> "服" was automatically flushed to predictor on idle timeout!
+    {
+        let guard = shared_predictor.lock().await;
+        assert_eq!(
+            guard.frequencies.get("fuku").and_then(|m| m.get("服")).copied().unwrap_or(0),
+            1,
+            "Regular conversion 'fuku' -> '服' must be flushed on idle timeout without closing TCP connection"
+        );
+    }
+
+    drop(client);
     proxy_handle.abort();
     upstream_handle.abort();
 }

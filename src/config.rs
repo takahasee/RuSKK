@@ -38,7 +38,7 @@ impl Args {
         Backend {
             name: "azoo-key-skkserv".to_owned(),
             addr: self.azookey,
-            encoding: UpstreamEncoding::Utf8,
+            encoding: UpstreamEncoding::EucJpRequestUtf8Response,
             timeout: Duration::from_millis(self.azookey_timeout_ms),
         }
     }
