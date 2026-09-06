@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,7 +65,8 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let mut pending: Option<PendingObservation> = None;
 
     // macSKK の補完（Completion）クエリを検出・除外するためのトラッキング
-    let mut recent_completions: HashSet<String> = HashSet::new();
+    let mut recent_completions: HashMap<String, Instant> = HashMap::new();
+    let mut recent_completion_prefixes: Vec<(String, Instant)> = Vec::new();
     let mut last_completion_time: Option<Instant> = None;
     let mut last_lookup_time: Option<Instant> = None;
 
@@ -131,25 +132,43 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let now = Instant::now();
                 let midashi_str = decode_midashi(midashi);
 
+                // 有効期限（5秒）の切れた古い補完情報を掃除
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
+                recent_completion_prefixes.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(5));
+
                 // --- macSKK の補完クエリ（裏で自動送信される展開 Lookup）の除外判定 ---
-                // macSKK の補完展開は Swift の for ループにより数十ミリ秒間隔で連続して飛んでくる。
-                // 人間の手動変換キー入力（通常 200ms 以上）と明確に区別するため、
-                // 「直前 800ms 以内に Completion があり、かつ 150ms 未満のバースト Lookup」を補完クエリとみなす。
-                let is_completion_refer = {
-                    let is_after_completion = last_completion_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(800))
-                        .unwrap_or(false);
-                    let is_rapid_burst = last_lookup_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(150))
+                // 1. 直近 5 秒以内に返した補完候補一覧に含まれているか（skkserv返却の補完候補）
+                let is_in_recent_completions = recent_completions.contains_key(&midashi_str);
+
+                // 2. 直近 5 秒以内の Completion prefix に前方一致し、かつ prefix より長い単語か（ローカル辞書由来の補完候補）
+                // ※送りあり変換（末尾が英字）はユーザーの通常変換なので除外
+                let is_okuri = is_okuri_midashi(&midashi_str);
+                let is_prefix_completion = !is_okuri
+                    && recent_completion_prefixes.iter().any(|(prefix, _)| {
+                        midashi_str.starts_with(prefix) && midashi_str != *prefix
+                    });
+
+                // 3. 直近 3 秒以内に Completion があり、かつ 200ms 未満のバースト Lookup か
+                let is_rapid_burst = last_completion_time
+                    .map(|t| now.duration_since(t) < Duration::from_secs(3))
+                    .unwrap_or(false)
+                    && last_lookup_time
+                        .map(|t| now.duration_since(t) < Duration::from_millis(200))
                         .unwrap_or(false);
 
-                    is_after_completion && is_rapid_burst
-                };
-
+                let is_completion_refer = is_in_recent_completions || is_prefix_completion || is_rapid_burst;
                 last_lookup_time = Some(now);
 
-                // 通常変換（ユーザーによる明示的な変換）が来た時だけ、直前の確定候補を flush する
-                if !is_completion_refer {
+                if is_completion_refer {
+                    debug!(
+                        midashi = %midashi_str,
+                        in_recent = is_in_recent_completions,
+                        is_prefix = is_prefix_completion,
+                        is_burst = is_rapid_burst,
+                        "ignored completion refer lookup from learning"
+                    );
+                } else {
+                    // 通常変換（ユーザーによる明示的な変換）が来た時だけ、直前の確定候補を flush する
                     flush_pending(&proxy, &mut pending).await;
                 }
 
@@ -195,12 +214,26 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 };
                 writer.write_all(&final_response).await?;
             }
-            Request::Completion(_) => {
+            Request::Completion(ref prefix_bytes) => {
+                let prefix_str = decode_midashi(prefix_bytes);
                 let (response, completions) = completion_with_aggregation(&proxy, &request, &session_context).await;
-                last_completion_time = Some(Instant::now());
-                recent_completions.clear();
+                let now = Instant::now();
+                last_completion_time = Some(now);
+
+                // 5秒以上経過した古いプレフィックスを削除し、最新を追加
+                recent_completion_prefixes.retain(|(_, t)| now.duration_since(*t) < Duration::from_secs(5));
+                if !prefix_str.is_empty() {
+                    recent_completion_prefixes.push((prefix_str, now));
+                }
+
+                // 5秒以上経過した古い補完候補を削除し、最新を追加
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(5));
                 for cand in completions {
-                    recent_completions.insert(cand);
+                    let clean = cand.split(';').next().unwrap_or(&cand).trim().to_string();
+                    if !clean.is_empty() {
+                        recent_completions.insert(clean, now);
+                    }
+                    recent_completions.insert(cand, now);
                 }
                 writer.write_all(&response).await?;
             }
@@ -346,3 +379,15 @@ fn contains_kanji(s: &str) -> bool {
         )
     })
 }
+
+/// SKKの送りあり見出し（例: "きr", "おくr", "たべr" 等）か判定する。
+/// 送りあり見出しは平仮名等の非ASCII文字の末尾に送りブロック用のアルファベット英字（小文字等）が付く。
+/// ローマ字見出し（例: "hontou", "fuku"）のように直前も英字の場合は送りありとはみなさない。
+fn is_okuri_midashi(midashi: &str) -> bool {
+    let mut chars = midashi.chars().rev();
+    match (chars.next(), chars.next()) {
+        (Some(last), Some(prev)) => last.is_ascii_alphabetic() && !prev.is_ascii(),
+        _ => false,
+    }
+}
+

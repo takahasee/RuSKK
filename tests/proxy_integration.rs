@@ -241,13 +241,17 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
                         let req = &buf[..n];
                         if req.starts_with(b"4ho") {
                             // Completion returns multiple completion keys
-                            let resp = "1/ほぞん/ほぞんうんどう/\n".as_bytes();
+                            let resp = "1/hozon/hozonundou/ほぞん/ほぞんうんどう/\n".as_bytes();
                             let _ = stream.write_all(resp).await;
                         } else if req.starts_with(b"1hozonundou") {
                             let resp = "1/保存運動/\n".as_bytes();
                             let _ = stream.write_all(resp).await;
                         } else if req.starts_with(b"1hozon") {
                             let resp = "1/保存/\n".as_bytes();
+                            let _ = stream.write_all(resp).await;
+                        } else if req.starts_with(b"1hontou") {
+                            // Local dict completion (not in upstream 4ho, but starts with prefix "ho")
+                            let resp = "1/本当/\n".as_bytes();
                             let _ = stream.write_all(resp).await;
                         } else if req.starts_with(b"1fuku") {
                             let resp = "1/服/\n".as_bytes();
@@ -294,34 +298,51 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // 1. macSKK completion flow: opcode 4 followed immediately by burst 1s
+    // 1. macSKK completion flow: opcode 4 followed by lookups (with delay between them)
     client.write_all(b"4ho \n").await.unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
-    // Burst lookups for completion preview
+    // Lookups for completion preview:
+    // First lookup: in recent_completions
     client.write_all(b"1hozon \n").await.unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
+    // Introduce 300ms delay (>150ms burst threshold) between completion lookups,
+    // simulating network/Google Suggest latency from yaskkserv2.
+    tokio::time::sleep(Duration::from_millis(300)).await;
     client.write_all(b"1hozonundou \n").await.unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
-    // Verify completion burst lookups are NOT observed!
+    // Local dictionary completion candidate (starts with prefix "ho", delayed by 300ms)
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.write_all(b"1hontou \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // Idle for 1.2s — if any completion lookup was erroneously treated as a regular conversion,
+    // the 1.0s debounce flush would have auto-confirmed it!
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Verify completion lookups are NEVER observed or confirmed!
     {
         let guard = shared_predictor.lock().await;
         assert_eq!(
             guard.frequencies.get("hozon").and_then(|m| m.get("保存")).copied().unwrap_or(0),
             0,
-            "Completion lookup 'hozon' must NOT be observed"
+            "Completion lookup 'hozon' must NOT be auto-confirmed"
         );
         assert_eq!(
             guard.frequencies.get("hozonundou").and_then(|m| m.get("保存運動")).copied().unwrap_or(0),
             0,
-            "Completion lookup 'hozonundou' must NOT be observed"
+            "Completion lookup 'hozonundou' must NOT be auto-confirmed"
+        );
+        assert_eq!(
+            guard.frequencies.get("hontou").and_then(|m| m.get("本当")).copied().unwrap_or(0),
+            0,
+            "Local dict completion lookup 'hontou' must NOT be auto-confirmed"
         );
     }
 
-    // 2. Wait 1.6s so completion time window expires, then send regular conversion lookup "1fuku \n"
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    // 2. Now send a REGULAR user conversion lookup "1fuku \n"
     client.write_all(b"1fuku \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
