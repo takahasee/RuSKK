@@ -8,7 +8,10 @@ use tokio::sync::Mutex;
 use tracing::debug;
 
 const SAVE_INTERVAL: u32 = 10;
-const LEGACY_HISTORY_FILE: &str = ".skk-proxy-bayesian.json";
+const LEGACY_HISTORY_FILES: &[&str] = &[
+    ".skk-proxy-frequency.json",
+    ".skk-proxy-bayesian.json",
+];
 
 /// Frequency-based predictor for completion candidate ranking.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -45,10 +48,12 @@ impl FrequencyPredictor {
             return self.load(path);
         }
         if let Some(home) = path.parent() {
-            let legacy = home.join(LEGACY_HISTORY_FILE);
-            if legacy.exists() {
-                debug!(from = %legacy.display(), to = %path.display(), "migrating legacy history file");
-                return self.load(&legacy);
+            for legacy_name in LEGACY_HISTORY_FILES {
+                let legacy = home.join(legacy_name);
+                if legacy.exists() {
+                    debug!(from = %legacy.display(), to = %path.display(), "migrating legacy history file");
+                    return self.load(&legacy);
+                }
             }
         }
         Ok(())

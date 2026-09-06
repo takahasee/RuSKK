@@ -29,4 +29,4 @@ wait_port() {
 wait_port "$AZOOKEY_HOST" "$AZOOKEY_PORT" "azooKey SKKServ"
 wait_port "$YASKKSERV2_HOST" "$YASKKSERV2_PORT" "yaskkserv2"
 
-exec "$SKK_PROXY_BIN" "$@"
+exec "${RUSKK_BIN:-${SKK_PROXY_BIN}}" "$@"

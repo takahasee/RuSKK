@@ -7,7 +7,7 @@ use crate::backend::{Backend, UpstreamEncoding};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "skk-proxy",
+    name = "ruskk",
     about = "skkserv proxy: azoo-key-skkserv first, yaskkserv2 fallback",
     version
 )]

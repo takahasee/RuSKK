@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use skk_proxy::backend::{Backend, UpstreamEncoding};
-use skk_proxy::protocol::{is_found, Request};
+use ruskk::backend::{Backend, UpstreamEncoding};
+use ruskk::protocol::{is_found, Request};
 
 #[tokio::test]
 async fn backend_utf8_passthrough() {
@@ -85,16 +85,16 @@ fn test_completion_merge_logic() {
     let primary_resp = b"1/\xe3\x81\x82/\xe3\x81\x84/\n"; // 1/あ/い/
     let fallback_resp = vec![b'1', b'/', 0xA4, 0xA4, b'/', 0xA4, 0xA6, b'/', b'\n']; // 1/い/う/ in EUC-JP
 
-    let primary_utf8 = skk_proxy::encoding::response_euc_to_utf8(primary_resp);
-    let fallback_utf8 = skk_proxy::encoding::response_euc_to_utf8(&fallback_resp);
+    let primary_utf8 = ruskk::encoding::response_euc_to_utf8(primary_resp);
+    let fallback_utf8 = ruskk::encoding::response_euc_to_utf8(&fallback_resp);
 
-    let primary_cands = skk_proxy::encoding::parse_candidates(&primary_utf8);
-    let fallback_cands = skk_proxy::encoding::parse_candidates(&fallback_utf8);
+    let primary_cands = ruskk::encoding::parse_candidates(&primary_utf8);
+    let fallback_cands = ruskk::encoding::parse_candidates(&fallback_utf8);
 
-    let merged = skk_proxy::encoding::merge_candidates(&primary_cands, &fallback_cands);
+    let merged = ruskk::encoding::merge_candidates(&primary_cands, &fallback_cands);
     assert_eq!(merged, vec!["あ", "い", "う"]);
 
-    let formatted = skk_proxy::encoding::format_candidates_response(&merged);
+    let formatted = ruskk::encoding::format_candidates_response(&merged);
     assert_eq!(formatted, "1/あ/い/う/\n".as_bytes());
 }
 

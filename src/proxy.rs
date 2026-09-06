@@ -21,7 +21,7 @@ pub struct Proxy {
 impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.listen).await?;
-        info!(listen = %self.listen, "skk-proxy listening");
+        info!(listen = %self.listen, "ruskk listening");
         info!(
             primary = %self.primary.name,
             primary_addr = %self.primary.addr,
@@ -94,10 +94,10 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 break;
             }
             Request::Version => {
-                writer.write_all(b"skk-proxy/0.1.0 ").await?;
+                writer.write_all(b"ruskk/0.1.0 ").await?;
             }
             Request::Host => {
-                let host = format!("skk-proxy/{}: ", proxy.listen);
+                let host = format!("ruskk/{}: ", proxy.listen);
                 writer.write_all(host.as_bytes()).await?;
             }
             Request::Lookup(ref midashi) => {

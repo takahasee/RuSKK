@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.skkproxy.yaskkserv2</string>
+    <string>com.ruskk.yaskkserv2</string>
     <key>ProgramArguments</key>
     <array>
         <string>@YASKKSERV2_BIN@</string>

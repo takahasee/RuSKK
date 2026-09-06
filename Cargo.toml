@@ -1,8 +1,8 @@
 [package]
-name = "skk-proxy"
+name = "ruskk"
 version = "0.1.0"
 edition = "2024"
-description = "skkserv proxy for macSKK: azoo-key-skkserv primary, yaskkserv2 fallback"
+description = "RuSKK — skkserv proxy for macSKK: azoo-key-skkserv primary, yaskkserv2 fallback"
 license = "MIT"
 
 [dependencies]

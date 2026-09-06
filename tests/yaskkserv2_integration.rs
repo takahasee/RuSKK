@@ -4,10 +4,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use skk_proxy::backend::{Backend, UpstreamEncoding};
-use skk_proxy::encoding::encode_euc_jp;
-use skk_proxy::frequency::{FrequencyPredictor, SharedPredictor};
-use skk_proxy::proxy::Proxy;
+use ruskk::backend::{Backend, UpstreamEncoding};
+use ruskk::encoding::encode_euc_jp;
+use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
+use ruskk::proxy::Proxy;
 
 #[tokio::test]
 async fn test_yaskkserv2_standalone_bayesian_ranking() {
