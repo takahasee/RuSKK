@@ -25,11 +25,11 @@ pub struct Args {
     pub yaskkserv2: SocketAddr,
 
     /// Timeout for azoo-key-skkserv queries (milliseconds)
-    #[arg(long, default_value_t = 1500)]
+    #[arg(long, default_value_t = 500)]
     pub azookey_timeout_ms: u64,
 
     /// Timeout for yaskkserv2 queries (milliseconds)
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 400)]
     pub yaskkserv2_timeout_ms: u64,
 }
 

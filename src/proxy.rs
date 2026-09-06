@@ -132,19 +132,18 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let midashi_str = decode_midashi(midashi);
 
                 // --- macSKK の補完クエリ（裏で自動送信される展開 Lookup）の除外判定 ---
-                // macSKK は補完有効時、opcode 4 で返った見出しリストに対して即座に連続して 1midashi を送ってくる。
-                // また、1文字入力時にもバックグラウンドで 1 を送ってくる。
-                // これらは確定候補・文脈更新の対象から除外する。
+                // macSKK の補完展開は Swift の for ループにより数十ミリ秒間隔で連続して飛んでくる。
+                // 人間の手動変換キー入力（通常 200ms 以上）と明確に区別するため、
+                // 「直前 800ms 以内に Completion があり、かつ 150ms 未満のバースト Lookup」を補完クエリとみなす。
                 let is_completion_refer = {
                     let is_after_completion = last_completion_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(1500))
+                        .map(|t| now.duration_since(t) < Duration::from_millis(800))
                         .unwrap_or(false);
-                    let is_in_completions = recent_completions.contains(&midashi_str);
                     let is_rapid_burst = last_lookup_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(120))
+                        .map(|t| now.duration_since(t) < Duration::from_millis(150))
                         .unwrap_or(false);
 
-                    (is_after_completion && is_in_completions) || (is_after_completion && is_rapid_burst)
+                    is_after_completion && is_rapid_burst
                 };
 
                 last_lookup_time = Some(now);

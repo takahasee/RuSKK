@@ -51,39 +51,43 @@ pub fn parse_request(line: &[u8]) -> Result<Request, ProtocolError> {
     }
 }
 
-/// Rebuild a wire request for forwarding to an upstream skkserv.
+/// Rebuild a wire request for forwarding to an upstream skkserv (UTF-8).
 pub fn encode_request(request: &Request) -> Vec<u8> {
+    use crate::encoding::decode_euc_or_utf8;
+
     match request {
         Request::End => b"0 \n".to_vec(),
         Request::Lookup(midashi) => {
-            let mut buf = Vec::with_capacity(midashi.len() + 3);
+            let midashi_str = decode_euc_or_utf8(midashi);
+            let mut buf = Vec::with_capacity(midashi_str.len() + 3);
             buf.push(b'1');
-            buf.extend_from_slice(midashi);
+            buf.extend_from_slice(midashi_str.as_bytes());
             buf.extend_from_slice(b" \n");
             buf
         }
         Request::Version => b"2 \n".to_vec(),
         Request::Host => b"3 \n".to_vec(),
         Request::Completion(midashi) => {
-            let mut buf = Vec::with_capacity(midashi.len() + 3);
+            let midashi_str = decode_euc_or_utf8(midashi);
+            let mut buf = Vec::with_capacity(midashi_str.len() + 3);
             buf.push(b'4');
-            buf.extend_from_slice(midashi);
+            buf.extend_from_slice(midashi_str.as_bytes());
             buf.extend_from_slice(b" \n");
             buf
         }
     }
 }
 
-/// EUC-JP バックエンド（yaskkserv2）向けにリクエストを構築する。
-/// 見出し語を UTF-8 から EUC-JP にエンコードして送信する。
+/// EUC-JP バックエンド向けにリクエストを構築する。
+/// 見出し語を正しくデコードした上で EUC-JP にエンコードして送信する。
 pub fn encode_request_for_encoding(request: &Request) -> Vec<u8> {
-    use crate::encoding::encode_euc_jp;
+    use crate::encoding::{decode_euc_or_utf8, encode_euc_jp};
 
     match request {
         Request::End => b"0 \n".to_vec(),
         Request::Lookup(midashi) => {
-            let midashi_utf8 = String::from_utf8_lossy(midashi);
-            let euc_midashi = encode_euc_jp(&midashi_utf8);
+            let midashi_str = decode_euc_or_utf8(midashi);
+            let euc_midashi = encode_euc_jp(&midashi_str);
             let mut buf = Vec::with_capacity(euc_midashi.len() + 3);
             buf.push(b'1');
             buf.extend_from_slice(&euc_midashi);
@@ -93,8 +97,8 @@ pub fn encode_request_for_encoding(request: &Request) -> Vec<u8> {
         Request::Version => b"2 \n".to_vec(),
         Request::Host => b"3 \n".to_vec(),
         Request::Completion(midashi) => {
-            let midashi_utf8 = String::from_utf8_lossy(midashi);
-            let euc_midashi = encode_euc_jp(&midashi_utf8);
+            let midashi_str = decode_euc_or_utf8(midashi);
+            let euc_midashi = encode_euc_jp(&midashi_str);
             let mut buf = Vec::with_capacity(euc_midashi.len() + 3);
             buf.push(b'4');
             buf.extend_from_slice(&euc_midashi);
