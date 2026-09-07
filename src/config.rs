@@ -31,6 +31,18 @@ pub struct Args {
     /// Timeout for yaskkserv2 queries (milliseconds)
     #[arg(long, default_value_t = 400)]
     pub yaskkserv2_timeout_ms: u64,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, clap::Subcommand)]
+pub enum Command {
+    /// Import frequency data from a macSKK user dictionary
+    ImportUserDict {
+        /// Path to macSKK user dictionary (e.g., skk-jisyo.utf8)
+        path: std::path::PathBuf,
+    },
 }
 
 impl Args {

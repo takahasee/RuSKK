@@ -22,6 +22,19 @@ async fn main() -> anyhow::Result<()> {
     let history_path = std::env::var("HOME")
         .ok()
         .map(|h| std::path::PathBuf::from(h).join(".ruskk-frequency.json"));
+    
+    // サブコマンドが指定されている場合は、プロキシを起動せずに処理を実行して終了する
+    if let Some(ruskk::config::Command::ImportUserDict { path }) = args.command {
+        info!("Importing frequencies from {:?}", path);
+        let mut predictor = FrequencyPredictor::new(history_path);
+        if let Err(e) = predictor.import_from_skk_dict(&path) {
+            tracing::error!("Failed to import from skk dict: {}", e);
+            std::process::exit(1);
+        }
+        info!("Successfully imported frequencies. (context_frequencies are kept intact)");
+        return Ok(());
+    }
+
     let predictor = Arc::new(Mutex::new(FrequencyPredictor::new(history_path)));
 
     let proxy = Proxy {

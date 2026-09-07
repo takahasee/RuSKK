@@ -38,6 +38,17 @@ skkserv プロトコルの制約上、クライアント（macSKK）側でユー
 
 この例では、「服」と入力した直後に「きr」を変換すると「着る」が、「肉」の直後なら「切る」が第1候補になるようにスコアリングされます。
 
+### macSKK ユーザー辞書からの頻度インポート
+
+macSKK のローカル辞書に蓄積された「最近選択した候補」の情報を `~/.ruskk-frequency.json` に取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます）。
+
+```sh
+# フルディスクアクセス権限を持つターミナルから実行してください
+ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
+```
+
+※ macSKK のユーザー辞書は `~/Library/Containers` 配下にあるため、ターミナルに「フルディスクアクセス」権限が必要です。
+
 ## ビルド
 
 ```sh

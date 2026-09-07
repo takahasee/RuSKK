@@ -68,6 +68,70 @@ impl FrequencyPredictor {
         Ok(())
     }
 
+    pub fn save(&self) -> anyhow::Result<()> {
+        if let Some(ref path) = self.storage_path {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let data = serde_json::to_string_pretty(&self)?;
+            fs::write(path, data)?;
+        }
+        Ok(())
+    }
+
+    /// macSKK などのユーザー辞書 (skk-jisyo.utf8) をパースし、
+    /// 候補の順番に応じたスコアを frequencies にインポート（加算）する。
+    /// context_frequencies は変更しない。
+    pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
+        let content = fs::read_to_string(dict_path)?;
+        
+        for line in content.lines() {
+            let line = line.trim();
+            // コメント行や空行はスキップ
+            if line.is_empty() || line.starts_with(';') {
+                continue;
+            }
+
+            // フォーマット: 見出し語 /候補1/候補2/
+            let mut parts = line.splitn(2, ' ');
+            let midashi = match parts.next() {
+                Some(m) if !m.is_empty() => m,
+                _ => continue,
+            };
+            
+            let cands_part = match parts.next() {
+                Some(c) if c.starts_with('/') && c.ends_with('/') => &c[1..c.len() - 1],
+                _ => continue,
+            };
+
+            let candidates: Vec<&str> = cands_part.split('/').collect();
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let entry = self.frequencies.entry(midashi.to_string()).or_insert_with(HashMap::new);
+            
+            // 順番に応じてスコアを付与 (先頭ほど高い)
+            // 候補がN個の場合、1番目=N点, 2番目=N-1点, ..., N番目=1点
+            let total_cands = candidates.len() as u64;
+            for (idx, cand) in candidates.iter().enumerate() {
+                // 注釈付き候補 (例: 候補;注釈) の場合は候補部分だけを取り出す
+                let cand_text = cand.split(';').next().unwrap_or(cand);
+                if cand_text.is_empty() {
+                    continue;
+                }
+                
+                let score = total_cands.saturating_sub(idx as u64);
+                *entry.entry(cand_text.to_string()).or_insert(0) += score;
+            }
+        }
+        
+        // インポートした結果を保存する
+        self.save()?;
+        
+        Ok(())
+    }
+
     /// seed データの頻度と文脈共起に基づいて候補を並び替える。
     pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
         if candidates.len() <= 1 {
@@ -167,5 +231,54 @@ mod tests {
         // 文脈「肉」のとき、「切る」が第1候補
         let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
         assert_eq!(ranked_niku[0], "切る");
+    }
+
+    #[test]
+    fn test_import_from_skk_dict() {
+        use tempfile::NamedTempFile;
+        use std::io::Write;
+
+        // ダミーの SKK 辞書ファイルを作成
+        let mut dict_file = NamedTempFile::new().unwrap();
+        writeln!(dict_file, ";; okuri-ari entries.").unwrap();
+        writeln!(dict_file, "きr /切る;注釈/着る/伐る/").unwrap();
+        writeln!(dict_file, ";; okuri-nasi entries.").unwrap();
+        writeln!(dict_file, "ふく /服/吹く/副/").unwrap();
+        
+        // テスト用の JSON 保存先
+        let json_file = NamedTempFile::new().unwrap();
+
+        let mut predictor = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
+        // 既存の context_frequencies が保持されることを確認するため追加
+        predictor.context_frequencies.insert("肉".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("切る".to_string(), 10);
+            m
+        });
+
+        // インポート実行
+        predictor.import_from_skk_dict(dict_file.path()).unwrap();
+
+        // frequencies が正しくインポートされているか確認
+        // "きr": 切る=3, 着る=2, 伐る=1
+        let kir_freqs = predictor.frequencies.get("きr").unwrap();
+        assert_eq!(kir_freqs.get("切る").copied().unwrap_or(0), 3);
+        assert_eq!(kir_freqs.get("着る").copied().unwrap_or(0), 2);
+        assert_eq!(kir_freqs.get("伐る").copied().unwrap_or(0), 1);
+
+        // "ふく": 服=3, 吹く=2, 副=1
+        let fuku_freqs = predictor.frequencies.get("ふく").unwrap();
+        assert_eq!(fuku_freqs.get("服").copied().unwrap_or(0), 3);
+        assert_eq!(fuku_freqs.get("吹く").copied().unwrap_or(0), 2);
+        assert_eq!(fuku_freqs.get("副").copied().unwrap_or(0), 1);
+
+        // context_frequencies が維持されているか確認
+        let niku_ctx = predictor.context_frequencies.get("肉").unwrap();
+        assert_eq!(niku_ctx.get("切る").copied().unwrap_or(0), 10);
+
+        // ファイルにも保存されているか確認
+        let mut loaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
+        loaded.load(json_file.path()).unwrap();
+        assert_eq!(loaded.frequencies.get("きr").unwrap().get("切る").copied().unwrap_or(0), 3);
     }
 }
