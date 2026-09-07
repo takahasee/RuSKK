@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
 use ruskk::proxy::Proxy;
 
 #[tokio::test]
-async fn test_yaskkserv2_standalone_bayesian_ranking() {
+async fn test_yaskkserv2_standalone_seed_ranking() {
     // 1. Setup yaskkserv2 mock server (communicating strictly in EUC-JP)
     // Upstream defaults to returning EUC-JP encoded candidates with "切る" first: 1/切る/着る/\n
     let yaskkserv2_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -73,15 +74,18 @@ async fn test_yaskkserv2_standalone_bayesian_ranking() {
         }
     });
 
-    // 2. Setup FrequencyPredictor pre-observed context data
+    // 2. Setup FrequencyPredictor seed data (mocking ~/.ruskk-frequency.json)
     let mut predictor = FrequencyPredictor::new(None);
-    // Pre-observe: Context "服" -> "着る", Context "肉" -> "切る"
-    predictor.observe(&["服".to_string()], "きr", "着る");
-    predictor.observe(&["服".to_string()], "きr", "着る");
-    predictor.observe(&["服".to_string()], "きる", "着る");
-    predictor.observe(&["肉".to_string()], "きr", "切る");
-    predictor.observe(&["肉".to_string()], "きr", "切る");
-    predictor.observe(&["肉".to_string()], "きる", "切る");
+    predictor.context_frequencies.insert("服".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
 
     let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
 
@@ -105,7 +109,7 @@ async fn test_yaskkserv2_standalone_bayesian_ranking() {
             encoding: UpstreamEncoding::EucJp,
             timeout: Duration::from_secs(1),
         },
-        predictor: shared_predictor,
+        predictor: shared_predictor.clone(),
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -118,39 +122,22 @@ async fn test_yaskkserv2_standalone_bayesian_ranking() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // Client requests "ふく" (UTF-8) -> yaskkserv2 returns "服", session context becomes ["服"]
+    // Client requests "ふく" (UTF-8) -> yaskkserv2 returns "服"
     client.write_all("1ふく \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp1 = String::from_utf8_lossy(&buf[..n]);
     assert!(resp1.contains("服"), "Expected '服' in response, got: {}", resp1);
 
-    // Client requests "きr" (UTF-8) with context ["服"]
-    // yaskkserv2 returns EUC-JP for "1/切る/着る/\n", BUT skk-proxy converts to UTF-8
-    // AND re-ranks "着る" to 1st candidate based on Bayesian model!
+    // Context learning is disabled. Even if the seed data has "服" -> "着る",
+    // the proxy doesn't track session context automatically anymore.
+    // We only verify that the response comes back correctly decoded from EUC-JP.
     client.write_all("1きr \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp2, "1/着る/切る/\n");
-
-    // 4. Client connection 2 with context "肉" -> lookup "きr"
-    let mut client2 = TcpStream::connect(proxy_addr).await.unwrap();
-
-    // Client requests "にく" (UTF-8) -> session context becomes ["肉"]
-    client2.write_all("1にく \n".as_bytes()).await.unwrap();
-    let n = client2.read(&mut buf).await.unwrap();
-    let resp3 = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp3.contains("肉"), "Expected '肉' in response, got: {}", resp3);
-
-    // Client requests "きr" (UTF-8) with context ["肉"]
-    // skk-proxy Bayesian model MUST keep "切る" as 1st candidate!
-    client2.write_all("1きr \n".as_bytes()).await.unwrap();
-    let n = client2.read(&mut buf).await.unwrap();
-    let resp4 = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp4, "1/切る/着る/\n");
+    // It should remain unchanged since session context is empty
+    assert_eq!(resp2, "1/切る/着る/\n");
 
     drop(client);
-    drop(client2);
-
     proxy_handle.abort();
     yaskkserv2_handle.abort();
 }

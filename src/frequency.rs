@@ -7,24 +7,23 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::debug;
 
-const SAVE_INTERVAL: u32 = 10;
 const LEGACY_HISTORY_FILES: &[&str] = &[
     ".skk-proxy-frequency.json",
     ".skk-proxy-bayesian.json",
 ];
 
-/// Frequency-based predictor for completion candidate ranking.
+/// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
+/// skkserv プロトコルではユーザーの選択を知る手段がないため、自動学習は行わない。
+/// ユーザーが `~/.ruskk-frequency.json` を手動で編集し、seed データを投入する。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FrequencyPredictor {
-    /// Mapping of midashi -> (candidate -> count)
+    /// 見出し語 → (候補 → 出現回数) のマッピング
     pub frequencies: HashMap<String, HashMap<String, u64>>,
-    /// Mapping of context_word (kanji/word) -> (candidate -> count)
+    /// 文脈語（漢字/単語） → (候補 → 共起回数) のマッピング
     #[serde(default)]
     pub context_frequencies: HashMap<String, HashMap<String, u64>>,
     #[serde(skip)]
     pub storage_path: Option<PathBuf>,
-    #[serde(skip)]
-    pending_saves: u32,
 }
 
 impl FrequencyPredictor {
@@ -33,7 +32,6 @@ impl FrequencyPredictor {
             frequencies: HashMap::new(),
             context_frequencies: HashMap::new(),
             storage_path,
-            pending_saves: 0,
         };
         if let Some(ref path) = predictor.storage_path.clone() {
             if let Err(err) = predictor.load_with_legacy_fallback(path) {
@@ -70,43 +68,7 @@ impl FrequencyPredictor {
         Ok(())
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        if let Some(ref path) = self.storage_path {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let data = serde_json::to_string_pretty(&self)?;
-            fs::write(path, data)?;
-        }
-        Ok(())
-    }
-
-    /// Record selection of candidate given midashi and preceding kanji/word context.
-    pub fn observe(&mut self, context: &[String], midashi: &str, candidate: &str) {
-        let entry = self
-            .frequencies
-            .entry(midashi.to_string())
-            .or_insert_with(HashMap::new);
-        *entry.entry(candidate.to_string()).or_insert(0) += 1;
-
-        for ctx in context {
-            if !ctx.trim().is_empty() {
-                let ctx_entry = self
-                    .context_frequencies
-                    .entry(ctx.to_string())
-                    .or_insert_with(HashMap::new);
-                *ctx_entry.entry(candidate.to_string()).or_insert(0) += 1;
-            }
-        }
-
-        self.pending_saves += 1;
-        if self.pending_saves >= SAVE_INTERVAL {
-            let _ = self.save();
-            self.pending_saves = 0;
-        }
-    }
-
-    /// Rank candidates according to global frequency and context co-occurrence.
+    /// seed データの頻度と文脈共起に基づいて候補を並び替える。
     pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
         if candidates.len() <= 1 {
             return candidates.to_vec();
@@ -131,7 +93,7 @@ impl FrequencyPredictor {
                     })
                     .sum();
 
-                // Give higher weight (x10) to context co-occurrence
+                // 文脈共起は10倍の重みで評価する
                 let total_score = global_count + context_score * 10;
                 (idx, cand, total_score)
             })
@@ -165,16 +127,17 @@ mod tests {
         let mut predictor = FrequencyPredictor::new(None);
         let candidates = vec!["愛".to_string(), "相".to_string(), "藍".to_string()];
 
+        // 初期状態ではスコアがないため元の順序を維持
         let ranked = predictor.rank_candidates(&[], "あい", &candidates);
         assert_eq!(ranked, vec!["愛", "相", "藍"]);
 
-        predictor.observe(&[], "あい", "相");
-        predictor.observe(&[], "あい", "相");
-        predictor.observe(&[], "あい", "藍");
-        predictor.observe(&[], "あい", "藍");
-        predictor.observe(&[], "あい", "藍");
-        predictor.observe(&[], "あい", "藍");
-        predictor.observe(&[], "あい", "藍");
+        // seed データを直接設定（手動編集を模倣）
+        predictor.frequencies.insert("あい".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("相".to_string(), 2);
+            m.insert("藍".to_string(), 7);
+            m
+        });
 
         let ranked_after = predictor.rank_candidates(&[], "あい", &candidates);
         assert_eq!(ranked_after, vec!["藍", "相", "愛"]);
@@ -185,22 +148,24 @@ mod tests {
         let mut predictor = FrequencyPredictor::new(None);
         let candidates = vec!["着る".to_string(), "切る".to_string()];
 
-        // Observe "服" -> "着る"
-        predictor.observe(&["服".to_string()], "きる", "着る");
-        predictor.observe(&["服".to_string()], "きる", "着る");
+        // seed データを直接設定（手動編集を模倣）
+        predictor.context_frequencies.insert("服".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("着る".to_string(), 2);
+            m
+        });
+        predictor.context_frequencies.insert("肉".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("切る".to_string(), 3);
+            m
+        });
 
-        // Observe "肉" -> "切る"
-        predictor.observe(&["肉".to_string()], "きる", "切る");
-        predictor.observe(&["肉".to_string()], "きる", "切る");
-        predictor.observe(&["肉".to_string()], "きる", "切る");
-
-        // When context is "服", "着る" should rank first
+        // 文脈「服」のとき、「着る」が第1候補
         let ranked_fuku = predictor.rank_candidates(&["服".to_string()], "きる", &candidates);
         assert_eq!(ranked_fuku[0], "着る");
 
-        // When context is "肉", "切る" should rank first
+        // 文脈「肉」のとき、「切る」が第1候補
         let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
         assert_eq!(ranked_niku[0], "切る");
     }
 }
-

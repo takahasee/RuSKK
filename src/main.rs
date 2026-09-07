@@ -31,8 +31,7 @@ async fn main() -> anyhow::Result<()> {
         predictor: Arc::clone(&predictor),
     };
 
-    // SIGTERM / Ctrl-C を受け取ったらプロキシを停止し、学習データを保存する。
-    // skk-bayesian.el の kill-emacs-hook 相当。
+    // SIGTERM / Ctrl-C を受け取ったらプロキシを停止する。
     let shutdown = async {
         #[cfg(unix)]
         {
@@ -56,13 +55,6 @@ async fn main() -> anyhow::Result<()> {
         _ = shutdown => {}
     }
 
-    // シャットダウン時に必ず学習データをディスクへ書き出す。
-    // SAVE_INTERVAL に達していなくても確実に保存する。
-    let guard = predictor.lock().await;
-    match guard.save() {
-        Ok(()) => info!("frequency data saved on shutdown"),
-        Err(e) => tracing::warn!(error = %e, "failed to save frequency data on shutdown"),
-    }
-
+    info!("ruskk shutting down");
     Ok(())
 }
