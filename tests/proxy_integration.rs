@@ -385,7 +385,9 @@ async fn test_completion_burst_does_not_pollute_and_timeout_flushes() {
     client.write_all(b"1kattekimama \n").await.unwrap();
     let _ = client.read(&mut buf).await.unwrap();
 
-    // User hits Space to convert the typed word "katte" -> sends "1katte \n"
+    // User hits Space to convert the typed word "katte"
+    // (Requires a small delay to simulate human typing and avoid being caught by the 20ms burst filter)
+    tokio::time::sleep(Duration::from_millis(50)).await;
     client.write_all(b"1katte \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);

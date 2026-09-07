@@ -137,11 +137,14 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let is_okuri = is_okuri_midashi(&midashi_str);
 
                 // 直近 2 秒以内の最新 Completion prefix と完全に一致するか判定
-                // （一致する場合は、ユーザーが今まさにスペースキーで確定・変換しようとしている通常変換）
+                // （一致する場合は、ユーザーが今まさにスペースキーで確定・変換しようとしている通常変換。
+                // ただし、4 と 1 の間隔が 20ms 未満の場合は macSKK による補完候補選択の自動バースト送信なので通常変換とはみなさない）
                 let is_same_as_prefix = last_completion
                     .as_ref()
                     .map(|(prefix, time)| {
-                        now.duration_since(*time) < Duration::from_millis(2000)
+                        let elapsed = now.duration_since(*time);
+                        elapsed >= Duration::from_millis(20)
+                            && elapsed < Duration::from_millis(2000)
                             && &midashi_str == prefix
                     })
                     .unwrap_or(false);
@@ -167,17 +170,22 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                         })
                         .unwrap_or(false);
 
-                // 3. 直近 2 秒以内に Completion があり、かつ 200ms 未満のバースト Lookup か
-                // （※prefix と一致する通常変換はバースト除外対象としない）
-                let is_rapid_burst = !is_same_as_prefix
-                    && !is_okuri
+                // 3. 直近 2 秒以内に Completion があり、かつ極めて短い間隔（バースト）で送信されたか
+                // macSKK が補完候補を選択して確定したときなどは、4 と 1 をミリ秒単位のバーストで送信してくる。
+                let is_rapid_burst = !is_okuri
                     && last_completion
                         .as_ref()
-                        .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(2000))
+                        .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(20))
                         .unwrap_or(false)
-                    && last_lookup_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(200))
-                        .unwrap_or(false);
+                    || (!is_same_as_prefix
+                        && !is_okuri
+                        && last_completion
+                            .as_ref()
+                            .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(2000))
+                            .unwrap_or(false)
+                        && last_lookup_time
+                            .map(|t| now.duration_since(t) < Duration::from_millis(200))
+                            .unwrap_or(false));
 
                 // 4. macSKK がキー入力開始時（1文字目）に補完パネルを出すために自動送信してくる1文字Lookup
                 // （例: "か", "れ", "に", "ほ" 等）。送りあり（例: "きr"）は2文字なので除外されない。
