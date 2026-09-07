@@ -49,6 +49,10 @@ load_config() {
   YASKKSERV2_DICTIONARY="$(expand_path "$YASKKSERV2_DICTIONARY")"
   LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskk}")"
   WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskk.sh"
+  MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
+  if [ -n "$MACSKK_USER_DICT_PATH" ]; then
+    MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
+  fi
 }
 
 check_binaries() {
@@ -74,6 +78,7 @@ render_plist() {
     -e "s|@YASKKSERV2_DICTIONARY@|${YASKKSERV2_DICTIONARY}|g" \
     -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
+    -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
     "$template" >"$dest"
 }
 
@@ -109,12 +114,19 @@ do_install() {
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.yaskkserv2.plist"
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.skkserv.plist"
 
+  if [ -n "$MACSKK_USER_DICT_PATH" ]; then
+    render_plist "${ROOT}/launchd/com.ruskk.import-user-dict.plist" \
+      "${LAUNCH_AGENTS}/com.ruskk.import-user-dict.plist"
+    bootout_if_loaded "com.ruskk.import-user-dict"
+    launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.import-user-dict.plist"
+  fi
+
   echo "installed. logs: ${LOG_DIR}"
   echo "  tail -f ${LOG_DIR}/ruskk.log"
 }
 
 do_uninstall() {
-  for label in com.ruskk.skkserv com.ruskk.yaskkserv2 com.skkproxy.skkserv com.skkproxy.yaskkserv2 com.skkproxy.azookey; do
+  for label in com.ruskk.skkserv com.ruskk.yaskkserv2 com.ruskk.import-user-dict com.skkproxy.skkserv com.skkproxy.yaskkserv2 com.skkproxy.azookey; do
     bootout_if_loaded "$label"
     rm -f "${LAUNCH_AGENTS}/${label}.plist"
   done
@@ -123,7 +135,7 @@ do_uninstall() {
 }
 
 do_status() {
-  for label in com.ruskk.yaskkserv2 com.ruskk.skkserv; do
+  for label in com.ruskk.yaskkserv2 com.ruskk.skkserv com.ruskk.import-user-dict; do
     if launchctl print "${DOMAIN}/${label}" >/dev/null 2>&1; then
       echo "${label}: loaded"
     else

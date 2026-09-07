@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ruskk.import-user-dict</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@RUSKK_BIN@</string>
+        <string>import-user-dict</string>
+        <string>@MACSKK_USER_DICT_PATH@</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>@LOG_DIR@/import.log</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG_DIR@/import.error.log</string>
+</dict>
+</plist>
