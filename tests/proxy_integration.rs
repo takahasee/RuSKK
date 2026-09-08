@@ -313,3 +313,88 @@ async fn test_proxy_suppresses_completion_refer_lookup() {
     upstream_handle.abort();
 }
 
+/// macSKK の入力開始時（1文字目）プレビューLookup が 4\n で抑制され、
+/// ユーザーが Space を押した 2回目の Lookup で正常に候補が返ることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_single_char_preview_suppressed_then_explicit_convert() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1き ".as_bytes()) {
+                            let _ = stream.write_all("1/木/気/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "fallback".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        predictor: shared_predictor,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 入力開始時に macSKK が補完候補取得のため自動送信してくる 1文字目の Lookup "1き "
+    // RuSKK はこれを検出し、直ちに 4\n を返して誤爆確定（0.5秒ルール）を物理的に抑止する！
+    client.write_all("1き \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "4\n", "1回目の1文字プレビューLookupは4\\nで抑制されなければならない");
+
+    // 2. ユーザーが Space キーを押して「き」を漢字に変換しようとした場合（同一見出し語の2回目）
+    // 通常変換として正規の候補が返る！
+    client.write_all("1き \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/木/気/\n", "2回目の1文字Lookupは通常変換として候補が返らなければならない");
+
+    // 3. 次候補送り（3回目）もスムーズに返る
+    client.write_all("1き \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/木/気/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+

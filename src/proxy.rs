@@ -75,6 +75,16 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let mut last_completion: Option<(String, Instant)> = None;
     let mut last_lookup_time: Option<Instant> = None;
 
+    // macSKK の入力開始時（1文字目）プレビューLookup検出用: (見出し語, 時刻)
+    // macSKK はキー入力開始時（1文字目）に、完全一致補完候補を取得するため自動的に
+    // 1文字 Lookup（例: "う", "か", "て"）を送信してくる（UserDict.swift:98）。
+    // この 1回目の 1文字 Lookup に候補を返してしまうと、macSKK がそれを補完候補としてセットし、
+    // 0.5秒後にキー入力があった瞬間に「雨」「蚊」「手」などが勝手に確定（addFixedText）されてしまう。
+    // そのため 1回目の 1文字 Lookup には直ちに 4\n を返して補完候補展開を抑止する。
+    // ユーザーが Space を押して 1文字漢字（「手」「木」等）を通常変換した場合は同一見出し語で
+    // 再度 Lookup が届くため、通常変換としてバックエンドへ照会し、1文字漢字の変換を可能にする。
+    let mut last_single_char_preview: Option<(String, Instant)> = None;
+
     loop {
         line.clear();
 
@@ -203,6 +213,50 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                     continue;
                 }
 
+                // macSKK の入力開始時（1文字目）プレビューLookup の抑止:
+                // 非ASCII 1文字の見出し語（例: "う", "か", "て" 等）は、キー入力開始時に macSKK が
+                // 補完候補取得のため自動送信してくる（UserDict.swift:98）。
+                // この 1回目の Lookup で候補を返すと 0.5秒後のキー入力で誤爆確定（「雨」「手」「蚊」等）するため、
+                // 1回目は直ちに 4\n を返して補完誤爆確定を完全に防止する。
+                // ユーザーが Space を押して 1文字漢字（「手」「木」等）を通常変換した場合は同一見出し語で
+                // 再度 Lookup が届くため、通常変換としてバックエンドへ照会し、1文字漢字の変換を可能にする。
+                let is_single_char = !is_okuri
+                    && midashi_str.chars().count() == 1
+                    && midashi_str.chars().next().map(|c| !c.is_ascii()).unwrap_or(false);
+
+                if is_single_char {
+                    let is_consecutive = pending_context
+                        .as_ref()
+                        .map(|(prev, _, _)| prev == &midashi_str)
+                        .unwrap_or(false);
+
+                    let is_second_press = last_single_char_preview
+                        .as_ref()
+                        .map(|(prev, time)| prev == &midashi_str && now.duration_since(*time) < Duration::from_secs(3))
+                        .unwrap_or(false);
+
+                    if !is_consecutive && !is_second_press {
+                        debug!(
+                            midashi = %midashi_str,
+                            "suppressed 1-char preview lookup with 4 to prevent unintended commit"
+                        );
+                        last_single_char_preview = Some((midashi_str.clone(), now));
+                        writer.write_all(b"4\n").await?;
+                        writer.flush().await?;
+                        continue;
+                    } else {
+                        debug!(
+                            midashi = %midashi_str,
+                            is_consecutive,
+                            is_second_press,
+                            "allowed 1-char lookup as explicit conversion"
+                        );
+                        last_single_char_preview = Some((midashi_str.clone(), now));
+                    }
+                } else {
+                    last_single_char_preview = None;
+                }
+
                 // 遅延確定方式（Deferred Context Commit）:
                 // 補完クエリでない通常変換で、かつ前回の見出し語と異なる新しい単語が始まった場合、
                 // 前回の単語が確定されたとみなして session_context に昇格させる。
@@ -255,6 +309,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
             }
             Request::Completion(ref prefix_bytes) => {
                 let now = Instant::now();
+                last_single_char_preview = None;
                 if let Some(t) = last_context_time
                     && now.duration_since(t) > Duration::from_secs(60) {
                         session_context.clear();
