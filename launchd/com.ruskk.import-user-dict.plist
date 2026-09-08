@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>@RUSKK_BIN@</string>
+        <string>@IMPORTER_APP_BIN@</string>
         <string>import-user-dict</string>
         <string>@MACSKK_USER_DICT_PATH@</string>
     </array>

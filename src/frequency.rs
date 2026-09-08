@@ -33,11 +33,10 @@ impl FrequencyPredictor {
             context_frequencies: HashMap::new(),
             storage_path,
         };
-        if let Some(ref path) = predictor.storage_path.clone() {
-            if let Err(err) = predictor.load_with_legacy_fallback(path) {
+        if let Some(ref path) = predictor.storage_path.clone()
+            && let Err(err) = predictor.load_with_legacy_fallback(path) {
                 debug!(error = %err, "no existing frequency data loaded, starting fresh");
             }
-        }
         predictor
     }
 
@@ -79,9 +78,49 @@ impl FrequencyPredictor {
         Ok(())
     }
 
+    pub const DEFAULT_SEED_JSON: &'static str = include_str!("../data/default-seed.json");
+
+    /// 組み込みのデフォルト文脈プリセットをパースして返す。
+    pub fn default_preset_data() -> anyhow::Result<FrequencyPredictorData> {
+        let data: FrequencyPredictorData = serde_json::from_str(Self::DEFAULT_SEED_JSON)?;
+        Ok(data)
+    }
+
+    /// 組み込みのデフォルト文脈プリセット（context_frequencies）をマージする。
+    /// 既存の frequencies や context_frequencies は維持され、プリセット側の値が追加・更新（最大値）される。
+    pub fn merge_default_presets(&mut self) -> anyhow::Result<()> {
+        let preset = Self::default_preset_data()?;
+        if let Some(ctx_map) = preset.context_frequencies {
+            for (ctx, cands) in ctx_map {
+                let entry = self.context_frequencies.entry(ctx).or_default();
+                for (cand, count) in cands {
+                    let current = entry.entry(cand).or_insert(0);
+                    *current = (*current).max(count);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// seed ファイル（~/.ruskk-frequency.json）を初期化またはマージして保存する。
+    /// force が true の場合はプリセットで完全上書きし、false の場合は既存データを保持したままマージする。
+    pub fn init_seed(&mut self, force: bool) -> anyhow::Result<()> {
+        if force {
+            let preset = Self::default_preset_data()?;
+            self.frequencies = preset.frequencies;
+            self.context_frequencies = preset.context_frequencies.unwrap_or_default();
+        } else {
+            self.merge_default_presets()?;
+        }
+        self.save()?;
+        Ok(())
+    }
+
     /// macSKK などのユーザー辞書 (skk-jisyo.utf8) をパースし、
     /// 候補の順番に応じたスコアを frequencies にインポート（加算）する。
-    /// context_frequencies は変更しない。
+    /// 送りありブロック（例: `きr /[る/着/切/伐/]/[り/切/]/`）も正確にパースし、
+    /// `"[る"` や `"]"` などの不要記号の混入を完全に防止する。
+    /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
     pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
         let content = fs::read_to_string(dict_path)?;
         
@@ -92,7 +131,7 @@ impl FrequencyPredictor {
                 continue;
             }
 
-            // フォーマット: 見出し語 /候補1/候補2/
+            // フォーマット: 見出し語 /候補1/候補2/ または 見出し語 /[送り/候補1/]/
             let mut parts = line.splitn(2, ' ');
             let midashi = match parts.next() {
                 Some(m) if !m.is_empty() => m,
@@ -100,32 +139,31 @@ impl FrequencyPredictor {
             };
             
             let cands_part = match parts.next() {
-                Some(c) if c.starts_with('/') && c.ends_with('/') => &c[1..c.len() - 1],
+                Some(c) if c.starts_with('/') && c.ends_with('/') => c,
                 _ => continue,
             };
 
-            let candidates: Vec<&str> = cands_part.split('/').collect();
+            let candidates = parse_dict_line_candidates(cands_part);
             if candidates.is_empty() {
                 continue;
             }
 
-            let entry = self.frequencies.entry(midashi.to_string()).or_insert_with(HashMap::new);
+            let entry = self.frequencies.entry(midashi.to_string()).or_default();
             
             // 順番に応じてスコアを付与 (先頭ほど高い)
             // 候補がN個の場合、1番目=N点, 2番目=N-1点, ..., N番目=1点
             let total_cands = candidates.len() as u64;
-            for (idx, cand) in candidates.iter().enumerate() {
-                // 注釈付き候補 (例: 候補;注釈) の場合は候補部分だけを取り出す
-                let cand_text = cand.split(';').next().unwrap_or(cand);
-                if cand_text.is_empty() {
-                    continue;
-                }
-                
+            for (idx, cand_text) in candidates.iter().enumerate() {
                 let score = total_cands.saturating_sub(idx as u64);
-                *entry.entry(cand_text.to_string()).or_insert(0) += score;
+                *entry.entry(cand_text.clone()).or_insert(0) += score;
             }
         }
         
+        // context_frequencies が空なら、デフォルトプリセットも一緒に初期化
+        if self.context_frequencies.is_empty() {
+            let _ = self.merge_default_presets();
+        }
+
         // インポートした結果を保存する
         self.save()?;
         
@@ -133,6 +171,8 @@ impl FrequencyPredictor {
     }
 
     /// seed データの頻度と文脈共起に基づいて候補を並び替える。
+    /// 候補文字列に注釈（`;` 以降）が含まれる場合や、
+    /// 送りあり単漢字（"切"）と活用形（"切る"）の表記差がある場合も柔軟にスコアを照合する。
     pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
         if candidates.len() <= 1 {
             return candidates.to_vec();
@@ -145,14 +185,14 @@ impl FrequencyPredictor {
             .iter()
             .enumerate()
             .map(|(idx, cand)| {
-                let global_count = freq_map.get(cand).copied().unwrap_or(0);
+                let clean = clean_candidate(cand);
+                let global_count = get_score_flexible(freq_map, clean);
                 let context_score: u64 = context
                     .iter()
                     .map(|ctx| {
                         self.context_frequencies
                             .get(ctx)
-                            .and_then(|m| m.get(cand))
-                            .copied()
+                            .map(|m| get_score_flexible(m, clean))
                             .unwrap_or(0)
                     })
                     .sum();
@@ -172,8 +212,69 @@ impl FrequencyPredictor {
     }
 }
 
+/// マップからスコアを取得する。完全一致を最優先し、
+/// 見つからない場合は送りあり単漢字（"切"）と活用形（"切る"）の前方一致を許容する。
+fn get_score_flexible(map: &HashMap<String, u64>, target: &str) -> u64 {
+    if let Some(&score) = map.get(target) {
+        return score;
+    }
+    map.iter()
+        .filter(|(k, _)| k.starts_with(target) || target.starts_with(k.as_str()))
+        .map(|(_, &score)| score)
+        .max()
+        .unwrap_or(0)
+}
+
+/// 候補文字列から注釈（`;` 以降）を除去した本体文字列を返す。
+pub fn clean_candidate(cand: &str) -> &str {
+    cand.split(';').next().unwrap_or(cand).trim()
+}
+
+/// SKK 辞書エントリの候補部分（`/[る/着/切/伐/]/[り/切/]/` や `/変換/返還/`）から、
+/// 送り仮名ブロック `[...]` や注釈 `;...` を解析し、純粋な候補文字列のリストを返す。
+pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    let trimmed = cands_part.trim_matches('/');
+    if trimmed.is_empty() {
+        return candidates;
+    }
+
+    let mut in_bracket = false;
+    let mut is_first_in_bracket = false;
+
+    for part in trimmed.split('/') {
+        let mut p = part;
+        if p.starts_with('[') {
+            in_bracket = true;
+            is_first_in_bracket = true;
+            p = &p[1..];
+        }
+
+        let ends_bracket = p.ends_with(']');
+        if ends_bracket {
+            p = &p[..p.len() - 1];
+        }
+
+        if in_bracket && is_first_in_bracket {
+            // 送り仮名ブロックの最初の要素は「送り仮名」（例: "る", "り"）なので候補ではない
+            is_first_in_bracket = false;
+        } else if !p.is_empty() {
+            let cand_text = clean_candidate(p);
+            if !cand_text.is_empty() && !candidates.iter().any(|c| c == cand_text) {
+                candidates.push(cand_text.to_string());
+            }
+        }
+
+        if ends_bracket {
+            in_bracket = false;
+        }
+    }
+
+    candidates
+}
+
 #[derive(Serialize, Deserialize)]
-struct FrequencyPredictorData {
+pub struct FrequencyPredictorData {
     pub frequencies: HashMap<String, HashMap<String, u64>>,
     #[serde(default)]
     pub context_frequencies: Option<HashMap<String, HashMap<String, u64>>>,
@@ -238,10 +339,10 @@ mod tests {
         use tempfile::NamedTempFile;
         use std::io::Write;
 
-        // ダミーの SKK 辞書ファイルを作成
+        // ダミーの SKK 辞書ファイルを作成（macSKK の送りありブロック形式を含む）
         let mut dict_file = NamedTempFile::new().unwrap();
         writeln!(dict_file, ";; okuri-ari entries.").unwrap();
-        writeln!(dict_file, "きr /切る;注釈/着る/伐る/").unwrap();
+        writeln!(dict_file, "きr /[る/着/切;注釈/伐/]/[り/切/]/").unwrap();
         writeln!(dict_file, ";; okuri-nasi entries.").unwrap();
         writeln!(dict_file, "ふく /服/吹く/副/").unwrap();
         
@@ -252,7 +353,7 @@ mod tests {
         // 既存の context_frequencies が保持されることを確認するため追加
         predictor.context_frequencies.insert("肉".to_string(), {
             let mut m = HashMap::new();
-            m.insert("切る".to_string(), 10);
+            m.insert("切".to_string(), 10);
             m
         });
 
@@ -260,11 +361,20 @@ mod tests {
         predictor.import_from_skk_dict(dict_file.path()).unwrap();
 
         // frequencies が正しくインポートされているか確認
-        // "きr": 切る=3, 着る=2, 伐る=1
+        // 送りブロック `/[る/着/切;注釈/伐/]/[り/切/]/` から "着"=3, "切"=2, "伐"=1 となること
+        // "[る" や "]" などのゴミが一切含まれないこと
         let kir_freqs = predictor.frequencies.get("きr").unwrap();
-        assert_eq!(kir_freqs.get("切る").copied().unwrap_or(0), 3);
-        assert_eq!(kir_freqs.get("着る").copied().unwrap_or(0), 2);
-        assert_eq!(kir_freqs.get("伐る").copied().unwrap_or(0), 1);
+        assert!(!kir_freqs.contains_key("[る"));
+        assert!(!kir_freqs.contains_key("]"));
+        assert_eq!(kir_freqs.get("着").copied().unwrap_or(0), 3);
+        assert_eq!(kir_freqs.get("切").copied().unwrap_or(0), 2);
+        assert_eq!(kir_freqs.get("伐").copied().unwrap_or(0), 1);
+
+        // 注釈付き候補（例: "切;注釈あり"）でもスコア照合できていること
+        let ranked = predictor.rank_candidates(&[], "きr", &["伐".to_string(), "切;注釈あり".to_string(), "着".to_string()]);
+        assert_eq!(ranked[0], "着");
+        assert_eq!(ranked[1], "切;注釈あり");
+        assert_eq!(ranked[2], "伐");
 
         // "ふく": 服=3, 吹く=2, 副=1
         let fuku_freqs = predictor.frequencies.get("ふく").unwrap();
@@ -274,11 +384,46 @@ mod tests {
 
         // context_frequencies が維持されているか確認
         let niku_ctx = predictor.context_frequencies.get("肉").unwrap();
-        assert_eq!(niku_ctx.get("切る").copied().unwrap_or(0), 10);
+        assert_eq!(niku_ctx.get("切").copied().unwrap_or(0), 10);
 
         // ファイルにも保存されているか確認
         let mut loaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
         loaded.load(json_file.path()).unwrap();
-        assert_eq!(loaded.frequencies.get("きr").unwrap().get("切る").copied().unwrap_or(0), 3);
+        assert_eq!(loaded.frequencies.get("きr").unwrap().get("着").copied().unwrap_or(0), 3);
+    }
+
+    #[test]
+    fn test_init_seed_and_merge_default_presets() {
+        use tempfile::NamedTempFile;
+
+        let json_file = NamedTempFile::new().unwrap();
+        let mut predictor = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
+
+        // 初期状態では context_frequencies は空
+        assert!(predictor.context_frequencies.is_empty());
+
+        // init_seed を実行
+        predictor.init_seed(false).unwrap();
+
+        // デフォルトプリセットの代表的ペアが読み込まれていること
+        assert_eq!(
+            predictor.context_frequencies.get("服").unwrap().get("着る").copied().unwrap_or(0),
+            10
+        );
+        assert_eq!(
+            predictor.context_frequencies.get("肉").unwrap().get("切る").copied().unwrap_or(0),
+            10
+        );
+        assert_eq!(
+            predictor.context_frequencies.get("時間").unwrap().get("計る").copied().unwrap_or(0),
+            10
+        );
+
+        // ファイルから再ロードしても正しく永続化されていること
+        let reloaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
+        assert_eq!(
+            reloaded.context_frequencies.get("服").unwrap().get("着る").copied().unwrap_or(0),
+            10
+        );
     }
 }

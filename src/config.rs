@@ -25,11 +25,11 @@ pub struct Args {
     pub yaskkserv2: SocketAddr,
 
     /// Timeout for azoo-key-skkserv queries (milliseconds)
-    #[arg(long, default_value_t = 500)]
+    #[arg(long, default_value_t = 400)]
     pub azookey_timeout_ms: u64,
 
     /// Timeout for yaskkserv2 queries (milliseconds)
-    #[arg(long, default_value_t = 400)]
+    #[arg(long, default_value_t = 550)]
     pub yaskkserv2_timeout_ms: u64,
 
     #[command(subcommand)]
@@ -42,6 +42,12 @@ pub enum Command {
     ImportUserDict {
         /// Path to macSKK user dictionary (e.g., skk-jisyo.utf8)
         path: std::path::PathBuf,
+    },
+    /// Initialize or merge default context co-occurrence presets into ~/.ruskk-frequency.json
+    InitSeed {
+        /// Overwrite completely with presets instead of merging with existing data
+        #[arg(long, short)]
+        force: bool,
     },
 }
 

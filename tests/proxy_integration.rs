@@ -94,28 +94,53 @@ async fn test_proxy_ranks_by_seed_context() {
     let mut buf = [0u8; 512];
 
     // Lookup して候補返却を確認（プロキシ動作確認）
+    // 「服」を変換すると、session_context に「服」が追跡される
     client.write_all(b"1fuku \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.contains("服"));
+    assert_eq!(resp, "1/服/\n");
 
-    // seed データにコンテキスト「服」→「着る」が定義されているが、
-    // session_context は自動更新されないため、初回の KiRu では元順序のまま
+    // upstream は通常「切る」が第1候補だが、
+    // seed データにコンテキスト「服」→「着る」が定義されているため、
+    // 「着る」が第1候補に昇格する！
     client.write_all(b"1KiRu \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    // session_context が空なので、seed のコンテキスト共起は使われない → 元順序
+    assert_eq!(resp, "1/着る/切る/\n");
+
+    // 次に「肉」を変換すると、session_context が「肉」に更新される
+    client.write_all(b"1niku \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/肉/\n");
+
+    // seed データにコンテキスト「肉」→「切る」が定義されているため、
+    // 今度は「切る」が第1候補になる！
+    client.write_all(b"1KiRu \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/切る/着る/\n");
+
+    // --- テスト: 1文字プレビュー等による文脈汚染防止 ---
+    // 1文字の非ASCII見出し（プレビュー）が来ても、直前の「肉」文脈は上書きされない
+    client.write_all(b"1ka \n").await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // 再度 KiRu を引くと、依然として「肉」文脈が維持されており「切る」が第1候補
+    client.write_all(b"1KiRu \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
     assert_eq!(resp, "1/切る/着る/\n");
 
     // --- テスト: seed データが変更されていないことを確認 ---
-    // 自動学習を廃止したので、lookup しても frequencies は更新されない
+    // 自動学習を廃止したので、lookup しても frequencies は更新されない（読み取り専用）
     tokio::time::sleep(Duration::from_millis(100)).await;
     {
         let guard = shared_predictor.lock().await;
         assert_eq!(
             guard.frequencies.len(),
             initial_freq_count,
-            "frequencies must NOT change after lookups (no auto-learning)"
+            "frequencies must NOT change after lookups (read-only seed file)"
         );
     }
 

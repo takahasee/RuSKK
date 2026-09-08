@@ -38,16 +38,34 @@ skkserv プロトコルの制約上、クライアント（macSKK）側でユー
 
 この例では、「服」と入力した直後に「きr」を変換すると「着る」が、「肉」の直後なら「切る」が第1候補になるようにスコアリングされます。
 
+### 代表的な文脈共起プリセットの導入 (init-seed)
+
+日本語で頻出する代表的な同音異義語・送りあり動詞のコロケーション（共起ペア）を組み込んだプリセットを、ワンコマンドで `~/.ruskk-frequency.json` に安全に生成・マージできます。
+
+```sh
+# 既存の個人頻度データを保持したまま、文脈プリセットをマージ
+ruskk init-seed
+
+# 完全にプリセットの初期状態に戻す場合
+ruskk init-seed --force
+```
+
 ### macSKK ユーザー辞書からの頻度インポート
 
-macSKK のローカル辞書に蓄積された「最近選択した候補」の情報を `~/.ruskk-frequency.json` に取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます）。
+macSKK のローカル辞書に蓄積された「最近選択した候補」の情報を `~/.ruskk-frequency.json` に取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます。文脈共起が空の場合はプリセットも自動注入されます）。
 
 ```sh
 # フルディスクアクセス権限を持つターミナルから実行してください
 ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
 ```
 
-※ macSKK のユーザー辞書は `~/Library/Containers` 配下にあるため、ターミナルに「フルディスクアクセス」権限が必要です。
+※ macSKK のユーザー辞書は `~/Library/Containers` 配下にあるため、ターミナルから手動実行する場合はターミナルに「フルディスクアクセス」権限が必要です。
+
+#### 1時間ごとの完全自動定期インポート (LaunchAgent)
+
+`launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、専用のバックグラウンドヘルパー `~/Applications/RuSKKImporter.app` が自動生成され、1時間ごとに macSKK ユーザー辞書から自動インポートされます。
+
+初回のみ、「システム設定」→「プライバシーとセキュリティ」→「フルディスクアクセス」で `~/Applications/RuSKKImporter.app` を追加・許可してください（一度許可すれば、以降の再ビルドや再起動後も権限が保持されます）。
 
 ## ビルド
 

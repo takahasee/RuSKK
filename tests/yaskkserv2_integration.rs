@@ -126,16 +126,26 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
     client.write_all("1ふく \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp1 = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp1.contains("服"), "Expected '服' in response, got: {}", resp1);
+    assert_eq!(resp1, "1/服/\n");
 
-    // Context learning is disabled. Even if the seed data has "服" -> "着る",
-    // the proxy doesn't track session context automatically anymore.
-    // We only verify that the response comes back correctly decoded from EUC-JP.
+    // seed データに「服」→「着る」が定義されているため、
+    // yaskkserv2 の返却順（切る/着る）に関わらず、「着る」が第1候補に並び替えられる！
     client.write_all("1きr \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n]);
-    // It should remain unchanged since session context is empty
-    assert_eq!(resp2, "1/切る/着る/\n");
+    assert_eq!(resp2, "1/着る/切る/\n");
+
+    // 続いて "にく" を変換
+    client.write_all("1にく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp3 = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp3, "1/肉/\n");
+
+    // seed データに「肉」→「切る」が定義されているため、今度は「切る」が第1候補になる！
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp4 = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp4, "1/切る/着る/\n");
 
     drop(client);
     proxy_handle.abort();

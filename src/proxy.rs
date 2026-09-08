@@ -1,7 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
@@ -57,10 +60,20 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
 
-    // rank_candidates に渡すセッション文脈。
-    // skkserv プロトコルではユーザーが実際に選択した候補を知る手段がないため、
-    // 文脈の自動更新は行わない（誤った候補で文脈を汚染するのを防ぐ）。
-    let session_context: Vec<String> = Vec::new();
+    // rank_candidates に渡すセッション文脈（直前に変換・確定した漢字単語）。
+    // 手動 seed ファイルへの書き込み（自動学習）は行わず、メモリ内セッションでのみ追跡する。
+    let mut session_context: Vec<String> = Vec::new();
+    let mut last_context_time: Option<Instant> = None;
+
+    // 前回の通常変換で返却した保留中の文脈候補: (見出し語, 漢字単語, 時刻)
+    // 候補選択中（同一見出し語の再Lookup）は確定とみなさず、
+    // 次の「異なる通常変換見出し語」が入力された時点で直前単語が真に確定されたとみなして昇格させる。
+    let mut pending_context: Option<(String, String, Instant)> = None;
+
+    // macSKK の補完（Completion）クエリやプレビューによる文脈汚染を防止するためのトラッキング
+    let mut recent_completions: HashMap<String, Instant> = HashMap::new();
+    let mut last_completion: Option<(String, Instant)> = None;
+    let mut last_lookup_time: Option<Instant> = None;
 
     loop {
         line.clear();
@@ -104,7 +117,99 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 writer.write_all(host.as_bytes()).await?;
             }
             Request::Lookup(ref midashi) => {
+                let now = Instant::now();
                 let midashi_str = decode_midashi(midashi);
+
+                // 前回の文脈更新から60秒以上経過している場合は、古い文脈を安全に消去する
+                if let Some(t) = last_context_time
+                    && now.duration_since(t) > Duration::from_secs(60) {
+                        session_context.clear();
+                        last_context_time = None;
+                        pending_context = None;
+                    }
+
+                // 有効期限（3秒）の切れた古い補完情報を掃除
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3));
+
+                let is_okuri = is_okuri_midashi(&midashi_str);
+
+                // 直近 2 秒以内の最新 Completion prefix と完全に一致するか判定
+                // （一致する場合は、ユーザーが補完候補ではなくその prefix のまま確定・変換しようとしている通常変換。
+                // ただし、4 と 1 の間隔が 20ms 未満の場合は macSKK による補完候補選択の自動バースト送信なので通常変換とはみなさない）
+                let is_same_as_prefix = last_completion
+                    .as_ref()
+                    .map(|(prefix, time)| {
+                        let elapsed = now.duration_since(*time);
+                        elapsed >= Duration::from_millis(20)
+                            && elapsed < Duration::from_millis(2000)
+                            && &midashi_str == prefix
+                    })
+                    .unwrap_or(false);
+
+                // --- macSKK の補完クエリ（裏で自動送信される展開 Lookup）の除外判定 ---
+                // 1. 直近 3 秒以内に返した補完候補一覧に含まれているか
+                let is_in_recent_completions = !is_same_as_prefix
+                    && !is_okuri
+                    && recent_completions.contains_key(&midashi_str);
+
+                // 2. 直近の最新 Completion prefix より長い単語か（ローカル辞書由来の補完候補プレビュー）
+                let is_prefix_completion = !is_okuri
+                    && last_completion
+                        .as_ref()
+                        .map(|(prefix, time)| {
+                            now.duration_since(*time) < Duration::from_millis(2000)
+                                && !prefix.is_empty()
+                                && midashi_str.starts_with(prefix)
+                                && midashi_str != *prefix
+                        })
+                        .unwrap_or(false);
+
+                // 3. 補完直後の極短時間（20ms 未満）バースト、または連続バースト
+                let is_rapid_burst = !is_okuri
+                    && last_completion
+                        .as_ref()
+                        .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(20))
+                        .unwrap_or(false)
+                    || (!is_same_as_prefix
+                        && !is_okuri
+                        && last_completion
+                            .as_ref()
+                            .map(|(_, time)| now.duration_since(*time) < Duration::from_millis(2000))
+                            .unwrap_or(false)
+                        && last_lookup_time
+                            .map(|t| now.duration_since(t) < Duration::from_millis(200))
+                            .unwrap_or(false));
+
+                // 4. macSKK がキー入力開始時（1文字目）に補完パネルを出すために自動送信してくる1文字Lookup
+                let is_single_char_preview = midashi_str.chars().count() == 1
+                    && midashi_str.chars().next().map(|c| !c.is_ascii()).unwrap_or(false);
+
+                let is_completion_refer = is_in_recent_completions
+                    || is_prefix_completion
+                    || is_rapid_burst
+                    || is_single_char_preview;
+
+                last_lookup_time = Some(now);
+
+                // 遅延確定方式（Deferred Context Commit）:
+                // 補完クエリでない通常変換で、かつ前回の見出し語と異なる新しい単語が始まった場合、
+                // 前回の単語が確定されたとみなして session_context に昇格させる。
+                if !is_completion_refer
+                    && let Some((prev_midashi, prev_word, _)) = pending_context.take() {
+                        if prev_midashi != midashi_str {
+                            session_context.clear();
+                            session_context.push(prev_word);
+                            last_context_time = Some(now);
+                            debug!(
+                                context = ?session_context,
+                                new_midashi = %midashi_str,
+                                "deferred context committed"
+                            );
+                        } else {
+                            // 同一見出し語での連続Lookup（次候補送り中）なので保留を継続
+                            pending_context = Some((prev_midashi, prev_word, now));
+                        }
+                    }
 
                 let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
                 let final_response = if is_found(&response) {
@@ -115,6 +220,19 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                             let guard = proxy.predictor.lock().await;
                             guard.rank_candidates(&session_context, &midashi_str, &cands)
                         };
+
+                        // 補完クエリやプレビューでない通常変換の場合、
+                        // 返却第1候補が漢字を含んでいれば pending_context に保留する（まだ確定とはみなさない）
+                        if !is_completion_refer
+                            && let Some(top_cand) = ranked.first() {
+                                let clean = clean_candidate(top_cand);
+                                if contains_kanji(clean) {
+                                    pending_context = Some((midashi_str.clone(), clean.to_string(), now));
+                                } else {
+                                    pending_context = None;
+                                }
+                            }
+
                         format_candidates_response(&ranked)
                     } else {
                         response
@@ -124,8 +242,30 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 };
                 writer.write_all(&final_response).await?;
             }
-            Request::Completion(ref _prefix_bytes) => {
-                let (response, _completions) = completion_with_aggregation(&proxy, &request, &session_context).await;
+            Request::Completion(ref prefix_bytes) => {
+                let now = Instant::now();
+                if let Some(t) = last_context_time
+                    && now.duration_since(t) > Duration::from_secs(60) {
+                        session_context.clear();
+                        last_context_time = None;
+                    }
+
+                let prefix_str = decode_midashi(prefix_bytes);
+                let (response, completions) = completion_with_aggregation(&proxy, &request, &session_context).await;
+                last_completion = Some((prefix_str.clone(), now));
+
+                // 3秒以上経過した古い補完候補を削除し、最新を追加
+                recent_completions.retain(|_, t| now.duration_since(*t) < Duration::from_secs(3));
+                for cand in completions {
+                    let clean = clean_candidate(&cand);
+                    if !clean.is_empty() && clean != prefix_str {
+                        recent_completions.insert(clean.to_string(), now);
+                    }
+                    if cand != prefix_str {
+                        recent_completions.insert(cand, now);
+                    }
+                }
+
                 writer.write_all(&response).await?;
             }
         }
@@ -227,4 +367,31 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: 
     );
 
     (format_candidates_response(&ranked), ranked)
+}
+
+/// 候補文字列から注釈（`;` 以降）を除去した本体文字列を返す。
+fn clean_candidate(cand: &str) -> &str {
+    cand.split(';').next().unwrap_or(cand).trim()
+}
+
+/// 文字列にCJK漢字（U+4E00–U+9FFF など）が含まれるか判定する。
+/// session_context には漢字を含む単語のみ積む（ひらがな・英数字のみは除外）。
+fn contains_kanji(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}'   // CJK統合漢字
+            | '\u{3400}'..='\u{4DBF}' // CJK統合漢字拡張A
+            | '\u{F900}'..='\u{FAFF}' // CJK互換漢字
+        )
+    })
+}
+
+/// SKKの送りあり見出し（例: "きr", "おくr", "たべr" 等）か判定する。
+/// 送りあり見出しは平仮名等の非ASCII文字の末尾に送りブロック用のアルファベット英字が付く。
+fn is_okuri_midashi(midashi: &str) -> bool {
+    let mut chars = midashi.chars().rev();
+    match (chars.next(), chars.next()) {
+        (Some(last), Some(prev)) => last.is_ascii_alphabetic() && !prev.is_ascii(),
+        _ => false,
+    }
 }

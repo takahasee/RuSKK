@@ -49,6 +49,8 @@ load_config() {
   YASKKSERV2_DICTIONARY="$(expand_path "$YASKKSERV2_DICTIONARY")"
   LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskk}")"
   WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskk.sh"
+  IMPORTER_APP="${HOME}/Applications/RuSKKImporter.app"
+  IMPORTER_APP_BIN="${IMPORTER_APP}/Contents/MacOS/RuSKKImporter"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
@@ -77,6 +79,7 @@ render_plist() {
     -e "s|@YASKKSERV2_BIN@|${YASKKSERV2_BIN}|g" \
     -e "s|@YASKKSERV2_DICTIONARY@|${YASKKSERV2_DICTIONARY}|g" \
     -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
+    -e "s|@IMPORTER_APP_BIN@|${IMPORTER_APP_BIN}|g" \
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
     -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
     "$template" >"$dest"
@@ -95,7 +98,7 @@ do_install() {
   check_binaries
 
   mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR"
-  chmod +x "$WAIT_SCRIPT"
+  chmod +x "$WAIT_SCRIPT" "${ROOT}/scripts/build-importer-app.sh"
 
   # 旧 skk-proxy 関連の登録をクリーンアップ
   for old_label in com.skkproxy.azookey com.skkproxy.skkserv com.skkproxy.yaskkserv2; do
@@ -115,6 +118,7 @@ do_install() {
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.skkserv.plist"
 
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
+    "${ROOT}/scripts/build-importer-app.sh"
     render_plist "${ROOT}/launchd/com.ruskk.import-user-dict.plist" \
       "${LAUNCH_AGENTS}/com.ruskk.import-user-dict.plist"
     bootout_if_loaded "com.ruskk.import-user-dict"
