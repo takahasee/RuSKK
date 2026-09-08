@@ -20,6 +20,8 @@
         <string>127.0.0.1</string>
         <key>YASKKSERV2_PORT</key>
         <string>1179</string>
+        <key>RUST_LOG</key>
+        <string>ruskk=debug,info</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

@@ -230,3 +230,86 @@ async fn test_proxy_basic_lookup_passthrough() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+/// macSKK の補完クエリ直後に裏で自動送信される展開 Lookup が
+/// 4\n で抑制され、macSKK の勝手な確定（0.3秒誤爆確定）を防止することを検証するテスト。
+#[tokio::test]
+async fn test_proxy_suppresses_completion_refer_lookup() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with(b"4ki") {
+                            // 補完クエリに対する候補一覧
+                            let _ = stream.write_all("1/kiru/kiku/\n".as_bytes()).await;
+                        } else if req.starts_with(b"1kiru") {
+                            let _ = stream.write_all("1/切る/着る/\n".as_bytes()).await;
+                        } else if req.starts_with(b"1ki ") {
+                            let _ = stream.write_all("1/木/気/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "fallback".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        predictor: shared_predictor,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. まず macSKK がタイピング中に補完クエリ "4ki " を投げる
+    client.write_all(b"4ki \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.starts_with("1/"));
+
+    // 2. macSKK が裏で補完候補 "kiru" を展開しようと Lookup "1kiru " を送信する
+    // RuSKK はこれを検出し、直ちに 4\n を返して裏展開を抑止する！
+    client.write_all(b"1kiru \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "4\n", "裏補完展開 Lookup は 4\\n で抑制されなければならない");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+

@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
@@ -48,6 +48,14 @@ pub enum BackendError {
 
 impl Backend {
     pub async fn query(&self, request: &Request) -> Result<Vec<u8>, BackendError> {
+        self.query_with_timeout(request, self.timeout).await
+    }
+
+    pub async fn query_with_timeout(
+        &self,
+        request: &Request,
+        timeout_duration: Duration,
+    ) -> Result<Vec<u8>, BackendError> {
         // EUC-JP リクエストを必要とするバックエンドは見出し語を EUC-JP にエンコード
         let wire = match self.encoding {
             UpstreamEncoding::EucJp | UpstreamEncoding::EucJpRequestUtf8Response => {
@@ -59,10 +67,11 @@ impl Backend {
             backend = %self.name,
             addr = %self.addr,
             request_len = wire.len(),
+            timeout_ms = timeout_duration.as_millis(),
             "query upstream"
         );
 
-        let result = timeout(self.timeout, self.query_inner(&wire)).await;
+        let result = timeout(timeout_duration, self.query_inner(&wire)).await;
         match result {
             Ok(Ok(raw)) => {
                 let response = match self.encoding {
@@ -87,26 +96,27 @@ impl Backend {
             Err(_) => {
                 warn!(
                     backend = %self.name,
-                    timeout_ms = self.timeout.as_millis(),
+                    timeout_ms = timeout_duration.as_millis(),
                     "upstream timeout"
                 );
                 Err(BackendError::Timeout {
                     backend: self.name.clone(),
-                    timeout: self.timeout,
+                    timeout: timeout_duration,
                 })
             }
         }
     }
 
     async fn query_inner(&self, wire: &[u8]) -> Result<Vec<u8>, BackendError> {
-        let mut stream = TcpStream::connect(self.addr)
+        let stream = TcpStream::connect(self.addr)
             .await
             .map_err(|source| BackendError::Connect {
                 backend: self.name.clone(),
                 source,
             })?;
 
-        stream
+        let (reader, mut writer) = stream.into_split();
+        writer
             .write_all(wire)
             .await
             .map_err(|source| BackendError::Io {
@@ -114,31 +124,17 @@ impl Backend {
                 source,
             })?;
 
-        // skkserv responses are a single line ending with LF.
+        let mut reader = tokio::io::BufReader::new(reader);
         let mut buf = Vec::with_capacity(4096);
-        let mut byte = [0u8; 1];
-        loop {
-            let n = stream
-                .read(&mut byte)
-                .await
-                .map_err(|source| BackendError::Io {
-                    backend: self.name.clone(),
-                    source,
-                })?;
-            if n == 0 {
-                break;
-            }
-            buf.push(byte[0]);
-            if byte[0] == b'\n' {
-                break;
-            }
-            // Safety cap against runaway responses.
-            if buf.len() > 64 * 1024 {
-                break;
-            }
-        }
+        let n = reader
+            .read_until(b'\n', &mut buf)
+            .await
+            .map_err(|source| BackendError::Io {
+                backend: self.name.clone(),
+                source,
+            })?;
 
-        if buf.is_empty() {
+        if n == 0 || buf.is_empty() {
             return Err(BackendError::EmptyResponse {
                 backend: self.name.clone(),
             });

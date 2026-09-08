@@ -180,36 +180,47 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                             .map(|t| now.duration_since(t) < Duration::from_millis(200))
                             .unwrap_or(false));
 
-                // 4. macSKK がキー入力開始時（1文字目）に補完パネルを出すために自動送信してくる1文字Lookup
-                let is_single_char_preview = midashi_str.chars().count() == 1
-                    && midashi_str.chars().next().map(|c| !c.is_ascii()).unwrap_or(false);
-
                 let is_completion_refer = is_in_recent_completions
                     || is_prefix_completion
-                    || is_rapid_burst
-                    || is_single_char_preview;
+                    || is_rapid_burst;
 
                 last_lookup_time = Some(now);
+
+                // macSKK が裏で補完候補を展開するために自動送信してくる Lookup に対しては、
+                // 即座に 4（未検出）を返して補完展開を抑止する。
+                // これにより macSKK 側で「展開候補（completion = .candidates）」が生成されず、
+                // 補完確定時間制限（約0.3秒）による勝手な確定（addFixedText）を 100% 物理的に防止する。
+                if is_completion_refer {
+                    debug!(
+                        midashi = %midashi_str,
+                        in_recent = is_in_recent_completions,
+                        is_prefix = is_prefix_completion,
+                        is_burst = is_rapid_burst,
+                        "suppressed completion refer lookup to prevent unintended commit"
+                    );
+                    writer.write_all(b"4\n").await?;
+                    writer.flush().await?;
+                    continue;
+                }
 
                 // 遅延確定方式（Deferred Context Commit）:
                 // 補完クエリでない通常変換で、かつ前回の見出し語と異なる新しい単語が始まった場合、
                 // 前回の単語が確定されたとみなして session_context に昇格させる。
-                if !is_completion_refer
-                    && let Some((prev_midashi, prev_word, _)) = pending_context.take() {
-                        if prev_midashi != midashi_str {
-                            session_context.clear();
-                            session_context.push(prev_word);
-                            last_context_time = Some(now);
-                            debug!(
-                                context = ?session_context,
-                                new_midashi = %midashi_str,
-                                "deferred context committed"
-                            );
-                        } else {
-                            // 同一見出し語での連続Lookup（次候補送り中）なので保留を継続
-                            pending_context = Some((prev_midashi, prev_word, now));
-                        }
+                if let Some((prev_midashi, prev_word, _)) = pending_context.take() {
+                    if prev_midashi != midashi_str {
+                        session_context.clear();
+                        session_context.push(prev_word);
+                        last_context_time = Some(now);
+                        debug!(
+                            context = ?session_context,
+                            new_midashi = %midashi_str,
+                            "deferred context committed"
+                        );
+                    } else {
+                        // 同一見出し語での連続Lookup（次候補送り中）なので保留を継続
+                        pending_context = Some((prev_midashi, prev_word, now));
                     }
+                }
 
                 let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
                 let final_response = if is_found(&response) {
@@ -284,16 +295,26 @@ enum BackendHit {
 }
 
 /// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
+/// 全体デッドライン（950ms）から動的タイムアウトを計算し、macSKK の 1.0秒制限を超えないようにする。
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
 async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, BackendHit) {
-    match proxy.primary.query(request).await {
+    let start = Instant::now();
+    let overall_deadline = Duration::from_millis(950);
+    let primary_timeout = proxy.primary.timeout.min(Duration::from_millis(300));
+
+    match proxy.primary.query_with_timeout(request, primary_timeout).await {
         Ok(response) if is_found(&response) => {
-            debug!(backend = %proxy.primary.name, "hit");
+            debug!(
+                backend = %proxy.primary.name,
+                elapsed_ms = start.elapsed().as_millis(),
+                "hit"
+            );
             return (response, BackendHit::Primary);
         }
         Ok(_) => {
             debug!(
                 backend = %proxy.primary.name,
+                elapsed_ms = start.elapsed().as_millis(),
                 "miss, trying fallback"
             );
         }
@@ -301,18 +322,34 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
             warn!(
                 backend = %proxy.primary.name,
                 error = %err,
+                elapsed_ms = start.elapsed().as_millis(),
                 "primary failed, trying fallback"
             );
         }
     }
 
-    match proxy.fallback.query(request).await {
+    let elapsed = start.elapsed();
+    let fallback_timeout = if overall_deadline > elapsed {
+        (overall_deadline - elapsed).max(Duration::from_millis(200))
+    } else {
+        Duration::from_millis(200)
+    };
+
+    match proxy.fallback.query_with_timeout(request, fallback_timeout).await {
         Ok(response) => {
             let hit = if is_found(&response) {
-                debug!(backend = %proxy.fallback.name, "hit");
+                debug!(
+                    backend = %proxy.fallback.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "hit"
+                );
                 BackendHit::Fallback
             } else {
-                debug!(backend = %proxy.fallback.name, "miss");
+                debug!(
+                    backend = %proxy.fallback.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "miss"
+                );
                 BackendHit::None
             };
             (response, hit)
@@ -321,6 +358,7 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
             warn!(
                 backend = %proxy.fallback.name,
                 error = %err,
+                elapsed_ms = start.elapsed().as_millis(),
                 "fallback failed"
             );
             (b"4\n".to_vec(), BackendHit::None)
@@ -334,36 +372,45 @@ async fn completion_with_aggregation(proxy: &Proxy, request: &Request, context: 
         _ => String::new(),
     };
 
-    let primary_fut = proxy.primary.query(request);
-    let fallback_fut = proxy.fallback.query(request);
-
-    let (primary_res, fallback_res) = tokio::join!(primary_fut, fallback_fut);
+    // 補完はタイピング中に毎文字飛ぶため、高速応答（150ms以内）が最優先。
+    // まずローカルの azooKey (5~20ms) を照会し、候補があれば即座に返却してタイピング詰まりを防ぐ。
+    let primary_timeout = Duration::from_millis(150);
+    let primary_res = proxy.primary.query_with_timeout(request, primary_timeout).await;
 
     let primary_cands = match primary_res {
         Ok(resp) if is_found(&resp) => parse_candidates(&resp),
         _ => Vec::new(),
     };
 
-    let fallback_cands = match fallback_res {
-        Ok(resp) if is_found(&resp) => parse_candidates(&resp),
-        _ => Vec::new(),
+    let fallback_cands = if primary_cands.is_empty() {
+        let fallback_timeout = Duration::from_millis(150);
+        match proxy.fallback.query_with_timeout(request, fallback_timeout).await {
+            Ok(resp) if is_found(&resp) => parse_candidates(&resp),
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
     };
 
     if primary_cands.is_empty() && fallback_cands.is_empty() {
         return (b"4\n".to_vec(), Vec::new());
     }
 
-    let merged = merge_candidates(&primary_cands, &fallback_cands);
+    let merged = if fallback_cands.is_empty() {
+        primary_cands
+    } else {
+        merge_candidates(&primary_cands, &fallback_cands)
+    };
+
     let ranked = {
         let guard = proxy.predictor.lock().await;
         guard.rank_candidates(context, &midashi_str, &merged)
     };
 
     debug!(
-        primary_count = primary_cands.len(),
-        fallback_count = fallback_cands.len(),
-        merged_count = merged.len(),
-        "completion candidates aggregated and ranked"
+        primary_count = merged.len(),
+        ranked_count = ranked.len(),
+        "completion candidates ranked"
     );
 
     (format_candidates_response(&ranked), ranked)
