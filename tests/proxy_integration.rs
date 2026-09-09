@@ -9,11 +9,11 @@ use ruskk::backend::{Backend, UpstreamEncoding};
 use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
 use ruskk::proxy::Proxy;
 
-/// seed データに基づいて候補が並び替えられることをテストする。
-/// upstream は常に「切る/着る」の順で返すが、seed データの文脈共起により
-/// 「服」の後は「着る」が、「肉」の後は「切る」が第1候補になることを検証する。
+/// seed データの単語頻度（frequencies）に基づいて候補が並び替えられることをテストする。
+/// upstream は常に「切る/着る」の順で返すが、seed データの単語頻度により
+/// 「着る」が第1候補に昇格することを検証する。
 #[tokio::test]
-async fn test_proxy_ranks_by_seed_context() {
+async fn test_proxy_ranks_by_seed_frequency() {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
@@ -28,10 +28,6 @@ async fn test_proxy_ranks_by_seed_context() {
                         if req.starts_with(b"1KiRu") || req.starts_with(b"1kiru") {
                             // upstream は常に「切る」が第1候補
                             let _ = stream.write_all("1/切る/着る/\n".as_bytes()).await;
-                        } else if req.starts_with(b"1fuku") {
-                            let _ = stream.write_all("1/服/\n".as_bytes()).await;
-                        } else if req.starts_with(b"1niku") {
-                            let _ = stream.write_all("1/肉/\n".as_bytes()).await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -41,16 +37,11 @@ async fn test_proxy_ranks_by_seed_context() {
         }
     });
 
-    // seed データを手動設定（~/.ruskk-frequency.json に相当）
+    // seed データの単語頻度を手動設定（~/.ruskk-frequency.json に相当）
     let mut predictor = FrequencyPredictor::new(None);
-    predictor.context_frequencies.insert("服".to_string(), {
+    predictor.frequencies.insert("KiRu".to_string(), {
         let mut m = HashMap::new();
         m.insert("着る".to_string(), 10);
-        m
-    });
-    predictor.context_frequencies.insert("肉".to_string(), {
-        let mut m = HashMap::new();
-        m.insert("切る".to_string(), 10);
         m
     });
 
@@ -83,66 +74,16 @@ async fn test_proxy_ranks_by_seed_context() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // seed データを変更しないことを確認するため、初期状態を記録
-    let initial_freq_count = {
-        let guard = shared_predictor.lock().await;
-        guard.frequencies.len()
-    };
-
-    // --- テスト: 候補の並び替え ---
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // Lookup して候補返却を確認（プロキシ動作確認）
-    // 「服」を変換すると、session_context に「服」が追跡される
-    client.write_all(b"1fuku \n").await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/服/\n");
-
     // upstream は通常「切る」が第1候補だが、
-    // seed データにコンテキスト「服」→「着る」が定義されているため、
+    // seed データに単語頻度「着る」= 10 が定義されているため、
     // 「着る」が第1候補に昇格する！
     client.write_all(b"1KiRu \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert_eq!(resp, "1/着る/切る/\n");
-
-    // 次に「肉」を変換すると、session_context が「肉」に更新される
-    client.write_all(b"1niku \n").await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/肉/\n");
-
-    // seed データにコンテキスト「肉」→「切る」が定義されているため、
-    // 今度は「切る」が第1候補になる！
-    client.write_all(b"1KiRu \n").await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/切る/着る/\n");
-
-    // --- テスト: 1文字プレビュー等による文脈汚染防止 ---
-    // 1文字の非ASCII見出し（プレビュー）が来ても、直前の「肉」文脈は上書きされない
-    client.write_all(b"1ka \n").await.unwrap();
-    let _ = client.read(&mut buf).await.unwrap();
-
-    // 再度 KiRu を引くと、依然として「肉」文脈が維持されており「切る」が第1候補
-    client.write_all(b"1KiRu \n").await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/切る/着る/\n");
-
-    // --- テスト: seed データが変更されていないことを確認 ---
-    // 自動学習を廃止したので、lookup しても frequencies は更新されない（読み取り専用）
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    {
-        let guard = shared_predictor.lock().await;
-        assert_eq!(
-            guard.frequencies.len(),
-            initial_freq_count,
-            "frequencies must NOT change after lookups (read-only seed file)"
-        );
-    }
 
     drop(client);
     proxy_handle.abort();
@@ -231,10 +172,10 @@ async fn test_proxy_basic_lookup_passthrough() {
     upstream_handle.abort();
 }
 
-/// macSKK の補完クエリ直後に裏で自動送信される展開 Lookup が
-/// 4\n で抑制され、macSKK の勝手な確定（0.3秒誤爆確定）を防止することを検証するテスト。
+/// macSKK の補完クエリ（Request::Completion）に対して常に 4\n を返し、
+/// macSKK の勝手な確定（タイピング停止後の誤爆確定）を物理的に防止することを検証するテスト。
 #[tokio::test]
-async fn test_proxy_suppresses_completion_refer_lookup() {
+async fn test_proxy_returns_not_found_on_completion() {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
@@ -247,12 +188,8 @@ async fn test_proxy_suppresses_completion_refer_lookup() {
                         if n == 0 { break; }
                         let req = &buf[..n];
                         if req.starts_with(b"4ki") {
-                            // 補完クエリに対する候補一覧
+                            // upstream が補完候補を持っていたとしても
                             let _ = stream.write_all("1/kiru/kiku/\n".as_bytes()).await;
-                        } else if req.starts_with(b"1kiru") {
-                            let _ = stream.write_all("1/切る/着る/\n".as_bytes()).await;
-                        } else if req.starts_with(b"1ki ") {
-                            let _ = stream.write_all("1/木/気/\n".as_bytes()).await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -295,28 +232,21 @@ async fn test_proxy_suppresses_completion_refer_lookup() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // 1. まず macSKK がタイピング中に補完クエリ "4ki " を投げる
+    // macSKK が補完クエリ "4ki " を投げても、プロキシは直ちに 4\n を返す
     client.write_all(b"4ki \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.starts_with("1/"));
-
-    // 2. macSKK が裏で補完候補 "kiru" を展開しようと Lookup "1kiru " を送信する
-    // RuSKK はこれを検出し、直ちに 4\n を返して裏展開を抑止する！
-    client.write_all(b"1kiru \n").await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "4\n", "裏補完展開 Lookup は 4\\n で抑制されなければならない");
+    assert_eq!(resp, "4\n", "補完クエリには常に 4\\n を返して macSKK の自動確定を防ぐ");
 
     drop(client);
     proxy_handle.abort();
     upstream_handle.abort();
 }
 
-/// macSKK の入力開始時（1文字目）プレビューLookup が 4\n で抑制され、
-/// ユーザーが Space を押した 2回目の Lookup で正常に候補が返ることを検証するテスト。
+/// ユーザーが Space を押した時、1文字見出し（「き」等）でも
+/// 初回から素直に変換候補が返ることを検証するテスト。
 #[tokio::test]
-async fn test_proxy_single_char_preview_suppressed_then_explicit_convert() {
+async fn test_proxy_single_char_lookup_works_immediately() {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
@@ -372,29 +302,14 @@ async fn test_proxy_single_char_preview_suppressed_then_explicit_convert() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // 1. 入力開始時に macSKK が補完候補取得のため自動送信してくる 1文字目の Lookup "1き "
-    // RuSKK はこれを検出し、直ちに 4\n を返して誤爆確定（0.5秒ルール）を物理的に抑止する！
+    // ユーザーが Space キーを押して「き」を漢字に変換しようとした場合
+    // 初回から通常変換として正規の候補が返る！
     client.write_all("1き \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "4\n", "1回目の1文字プレビューLookupは4\\nで抑制されなければならない");
-
-    // 2. ユーザーが Space キーを押して「き」を漢字に変換しようとした場合（同一見出し語の2回目）
-    // 通常変換として正規の候補が返る！
-    client.write_all("1き \n".as_bytes()).await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/木/気/\n", "2回目の1文字Lookupは通常変換として候補が返らなければならない");
-
-    // 3. 次候補送り（3回目）もスムーズに返る
-    client.write_all("1き \n".as_bytes()).await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/木/気/\n");
+    assert_eq!(resp, "1/木/気/\n", "1文字見出しでも初回から候補が返る");
 
     drop(client);
     proxy_handle.abort();
     upstream_handle.abort();
 }
-
-

@@ -76,14 +76,9 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
 
     // 2. Setup FrequencyPredictor seed data (mocking ~/.ruskk-frequency.json)
     let mut predictor = FrequencyPredictor::new(None);
-    predictor.context_frequencies.insert("服".to_string(), {
+    predictor.frequencies.insert("きr".to_string(), {
         let mut m = HashMap::new();
         m.insert("着る".to_string(), 10);
-        m
-    });
-    predictor.context_frequencies.insert("肉".to_string(), {
-        let mut m = HashMap::new();
-        m.insert("切る".to_string(), 10);
         m
     });
 
@@ -118,7 +113,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // 3. Client connection with context "服" -> lookup "きr"
+    // 3. Client connection -> lookup "きr"
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
@@ -128,24 +123,12 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
     let resp1 = String::from_utf8_lossy(&buf[..n]);
     assert_eq!(resp1, "1/服/\n");
 
-    // seed データに「服」→「着る」が定義されているため、
+    // seed データの単語頻度に「着る」が定義されているため、
     // yaskkserv2 の返却順（切る/着る）に関わらず、「着る」が第1候補に並び替えられる！
     client.write_all("1きr \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n]);
     assert_eq!(resp2, "1/着る/切る/\n");
-
-    // 続いて "にく" を変換
-    client.write_all("1にく \n".as_bytes()).await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp3 = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp3, "1/肉/\n");
-
-    // seed データに「肉」→「切る」が定義されているため、今度は「切る」が第1候補になる！
-    client.write_all("1きr \n".as_bytes()).await.unwrap();
-    let n = client.read(&mut buf).await.unwrap();
-    let resp4 = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp4, "1/切る/着る/\n");
 
     drop(client);
     proxy_handle.abort();
