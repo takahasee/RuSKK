@@ -180,6 +180,12 @@ impl FrequencyPredictor {
 
         let empty_map = HashMap::new();
         let freq_map = self.frequencies.get(midashi).unwrap_or(&empty_map);
+        let has_context = !context.is_empty() && !self.context_frequencies.is_empty();
+
+        // 頻度情報も文脈情報もない場合は、無駄な計算やソートを完全スキップして即座に返却
+        if freq_map.is_empty() && !has_context {
+            return candidates.to_vec();
+        }
 
         let mut indexed_cands: Vec<(usize, &String, u64)> = candidates
             .iter()
@@ -187,21 +193,30 @@ impl FrequencyPredictor {
             .map(|(idx, cand)| {
                 let clean = clean_candidate(cand);
                 let global_count = get_score_flexible(freq_map, clean);
-                let context_score: u64 = context
-                    .iter()
-                    .map(|ctx| {
-                        self.context_frequencies
-                            .get(ctx)
-                            .map(|m| get_score_flexible(m, clean))
-                            .unwrap_or(0)
-                    })
-                    .sum();
+                let context_score: u64 = if has_context {
+                    context
+                        .iter()
+                        .map(|ctx| {
+                            self.context_frequencies
+                                .get(ctx)
+                                .map(|m| get_score_flexible(m, clean))
+                                .unwrap_or(0)
+                        })
+                        .sum()
+                } else {
+                    0
+                };
 
                 // 文脈共起は10倍の重みで評価する
                 let total_score = global_count + context_score * 10;
                 (idx, cand, total_score)
             })
             .collect();
+
+        // 全ての候補のスコアが 0 の場合は元の順序を維持
+        if indexed_cands.iter().all(|(_, _, score)| *score == 0) {
+            return candidates.to_vec();
+        }
 
         indexed_cands.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 

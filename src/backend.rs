@@ -2,13 +2,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::encoding::response_euc_to_utf8;
 use crate::protocol::{encode_request, encode_request_for_encoding, Request};
+
+const MAX_BACKEND_RESPONSE_BYTES: u64 = 65536; // 64KB
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamEncoding {
@@ -124,9 +126,10 @@ impl Backend {
                 source,
             })?;
 
-        let mut reader = tokio::io::BufReader::new(reader);
+        let reader = tokio::io::BufReader::new(reader);
         let mut buf = Vec::with_capacity(4096);
-        let n = reader
+        let mut take_reader = reader.take(MAX_BACKEND_RESPONSE_BYTES);
+        let n = take_reader
             .read_until(b'\n', &mut buf)
             .await
             .map_err(|source| BackendError::Io {

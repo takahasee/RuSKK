@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -62,7 +62,9 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     loop {
         line.clear();
 
-        let n = reader.read_until(b'\n', &mut line).await?;
+        // 8KB を超える改行なし不正データによるメモリ枯渇 (OOM DoS) を防ぐため、take で上限を設定
+        let mut take_reader = (&mut reader).take(MAX_LINE_BYTES + 1);
+        let n = take_reader.read_until(b'\n', &mut line).await?;
 
         if n == 0 {
             break;
