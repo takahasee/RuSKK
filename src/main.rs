@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
         fallback: args.fallback(),
         predictor: Arc::clone(&predictor),
         okuri_expansion: args.is_okuri_expansion_enabled(),
+        context_ranking: args.is_context_ranking_enabled(),
     };
 
     // SIGTERM / Ctrl-C を受け取ったらプロキシを停止する。

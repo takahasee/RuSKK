@@ -326,27 +326,43 @@ mod tests {
     #[test]
     fn kanji_context_cooccurrence_ranking() {
         let mut predictor = FrequencyPredictor::new(None);
-        let candidates = vec!["着る".to_string(), "切る".to_string()];
+        let candidates = vec!["着る".to_string(), "切る".to_string(), "伐る".to_string()];
+        let stem_candidates = vec!["着".to_string(), "切".to_string(), "伐".to_string()];
 
         // seed データを直接設定（手動編集を模倣）
-        predictor.context_frequencies.insert("服".to_string(), {
-            let mut m = HashMap::new();
-            m.insert("着る".to_string(), 2);
-            m
-        });
         predictor.context_frequencies.insert("肉".to_string(), {
             let mut m = HashMap::new();
             m.insert("切る".to_string(), 3);
             m
         });
+        predictor.context_frequencies.insert("服".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("着る".to_string(), 2);
+            m
+        });
+        predictor.context_frequencies.insert("木".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("伐る".to_string(), 4);
+            m
+        });
 
-        // 文脈「服」のとき、「着る」が第1候補
-        let ranked_fuku = predictor.rank_candidates(&["服".to_string()], "きる", &candidates);
-        assert_eq!(ranked_fuku[0], "着る");
-
-        // 文脈「肉」のとき、「切る」が第1候補
+        // 1. 文脈「肉」のとき、「切る」（および語幹「切」）が第1候補
         let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
         assert_eq!(ranked_niku[0], "切る");
+        let ranked_niku_stem = predictor.rank_candidates(&["肉".to_string()], "きr", &stem_candidates);
+        assert_eq!(ranked_niku_stem[0], "切");
+
+        // 2. 文脈「服」のとき、「着る」（および語幹「着」）が第1候補
+        let ranked_fuku = predictor.rank_candidates(&["服".to_string()], "きる", &candidates);
+        assert_eq!(ranked_fuku[0], "着る");
+        let ranked_fuku_stem = predictor.rank_candidates(&["服".to_string()], "きr", &stem_candidates);
+        assert_eq!(ranked_fuku_stem[0], "着");
+
+        // 3. 文脈「木」のとき、「伐る」（および語幹「伐」）が第1候補
+        let ranked_ki = predictor.rank_candidates(&["木".to_string()], "きる", &candidates);
+        assert_eq!(ranked_ki[0], "伐る");
+        let ranked_ki_stem = predictor.rank_candidates(&["木".to_string()], "きr", &stem_candidates);
+        assert_eq!(ranked_ki_stem[0], "伐");
     }
 
     #[test]

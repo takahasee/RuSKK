@@ -19,6 +19,7 @@ pub struct Proxy {
     pub fallback: Backend,
     pub predictor: SharedPredictor,
     pub okuri_expansion: bool,
+    pub context_ranking: bool,
 }
 
 impl Proxy {
@@ -59,6 +60,9 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
+
+    let mut session_context: Vec<String> = Vec::new();
+    let mut pending_context: Option<(String, String, Instant)> = None;
 
     loop {
         line.clear();
@@ -105,9 +109,42 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
             }
             Request::Lookup(ref midashi) => {
                 let midashi_str = decode_midashi(midashi);
+                let now = Instant::now();
+
+                // 文脈連動（context_ranking）が有効な場合、
+                // 前回の単語と異なる新しい見出し語の変換が始まった時点で、
+                // 前回の単語がユーザーによって確定されたとみなして session_context に昇格する。
+                if proxy.context_ranking
+                    && let Some((prev_midashi, prev_word, time)) = pending_context.take()
+                {
+                    if prev_midashi != midashi_str {
+                        // 60秒以内の入力のみ文脈として保持
+                        if now.duration_since(time) <= Duration::from_secs(60) {
+                            session_context.clear();
+                            session_context.push(prev_word);
+                            debug!(
+                                context = ?session_context,
+                                new_midashi = %midashi_str,
+                                "promoted pending context"
+                            );
+                        } else {
+                            session_context.clear();
+                        }
+                    } else {
+                        // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
+                        pending_context = Some((prev_midashi, prev_word, time));
+                    }
+                }
+
+                let ctx_ref = if proxy.context_ranking {
+                    &session_context[..]
+                } else {
+                    &[]
+                };
 
                 let mut okuri_handled = false;
                 let mut final_response = None;
+                let mut top_candidate_for_context = None;
 
                 // 送りあり見出し（例: "かk" -> "かく", "きr" -> "きる"）の活用復元試行
                 if proxy.okuri_expansion
@@ -115,28 +152,31 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                         crate::okuri::expand_okuri_to_full_kana(&midashi_str)
                 {
                     let okuri_req = Request::Lookup(full_kana.as_bytes().to_vec());
-                        let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
+                    let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
 
-                        if is_found(&okuri_resp) {
-                            let raw_cands = parse_candidates(&okuri_resp);
-                            let stem_cands = crate::okuri::extract_stem_candidates(&raw_cands, okuri_suffix);
+                    if is_found(&okuri_resp) {
+                        let raw_cands = parse_candidates(&okuri_resp);
+                        let stem_cands = crate::okuri::extract_stem_candidates(&raw_cands, okuri_suffix);
 
-                            if !stem_cands.is_empty() {
-                                debug!(
-                                    midashi = %midashi_str,
-                                    full_kana = %full_kana,
-                                    stems_count = stem_cands.len(),
-                                    "okuri expansion resolved candidates"
-                                );
-                                let ranked = {
-                                    let guard = proxy.predictor.lock().await;
-                                    guard.rank_candidates(&[], &midashi_str, &stem_cands)
-                                };
-                                final_response = Some(format_candidates_response(&ranked));
-                                okuri_handled = true;
+                        if !stem_cands.is_empty() {
+                            debug!(
+                                midashi = %midashi_str,
+                                full_kana = %full_kana,
+                                stems_count = stem_cands.len(),
+                                "okuri expansion resolved candidates"
+                            );
+                            let ranked = {
+                                let guard = proxy.predictor.lock().await;
+                                guard.rank_candidates(ctx_ref, &midashi_str, &stem_cands)
+                            };
+                            if let Some(top) = ranked.first() {
+                                top_candidate_for_context = Some(top.clone());
                             }
+                            final_response = Some(format_candidates_response(&ranked));
+                            okuri_handled = true;
                         }
                     }
+                }
 
                 // 送りなし見出し、または送り復元が無効／失敗した場合は従来通りの照会
                 let resp_to_send = if okuri_handled && let Some(resp) = final_response {
@@ -146,13 +186,13 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                     if is_found(&response) {
                         let cands = parse_candidates(&response);
                         if !cands.is_empty() {
-                            // seed ファイルの頻度データに基づいて候補を並び替える。
-                            // サーバー側での自動確定推測（pending_context等）は一切行わず、
-                            // ユーザーが手動で確定する純粋な通常変換として返却する。
                             let ranked = {
                                 let guard = proxy.predictor.lock().await;
-                                guard.rank_candidates(&[], &midashi_str, &cands)
+                                guard.rank_candidates(ctx_ref, &midashi_str, &cands)
                             };
+                            if let Some(top) = ranked.first() {
+                                top_candidate_for_context = Some(top.clone());
+                            }
                             format_candidates_response(&ranked)
                         } else {
                             response
@@ -161,6 +201,17 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                         response
                     }
                 };
+
+                // 今回返却した第1候補が漢字を含む場合、次回の文脈候補として保留する
+                if proxy.context_ranking
+                    && let Some(ref top) = top_candidate_for_context
+                {
+                    let clean = crate::frequency::clean_candidate(top);
+                    if contains_kanji(clean) {
+                        pending_context = Some((midashi_str.clone(), clean.to_string(), now));
+                    }
+                }
+
                 writer.write_all(&resp_to_send).await?;
             }
             Request::Completion(_) => {
@@ -257,4 +308,17 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
         }
     }
 }
+
+/// 文字列にCJK漢字が含まれているかを判定する。
+/// 文脈候補（session_context / pending_context）には漢字を含む単語のみを積む。
+fn contains_kanji(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(c,
+            '\u{4E00}'..='\u{9FFF}'   // CJK統合漢字
+            | '\u{3400}'..='\u{4DBF}' // CJK統合漢字拡張A
+            | '\u{F900}'..='\u{FAFF}' // CJK互換漢字
+        )
+    })
+}
+
 

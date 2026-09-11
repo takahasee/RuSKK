@@ -36,6 +36,10 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub okuri_expansion: bool,
 
+    /// 直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKK_CONTEXT_RANKING でも制御可能）
+    #[arg(long, default_value_t = true)]
+    pub context_ranking: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -85,6 +89,19 @@ impl Args {
             }
         }
         self.okuri_expansion
+    }
+
+    pub fn is_context_ranking_enabled(&self) -> bool {
+        if let Ok(val) = std::env::var("RUSKK_CONTEXT_RANKING") {
+            let val = val.trim().to_lowercase();
+            if val == "0" || val == "false" || val == "no" || val == "off" {
+                return false;
+            }
+            if val == "1" || val == "true" || val == "yes" || val == "on" {
+                return true;
+            }
+        }
+        self.context_ranking
     }
 }
 

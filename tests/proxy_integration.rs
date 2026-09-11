@@ -67,6 +67,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
         },
         predictor: shared_predictor.clone(),
         okuri_expansion: false,
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -141,6 +142,7 @@ async fn test_proxy_basic_lookup_passthrough() {
         },
         predictor: shared_predictor,
         okuri_expansion: false,
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -224,6 +226,7 @@ async fn test_proxy_returns_not_found_on_completion() {
         },
         predictor: shared_predictor,
         okuri_expansion: false,
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -295,6 +298,7 @@ async fn test_proxy_single_char_lookup_works_immediately() {
         },
         predictor: shared_predictor,
         okuri_expansion: false,
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -368,6 +372,7 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
         },
         predictor: shared_predictor,
         okuri_expansion: true, // 送り復元有効
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -442,6 +447,7 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
         },
         predictor: shared_predictor,
         okuri_expansion: false, // 送り復元無効（従来動作）
+        context_ranking: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -464,4 +470,235 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+/// 直前単語に基づく文脈共起並び替え（肉→切る、服→着る、木→伐る）がプロキシ上で連動することを検証するテスト。
+#[tokio::test]
+async fn test_proxy_context_ranking_promotes_candidates() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1にく ".as_bytes()) {
+                            let _ = stream.write_all("1/肉/\n".as_bytes()).await;
+                        } else if req.starts_with("1ふく ".as_bytes()) {
+                            let _ = stream.write_all("1/服/\n".as_bytes()).await;
+                        } else if req.starts_with("1き ".as_bytes()) {
+                            let _ = stream.write_all("1/木/\n".as_bytes()).await;
+                        } else if req.starts_with("1きる ".as_bytes()) {
+                            // azooKey は平仮名「きる」に対して着る・切る・伐るを返却
+                            let _ = stream.write_all("1/着る/切る/伐る/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    // 固定頻度: 着=3, 切=2, 伐=1
+    predictor.frequencies.insert("きr".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着".to_string(), 3);
+        m.insert("切".to_string(), 2);
+        m.insert("伐".to_string(), 1);
+        m
+    });
+    // 文脈共起: 肉->切る, 服->着る, 木->伐る
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("服".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("木".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("伐る".to_string(), 10);
+        m
+    });
+
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "mock-primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "mock-fallback-down".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_millis(50),
+        },
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // --- ケース 1: 肉 -> 切る（切） ---
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1にく \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
+
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        // 文脈「肉」により「切」が第1候補！
+        assert_eq!(resp, "1/切/着/伐/\n");
+    }
+
+    // --- ケース 2: 服 -> 着る（着） ---
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1ふく \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
+
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        // 文脈「服」により「着」が第1候補！
+        assert_eq!(resp, "1/着/切/伐/\n");
+    }
+
+    // --- ケース 3: 木 -> 伐る（伐） ---
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1き \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/木/\n");
+
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        // 文脈「木」により「伐」が第1候補！
+        assert_eq!(resp, "1/伐/着/切/\n");
+    }
+
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+/// context_ranking: false の場合、前回の単語にかかわらず固定頻度順が維持されることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_context_ranking_disabled() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1にく ".as_bytes()) {
+                            let _ = stream.write_all("1/肉/\n".as_bytes()).await;
+                        } else if req.starts_with("1きる ".as_bytes()) {
+                            let _ = stream.write_all("1/着る/切る/伐る/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    // 固定頻度: 着=3, 切=2, 伐=1
+    predictor.frequencies.insert("きr".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着".to_string(), 3);
+        m.insert("切".to_string(), 2);
+        m.insert("伐".to_string(), 1);
+        m
+    });
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
+
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "mock-primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "mock-fallback-down".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_millis(50),
+        },
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false, // 文脈連動無効
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1にく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
+
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // context_ranking が無効のため、「肉」の後でも「切」は昇格せず、固定頻度順の「着」が第1候補のまま！
+    assert_eq!(resp, "1/着/切/伐/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 

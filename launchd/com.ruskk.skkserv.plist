@@ -24,6 +24,8 @@
         <string>ruskk=debug,info</string>
         <key>RUSKK_OKURI_EXPANSION</key>
         <string>@RUSKK_OKURI_EXPANSION@</string>
+        <key>RUSKK_CONTEXT_RANKING</key>
+        <string>@RUSKK_CONTEXT_RANKING@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

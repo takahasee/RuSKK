@@ -11,14 +11,15 @@ macSKK  →  RuSKK(:1178)  →  azoo-key-skkserv(:1180)   # primary
 ## 特徴
 
 - 送りあり見出し（`かk`, `きr`, `よm` 等）の平仮名活用形自動復元と語幹抽出（動詞・形容詞の高精度変換）
+- 直前確定単語に基づく文脈連動候補昇格（「肉」の後は「切る」、「服」の後は「着る」、「木」の後は「伐る」など）
 - 順次フォールバック（azookey → yaskkserv2）— opcode `1`（変換）
 - 勝手な確定（`addFixedText`）防止のため、opcode `4`（補完）は常に候補なし（`4\n`）を返却
-- 変換候補は seed データ (`~/.ruskk-frequency.json`) で指定した出現頻度で安全に並べ替え
+- 変換候補は seed データ (`~/.ruskk-frequency.json`) で指定した出現頻度・文脈共起で安全に並べ替え
 - クライアントへの応答は **UTF-8**
 - azoo-key-skkserv の UTF-8 応答はそのまま転送
 - yaskkserv2 の EUC-JP 応答は UTF-8 に変換
 - skkserv プロトコル `0` / `1` / `2` / `3` / `4` に対応
-- **即時切り替え・ロールバック安全機能**: 環境変数 `RUSKK_OKURI_EXPANSION=0` または `--okuri-expansion=false` で即座に従来の動作へ復帰可能
+- **即時切り替え・ロールバック安全機能**: 各機能は環境変数（`RUSKK_OKURI_EXPANSION=0`, `RUSKK_CONTEXT_RANKING=0`）または CLI 引数で即座に無効化可能
 
 ## 送りあり見出しの活用形復元・語幹抽出
 
@@ -129,6 +130,7 @@ yaskkserv2 --port 1179 --google-suggest ~/Documents/SKK/dictionary.yaskkserv2
 --azookey-timeout-ms 1500        azookey のタイムアウト
 --yaskkserv2-timeout-ms 500      yaskkserv2 のタイムアウト
 --okuri-expansion <bool>         送りあり見出し活用形復元 (デフォルト: true, 環境変数: RUSKK_OKURI_EXPANSION)
+--context-ranking <bool>        直前単語に基づく文脈連動候補昇格 (デフォルト: true, 環境変数: RUSKK_CONTEXT_RANKING)
 ```
 
 ログレベルは `RUST_LOG` で変更できます（例: `RUST_LOG=debug`）。
