@@ -22,6 +22,8 @@
         <string>1179</string>
         <key>RUST_LOG</key>
         <string>ruskk=debug,info</string>
+        <key>RUSKK_OKURI_EXPANSION</key>
+        <string>@RUSKK_OKURI_EXPANSION@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

@@ -18,6 +18,7 @@ pub struct Proxy {
     pub primary: Backend,
     pub fallback: Backend,
     pub predictor: SharedPredictor,
+    pub okuri_expansion: bool,
 }
 
 impl Proxy {
@@ -104,25 +105,63 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
             }
             Request::Lookup(ref midashi) => {
                 let midashi_str = decode_midashi(midashi);
-                let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
-                let final_response = if is_found(&response) {
-                    let cands = parse_candidates(&response);
-                    if !cands.is_empty() {
-                        // seed ファイルの頻度データに基づいて候補を並び替える。
-                        // サーバー側での自動確定推測（pending_context等）は一切行わず、
-                        // ユーザーが手動で確定する純粋な通常変換として返却する。
-                        let ranked = {
-                            let guard = proxy.predictor.lock().await;
-                            guard.rank_candidates(&[], &midashi_str, &cands)
-                        };
-                        format_candidates_response(&ranked)
+
+                let mut okuri_handled = false;
+                let mut final_response = None;
+
+                // 送りあり見出し（例: "かk" -> "かく", "きr" -> "きる"）の活用復元試行
+                if proxy.okuri_expansion
+                    && let Some((full_kana, okuri_suffix)) =
+                        crate::okuri::expand_okuri_to_full_kana(&midashi_str)
+                {
+                    let okuri_req = Request::Lookup(full_kana.as_bytes().to_vec());
+                        let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
+
+                        if is_found(&okuri_resp) {
+                            let raw_cands = parse_candidates(&okuri_resp);
+                            let stem_cands = crate::okuri::extract_stem_candidates(&raw_cands, okuri_suffix);
+
+                            if !stem_cands.is_empty() {
+                                debug!(
+                                    midashi = %midashi_str,
+                                    full_kana = %full_kana,
+                                    stems_count = stem_cands.len(),
+                                    "okuri expansion resolved candidates"
+                                );
+                                let ranked = {
+                                    let guard = proxy.predictor.lock().await;
+                                    guard.rank_candidates(&[], &midashi_str, &stem_cands)
+                                };
+                                final_response = Some(format_candidates_response(&ranked));
+                                okuri_handled = true;
+                            }
+                        }
+                    }
+
+                // 送りなし見出し、または送り復元が無効／失敗した場合は従来通りの照会
+                let resp_to_send = if okuri_handled && let Some(resp) = final_response {
+                    resp
+                } else {
+                    let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
+                    if is_found(&response) {
+                        let cands = parse_candidates(&response);
+                        if !cands.is_empty() {
+                            // seed ファイルの頻度データに基づいて候補を並び替える。
+                            // サーバー側での自動確定推測（pending_context等）は一切行わず、
+                            // ユーザーが手動で確定する純粋な通常変換として返却する。
+                            let ranked = {
+                                let guard = proxy.predictor.lock().await;
+                                guard.rank_candidates(&[], &midashi_str, &cands)
+                            };
+                            format_candidates_response(&ranked)
+                        } else {
+                            response
+                        }
                     } else {
                         response
                     }
-                } else {
-                    response
                 };
-                writer.write_all(&final_response).await?;
+                writer.write_all(&resp_to_send).await?;
             }
             Request::Completion(_) => {
                 // 補完クエリに対しては常に「候補なし (4\n)」を返す。

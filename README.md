@@ -10,13 +10,45 @@ macSKK  →  RuSKK(:1178)  →  azoo-key-skkserv(:1180)   # primary
 
 ## 特徴
 
+- 送りあり見出し（`かk`, `きr`, `よm` 等）の平仮名活用形自動復元と語幹抽出（動詞・形容詞の高精度変換）
 - 順次フォールバック（azookey → yaskkserv2）— opcode `1`（変換）
-- opcode `4`（補完）は両バックエンドを並列照会し、候補をマージ・重複除去
-- 変換候補・補完候補は seed データ (`~/.ruskk-frequency.json`) で指定した出現頻度と文脈共起で並べ替え
+- 勝手な確定（`addFixedText`）防止のため、opcode `4`（補完）は常に候補なし（`4\n`）を返却
+- 変換候補は seed データ (`~/.ruskk-frequency.json`) で指定した出現頻度で安全に並べ替え
 - クライアントへの応答は **UTF-8**
 - azoo-key-skkserv の UTF-8 応答はそのまま転送
 - yaskkserv2 の EUC-JP 応答は UTF-8 に変換
 - skkserv プロトコル `0` / `1` / `2` / `3` / `4` に対応
+- **即時切り替え・ロールバック安全機能**: 環境変数 `RUSKK_OKURI_EXPANSION=0` または `--okuri-expansion=false` で即座に従来の動作へ復帰可能
+
+## 送りあり見出しの活用形復元・語幹抽出
+
+SKK では動詞の送り仮名の最初の子音/母音をローマ字で入力します（例: `かk` で「書く」）。  
+これをそのまま azooKey SKKServ に問い合わせると、「化/家/下/科...」など大量の同音名詞の単漢字が返ってしまい、目的の動詞（「書」）が数十番目に埋没してしまいます。
+
+RuSKK は形態素解析器（MeCab / ChaSen 活用表）の規則に基づき、見出し語を自動判定・復元します：
+1. `かk` → `かく`、`きr` → `きる`、`よm` → `よむ`、`あかi` → `あかい` に平仮名復元
+2. azooKey に照会して「書く」「描く」などの高精度な候補を取得
+3. 末尾の送り仮名（`く`）を取り除き、語幹「書」「描」を抽出（送り仮名を持たない名詞「各」等は自動除外）
+4. macSKK に返却し、macSKK 側で「書く」「描く」として画面上に第1候補で表示
+
+### 従来の動作に戻す方法（ロールバック）
+
+何らかの理由で従来の動作（送りあり見出しをそのまま透過照会）に戻したい場合、再ビルド不要で即座に切り替えられます。
+
+- **一時的に無効化**:
+  ```sh
+  RUSKK_OKURI_EXPANSION=0 ./target/release/ruskk
+  # または
+  ./target/release/ruskk --okuri-expansion=false
+  ```
+- **LaunchAgent 運用で無効化**:
+  `launchd/config.env` に以下を追記・設定して再インストールします。
+  ```sh
+  RUSKK_OKURI_EXPANSION=0
+  ```
+  ```sh
+  ./scripts/install-launchd.sh install
+  ```
 
 ## 候補の並び替えと文脈判定 (Seed ファイル)
 
@@ -96,6 +128,7 @@ yaskkserv2 --port 1179 --google-suggest ~/Documents/SKK/dictionary.yaskkserv2
 --yaskkserv2 127.0.0.1:1179      yaskkserv2
 --azookey-timeout-ms 1500        azookey のタイムアウト
 --yaskkserv2-timeout-ms 500      yaskkserv2 のタイムアウト
+--okuri-expansion <bool>         送りあり見出し活用形復元 (デフォルト: true, 環境変数: RUSKK_OKURI_EXPANSION)
 ```
 
 ログレベルは `RUST_LOG` で変更できます（例: `RUST_LOG=debug`）。

@@ -66,6 +66,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
             timeout: Duration::from_secs(1),
         },
         predictor: shared_predictor.clone(),
+        okuri_expansion: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -139,6 +140,7 @@ async fn test_proxy_basic_lookup_passthrough() {
             timeout: Duration::from_secs(1),
         },
         predictor: shared_predictor,
+        okuri_expansion: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -221,6 +223,7 @@ async fn test_proxy_returns_not_found_on_completion() {
             timeout: Duration::from_secs(1),
         },
         predictor: shared_predictor,
+        okuri_expansion: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -291,6 +294,7 @@ async fn test_proxy_single_char_lookup_works_immediately() {
             timeout: Duration::from_secs(1),
         },
         predictor: shared_predictor,
+        okuri_expansion: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -313,3 +317,151 @@ async fn test_proxy_single_char_lookup_works_immediately() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+/// 送りあり見出し（例: "かk"）を平仮名活用形（"かく"）に復元し、
+/// azooKey から返った動詞候補から語幹（単漢字）を抽出して返すことを検証するテスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_verb() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        // 復元された平仮名活用形 "かく" を受け取った場合
+                        if req.starts_with("1かく ".as_bytes()) {
+                            let _ = stream.write_all("1/書く/各/描く/辛く/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "azookey-mock".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "fallback-down".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_millis(50),
+        },
+        predictor: shared_predictor,
+        okuri_expansion: true, // 送り復元有効
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // クライアントが SKK送りあり "1かk " を送信
+    client.write_all("1かk \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // 名詞 "各" は除外され、動詞 "書", "描", "辛" の語幹（単漢字）が返る！
+    assert_eq!(resp, "1/書/描/辛/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+/// 送り復元が無効（okuri_expansion: false）のときは、
+/// 従来通り元の見出し語（"かk"）がそのまま照会されることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_disabled_fallback() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        // 復元されず元の "かk" のまま照会される
+                        if req.starts_with("1かk ".as_bytes()) {
+                            let _ = stream.write_all("1/化/家/書/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "azookey-mock".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "fallback-down".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_millis(50),
+        },
+        predictor: shared_predictor,
+        okuri_expansion: false, // 送り復元無効（従来動作）
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1かk \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // 従来の単漢字リストがそのまま返る
+    assert_eq!(resp, "1/化/家/書/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+

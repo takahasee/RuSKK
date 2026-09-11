@@ -51,6 +51,7 @@ load_config() {
   WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskk.sh"
   IMPORTER_APP="${HOME}/Applications/RuSKKImporter.app"
   IMPORTER_APP_BIN="${IMPORTER_APP}/Contents/MacOS/RuSKKImporter"
+  RUSKK_OKURI_EXPANSION="${RUSKK_OKURI_EXPANSION:-1}"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
@@ -81,6 +82,7 @@ render_plist() {
     -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
     -e "s|@IMPORTER_APP_BIN@|${IMPORTER_APP_BIN}|g" \
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
+    -e "s|@RUSKK_OKURI_EXPANSION@|${RUSKK_OKURI_EXPANSION}|g" \
     -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
     "$template" >"$dest"
 }

@@ -32,6 +32,10 @@ pub struct Args {
     #[arg(long, default_value_t = 700)]
     pub yaskkserv2_timeout_ms: u64,
 
+    /// 送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKK_OKURI_EXPANSION でも制御可能）
+    #[arg(long, default_value_t = true)]
+    pub okuri_expansion: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -69,4 +73,18 @@ impl Args {
             timeout: Duration::from_millis(self.yaskkserv2_timeout_ms),
         }
     }
+
+    pub fn is_okuri_expansion_enabled(&self) -> bool {
+        if let Ok(val) = std::env::var("RUSKK_OKURI_EXPANSION") {
+            let val = val.trim().to_lowercase();
+            if val == "0" || val == "false" || val == "no" || val == "off" {
+                return false;
+            }
+            if val == "1" || val == "true" || val == "yes" || val == "on" {
+                return true;
+            }
+        }
+        self.okuri_expansion
+    }
 }
+
