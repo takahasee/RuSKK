@@ -29,7 +29,6 @@ pub struct Proxy {
 struct SharedContextState {
     session_context: Vec<String>,
     pending_context: Option<(String, String, Instant)>,
-    last_response_time: Option<Instant>,
 }
 
 impl Proxy {
@@ -88,6 +87,7 @@ async fn handle_client(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::with_capacity(128);
+    let mut conn_last_response_time: Option<Instant> = None;
 
     loop {
         line.clear();
@@ -129,57 +129,56 @@ async fn handle_client(
             }
             Request::Version => {
                 writer.write_all(b"ruskk/0.1.0 ").await?;
+                conn_last_response_time = Some(Instant::now());
             }
             Request::Host => {
                 let host = format!("ruskk/{}: ", proxy.listen);
                 writer.write_all(host.as_bytes()).await?;
+                conn_last_response_time = Some(Instant::now());
             }
             Request::Lookup(ref midashi) => {
                 let midashi_str = decode_midashi(midashi);
                 let now = Instant::now();
 
+                // 同一 TCP コネクション内での直前レスポンスからの経過時間を判定。
+                // 50ms 未満の超高速な連続送信は、macSKK の補完候補展開に伴う機械的連射スキャンであるため、
+                // 文脈確定（pending_context の昇格および更新）の対象外として保護する。
+                let is_completion_burst = conn_last_response_time
+                    .map(|t| now.duration_since(t) < Duration::from_millis(50))
+                    .unwrap_or(false);
+
                 // 複数 TCP 接続を跨いで文脈を安全に共有・判定する
-                let (is_completion_scan, session_ctx_snapshot) = {
+                let session_ctx_snapshot = {
                     let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
 
-                    // macSKK の自動補完スキャンの検出:
-                    // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
-                    let is_completion_scan = ctx
-                        .last_response_time
-                        .map(|t| now.duration_since(t) < Duration::from_millis(60))
-                        .unwrap_or(false);
+                    // 文脈連動（context_ranking）が有効で、かつ補完連射でない場合、
+                    // 手動での通常変換において前回の単語が確定されたかを判定して session_context に昇格する。
+                    if proxy.context_ranking
+                        && !is_completion_burst
+                        && let Some((prev_midashi, prev_word, time)) = ctx.pending_context.take()
+                    {
+                        let is_same_midashi = prev_midashi == midashi_str;
 
-                    // 文脈連動（context_ranking）が有効な場合、
-                    // 手動での通常変換（補完スキャンでない）かつ見出し語が変わった時点で、
-                    // 前回の単語が確定されたとみなして session_context に昇格する。
-                    if proxy.context_ranking {
-                        if is_completion_scan {
-                            debug!(
-                                midashi = %midashi_str,
-                                "ignored rapid completion scan from context promotion"
-                            );
-                        } else if let Some((prev_midashi, prev_word, time)) = ctx.pending_context.take() {
-                            if prev_midashi != midashi_str {
-                                // 60秒以内の入力のみ文脈として保持
-                                if now.duration_since(time) <= Duration::from_secs(60) {
-                                    ctx.session_context.clear();
-                                    ctx.session_context.push(prev_word);
-                                    debug!(
-                                        context = ?ctx.session_context,
-                                        new_midashi = %midashi_str,
-                                        "promoted pending context"
-                                    );
-                                } else {
-                                    ctx.session_context.clear();
-                                }
+                        if is_same_midashi {
+                            // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
+                            ctx.pending_context = Some((prev_midashi, prev_word, time));
+                        } else {
+                            // 見出し語が変わったため、前回の単語が確定したと判定して昇格
+                            if now.duration_since(time) <= Duration::from_secs(60) {
+                                ctx.session_context.clear();
+                                ctx.session_context.push(prev_word);
+                                debug!(
+                                    context = ?ctx.session_context,
+                                    new_midashi = %midashi_str,
+                                    "promoted pending context"
+                                );
                             } else {
-                                // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
-                                ctx.pending_context = Some((prev_midashi, prev_word, time));
+                                ctx.session_context.clear();
                             }
                         }
                     }
 
-                    (is_completion_scan, ctx.session_context.clone())
+                    ctx.session_context.clone()
                 };
 
                 let ctx_ref = if proxy.context_ranking {
@@ -277,10 +276,9 @@ async fn handle_client(
                     }
                 };
 
-                // 通常の手動変換（補完スキャンでない）であり、かつ返却第1候補が漢字を含む場合のみ保留する。
-                // macSKK の内部補完スキャンで返した単語は pending_context に入れず、前回の正当な保留を保護する。
+                // 文脈連動が有効で、補完連射でなく、返却第1候補が漢字を含む場合のみ次回のための直前単語として保留する。
                 if proxy.context_ranking
-                    && !is_completion_scan
+                    && !is_completion_burst
                     && let Some(ref top) = top_candidate_for_context
                 {
                     let clean = crate::frequency::clean_candidate(top);
@@ -292,18 +290,16 @@ async fn handle_client(
 
                 debug!(?peer, resp = ?String::from_utf8_lossy(&resp_to_send), "sending response to client");
                 writer.write_all(&resp_to_send).await?;
+                conn_last_response_time = Some(Instant::now());
             }
             Request::Completion(_) => {
                 let (response, hit) = lookup_with_fallback(&proxy, &request).await;
                 debug!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 writer.write_all(&response).await?;
+                conn_last_response_time = Some(Instant::now());
             }
         }
         writer.flush().await?;
-        {
-            let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
-            ctx.last_response_time = Some(Instant::now());
-        }
     }
 
     Ok(())
