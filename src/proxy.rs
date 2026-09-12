@@ -137,7 +137,7 @@ async fn handle_client(
 
                 // 複数 TCP 接続を跨いで文脈を安全に共有・判定する
                 let (is_completion_scan, session_ctx_snapshot) = {
-                    let mut ctx = shared_context.lock().unwrap();
+                    let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
 
                     // macSKK の自動補完スキャンの検出:
                     // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
@@ -209,7 +209,7 @@ async fn handle_client(
                                 "okuri expansion resolved candidates"
                             );
                             let ranked = {
-                                let guard = proxy.predictor.read().unwrap();
+                                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                                 guard.rank_candidates(ctx_ref, &midashi_str, &stem_cands)
                             };
                             if let Some(top) = ranked.first() {
@@ -230,7 +230,7 @@ async fn handle_client(
                         let cands = parse_candidates(&response);
                         if !cands.is_empty() {
                             let ranked = {
-                                let guard = proxy.predictor.read().unwrap();
+                                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                                 guard.rank_candidates(ctx_ref, &midashi_str, &cands)
                             };
                             if let Some(top) = ranked.first() {
@@ -253,7 +253,7 @@ async fn handle_client(
                 {
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
-                        let mut ctx = shared_context.lock().unwrap();
+                        let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
                         ctx.pending_context = Some((midashi_str.to_string(), clean.to_string(), now));
                     }
                 }
@@ -269,7 +269,7 @@ async fn handle_client(
         }
         writer.flush().await?;
         {
-            let mut ctx = shared_context.lock().unwrap();
+            let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
             ctx.last_response_time = Some(Instant::now());
         }
     }

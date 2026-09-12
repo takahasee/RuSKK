@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
@@ -164,10 +164,11 @@ impl Backend {
                 }
 
                 let mut buf = Vec::with_capacity(1024);
-                match reader.read_until(b'\n', &mut buf).await {
+                let mut take_reader = reader.take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
+                match take_reader.read_until(b'\n', &mut buf).await {
                     Ok(n) if n > 0 && !buf.is_empty() => {
-                        if buf.len() > MAX_BACKEND_RESPONSE_BYTES {
-                            warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes");
+                        if buf.len() > MAX_BACKEND_RESPONSE_BYTES || !buf.ends_with(b"\n") {
+                            warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes or missing newline");
                             *guard = None;
                             return Err(BackendError::EmptyResponse {
                                 backend: self.name.clone(),
