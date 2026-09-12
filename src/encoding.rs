@@ -79,7 +79,22 @@ pub fn decode_midashi(bytes: &[u8]) -> Cow<'_, str> {
     decode_euc_or_utf8(bytes)
 }
 
-pub fn parse_candidates(response: &[u8]) -> Vec<String> {
+/// レスポンスバイト列から第1候補（最初の / と / の間）をゼロアロケーションで抽出
+pub fn extract_first_candidate(response: &[u8]) -> Option<&str> {
+    if !response.starts_with(b"1/") {
+        return None;
+    }
+    let rest = &response[2..];
+    let end = rest.iter().position(|&b| b == b'/' || b == b'\n')?;
+    let first = &rest[..end];
+    if first.is_empty() {
+        return None;
+    }
+    std::str::from_utf8(first).ok()
+}
+
+/// レスポンスバイト列から借用スライスの候補リスト（ゼロコピー）を抽出
+pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     if !response.starts_with(b"1") {
         return Vec::new();
     }
@@ -87,12 +102,19 @@ pub fn parse_candidates(response: &[u8]) -> Vec<String> {
     body.split(|&b| b == b'/')
         .skip(1)
         .filter(|part| !part.is_empty())
-        .filter_map(|part| std::str::from_utf8(part).ok().map(|s| s.to_string()))
+        .filter_map(|part| std::str::from_utf8(part).ok())
         .collect()
 }
 
-/// Format a list of candidates into an skkserv response (e.g. `1/cand1/cand2/\n`).
-pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
+pub fn parse_candidates(response: &[u8]) -> Vec<String> {
+    parse_candidates_borrowed(response)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Format a list of borrowed candidate strings into an skkserv response.
+pub fn format_candidates_response_str(candidates: &[&str]) -> Vec<u8> {
     if candidates.is_empty() {
         return b"4\n".to_vec();
     }
@@ -106,6 +128,12 @@ pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
     out.push(b'/');
     out.push(b'\n');
     out
+}
+
+/// Format a list of candidates into an skkserv response (e.g. `1/cand1/cand2/\n`).
+pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
+    let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+    format_candidates_response_str(&borrowed)
 }
 
 /// Merge candidate lists from primary and fallback, preserving order and removing duplicates.
@@ -166,6 +194,29 @@ mod tests {
 
         let parsed = parse_candidates(&formatted);
         assert_eq!(parsed, merged);
+    }
+
+    #[test]
+    fn test_extract_first_candidate() {
+        assert_eq!(
+            extract_first_candidate("1/東京/Tokyo/tokyo/\n".as_bytes()),
+            Some("東京")
+        );
+        assert_eq!(
+            extract_first_candidate("1/服/\n".as_bytes()),
+            Some("服")
+        );
+        assert_eq!(extract_first_candidate(b"4\n"), None);
+        assert_eq!(extract_first_candidate(b"1/\n"), None);
+    }
+
+    #[test]
+    fn test_parse_candidates_borrowed() {
+        let resp = "1/着/切/伐/\n".as_bytes();
+        let borrowed = parse_candidates_borrowed(resp);
+        assert_eq!(borrowed, vec!["着", "切", "伐"]);
+        let formatted = format_candidates_response_str(&borrowed);
+        assert_eq!(formatted, resp);
     }
 }
 

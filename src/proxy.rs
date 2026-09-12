@@ -7,7 +7,10 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
-use crate::encoding::{decode_midashi, format_candidates_response, parse_candidates};
+use crate::encoding::{
+    decode_midashi, extract_first_candidate, format_candidates_response_str,
+    parse_candidates_borrowed,
+};
 use crate::frequency::SharedPredictor;
 use crate::protocol::{is_found, parse_request, Request};
 
@@ -187,7 +190,7 @@ async fn handle_client(
 
                 let mut okuri_handled = false;
                 let mut final_response = None;
-                let mut top_candidate_for_context = None;
+                let mut top_candidate_for_context: Option<String> = None;
 
                 // 送りあり見出し（例: "かk" -> "かく", "きr" -> "きる"）の活用復元試行
                 if proxy.okuri_expansion
@@ -198,8 +201,8 @@ async fn handle_client(
                     let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
 
                     if is_found(&okuri_resp) {
-                        let raw_cands = parse_candidates(&okuri_resp);
-                        let stem_cands = crate::okuri::extract_stem_candidates(&raw_cands, okuri_suffix);
+                        let raw_cands = parse_candidates_borrowed(&okuri_resp);
+                        let stem_cands = crate::okuri::extract_stem_candidates_borrowed(&raw_cands, okuri_suffix);
 
                         if !stem_cands.is_empty() {
                             debug!(
@@ -210,12 +213,12 @@ async fn handle_client(
                             );
                             let ranked = {
                                 let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                guard.rank_candidates(ctx_ref, &midashi_str, &stem_cands)
+                                guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &stem_cands)
                             };
-                            if let Some(top) = ranked.first() {
-                                top_candidate_for_context = Some(top.clone());
+                            if let Some(&top) = ranked.first() {
+                                top_candidate_for_context = Some(top.to_string());
                             }
-                            final_response = Some(format_candidates_response(&ranked));
+                            final_response = Some(format_candidates_response_str(&ranked));
                             okuri_handled = true;
                         }
                     }
@@ -227,17 +230,32 @@ async fn handle_client(
                 } else {
                     let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
                     if is_found(&response) {
-                        let cands = parse_candidates(&response);
-                        if !cands.is_empty() {
-                            let ranked = {
-                                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                guard.rank_candidates(ctx_ref, &midashi_str, &cands)
-                            };
-                            if let Some(top) = ranked.first() {
-                                top_candidate_for_context = Some(top.clone());
+                        // 【ファストパス】並び替えルールがあるか高速判定
+                        let should_rank = {
+                            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                            guard.should_rank(ctx_ref, &midashi_str)
+                        };
+
+                        if should_rank {
+                            // 並び替えルールがある場合のみ、ゼロコピーで借用パースして並び替え
+                            let cands = parse_candidates_borrowed(&response);
+                            if !cands.is_empty() {
+                                let ranked = {
+                                    let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                                    guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &cands)
+                                };
+                                if let Some(&top) = ranked.first() {
+                                    top_candidate_for_context = Some(top.to_string());
+                                }
+                                format_candidates_response_str(&ranked)
+                            } else {
+                                response
                             }
-                            format_candidates_response(&ranked)
                         } else {
+                            // 並び替えルールがない大部分の単語: パース・アロケーション完全スキップ（ゼロコピー直結！）
+                            if let Some(top) = extract_first_candidate(&response) {
+                                top_candidate_for_context = Some(top.to_string());
+                            }
                             response
                         }
                     } else {
