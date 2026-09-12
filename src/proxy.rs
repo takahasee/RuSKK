@@ -87,7 +87,7 @@ async fn handle_client(
     let peer = stream.peer_addr().ok();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = Vec::new();
+    let mut line = Vec::with_capacity(128);
 
     loop {
         line.clear();
