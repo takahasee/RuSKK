@@ -53,14 +53,14 @@ pub fn expand_okuri_to_full_kana(midashi: &str) -> Option<(String, &'static str)
 /// azooKey が返した活用形候補（例: ["書く", "各", "描く", "辛く"]）から、
 /// 送り仮名（例: "く"）で終わる候補のみを抽出し、送り仮名を剥がして語幹（単漢字）リストをゼロコピーで返す。
 pub fn extract_stem_candidates_borrowed<'a>(candidates: &[&'a str], okuri_suffix: &str) -> Vec<&'a str> {
-    // 送り語幹候補数は通常全体の半分以下（数個〜十数個程度）
-    let mut stems = Vec::with_capacity((candidates.len() / 2).max(4).min(candidates.len()));
+    let mut stems = Vec::with_capacity(candidates.len());
+    let mut seen = std::collections::HashSet::new();
 
     for &cand in candidates {
         let clean = clean_candidate(cand);
         if let Some(stem) = clean.strip_suffix(okuri_suffix)
             && !stem.is_empty()
-            && !stems.contains(&stem)
+            && seen.insert(stem)
         {
             stems.push(stem);
         }

@@ -27,7 +27,7 @@ pub struct Proxy {
 
 #[derive(Debug, Default)]
 struct SharedContextState {
-    session_context: Option<Arc<str>>,
+    session_context: Vec<String>,
     pending_context: Option<(String, String, Instant)>,
     last_response_time: Option<Instant>,
 }
@@ -86,8 +86,8 @@ async fn handle_client(
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
     let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::with_capacity(2048, reader);
-    let mut line = Vec::with_capacity(128);
+    let mut reader = BufReader::new(reader);
+    let mut line = Vec::new();
 
     loop {
         line.clear();
@@ -162,14 +162,15 @@ async fn handle_client(
                             if prev_midashi != midashi_str {
                                 // 60秒以内の入力のみ文脈として保持
                                 if now.duration_since(time) <= Duration::from_secs(60) {
-                                    ctx.session_context = Some(Arc::from(prev_word));
+                                    ctx.session_context.clear();
+                                    ctx.session_context.push(prev_word);
                                     debug!(
                                         context = ?ctx.session_context,
                                         new_midashi = %midashi_str,
                                         "promoted pending context"
                                     );
                                 } else {
-                                    ctx.session_context = None;
+                                    ctx.session_context.clear();
                                 }
                             } else {
                                 // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
@@ -181,10 +182,8 @@ async fn handle_client(
                     (is_completion_scan, ctx.session_context.clone())
                 };
 
-                let ctx_storage;
-                let ctx_ref: &[&str] = if proxy.context_ranking && let Some(ref s) = session_ctx_snapshot {
-                    ctx_storage = [s.as_ref()];
-                    &ctx_storage
+                let ctx_ref = if proxy.context_ranking {
+                    &session_ctx_snapshot[..]
                 } else {
                     &[]
                 };

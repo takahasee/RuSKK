@@ -130,7 +130,7 @@ impl Backend {
                     match TcpStream::connect(self.addr).await {
                         Ok(stream) => {
                             let _ = stream.set_nodelay(true);
-                            *guard = Some(BufReader::with_capacity(2048, stream));
+                            *guard = Some(BufReader::new(stream));
                         }
                         Err(source) => {
                             return Err(BackendError::Connect {
@@ -163,7 +163,7 @@ impl Backend {
                     continue;
                 }
 
-                let mut buf = Vec::with_capacity(512);
+                let mut buf = Vec::with_capacity(1024);
                 let mut take_reader = reader.take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
                 match take_reader.read_until(b'\n', &mut buf).await {
                     Ok(n) if n > 0 && !buf.is_empty() => {
