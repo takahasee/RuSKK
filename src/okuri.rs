@@ -2,12 +2,6 @@
 //! MeCab / ChaSen の活用表規則に基づき、SKKの送りキー（アルファベット）から
 //! 終止形・活用形の平仮名を合成し、azooKey から返った候補から語幹（単漢字）を抽出する。
 
-/// 送りキー（アルファベット1文字）から終止形などの送り仮名（平仮名）を返すマッピング。
-/// 五段活用、一段活用、形容詞の代表的活用語尾に対応。
-pub fn okuri_key_to_suffix(key: char) -> Option<&'static str> {
-    okuri_key_to_suffixes(key).first().copied()
-}
-
 /// 送りキー（アルファベット1文字）から終止形・連用形などの送り仮名（平仮名）のリストを返す。
 pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
     match key.to_ascii_lowercase() {
@@ -168,13 +162,6 @@ pub fn romaji_to_hiragana(romaji: &str) -> Option<&'static str> {
     }
 }
 
-/// 大文字子音キー（例: 'G', 'K', 'S'）から平仮名子音・濁音へのマッピング（後方互換用）。
-pub fn upper_key_to_kana(upper: char) -> Option<&'static str> {
-    let mut buf = [0u8; 4];
-    let s = upper.encode_utf8(&mut buf);
-    romaji_to_hiragana(s)
-}
-
 /// パースされた送りあり見出しの種別
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum OkuriMidashi<'a> {
@@ -311,13 +298,6 @@ pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
     variations
 }
 
-/// 送りあり見出しから、azooKey 照会用の完全な平仮名活用形と送り仮名を復元する（後方互換用）。
-/// 例: "かk" -> ("かく", "く")
-pub fn expand_okuri_to_full_kana(midashi: &str) -> Option<(String, &'static str)> {
-    let vars = expand_okuri_variations(midashi);
-    vars.into_iter().next().map(|v| (v.query_midashi, v.okuri_suffix))
-}
-
 #[inline]
 pub fn is_kanji(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
@@ -366,15 +346,6 @@ pub fn extract_stem_candidates_borrowed<'a>(
     }
 
     stems
-}
-
-/// azooKey が返した活用形候補から語幹リストを返す（String版）
-pub fn extract_stem_candidates(candidates: &[String], okuri_suffix: &str, query_midashi: &str) -> Vec<String> {
-    let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-    extract_stem_candidates_borrowed(&borrowed, okuri_suffix, query_midashi)
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect()
 }
 
 use crate::frequency::clean_candidate;
@@ -444,44 +415,25 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_stem_candidates() {
+    fn test_extract_stem_candidates_borrowed() {
         // "かく" に対する azooKey 候補: "書く", "各", "描く", "辛く", "書く;注釈"
-        let candidates = vec![
-            "書く".to_string(),
-            "各".to_string(), // 名詞 -> 除外されるべき
-            "描く".to_string(),
-            "辛く".to_string(),
-            "書く;注釈あり".to_string(), // 重複 -> 重複排除されるべき
-        ];
-        let stems = extract_stem_candidates(&candidates, "く", "かく");
+        let candidates = ["書く", "各", "描く", "辛く", "書く;注釈あり"];
+        let stems = extract_stem_candidates_borrowed(&candidates, "く", "かく");
         assert_eq!(stems, vec!["書", "描", "辛"]);
 
         // "交ぜがき" に対する azooKey 候補パターン A: "交ぜ書き", "混ぜ書き", "交ぜ餓鬼"
-        let comp_cands = vec![
-            "交ぜ書き".to_string(),
-            "混ぜ書き".to_string(),
-            "交ぜ餓鬼".to_string(),
-        ];
-        let comp_stems = extract_stem_candidates(&comp_cands, "き", "交ぜがき");
-        // 語幹 "交ぜ書", "混ぜ書" が抽出され、名詞 "交ぜ餓鬼" は除外される
+        let comp_cands = ["交ぜ書き", "混ぜ書き", "交ぜ餓鬼"];
+        let comp_stems = extract_stem_candidates_borrowed(&comp_cands, "き", "交ぜがき");
         assert_eq!(comp_stems, vec!["交ぜ書", "混ぜ書"]);
 
         // "交ぜがき" に対する azooKey 候補パターン B: すでに語幹化された "交ぜ書", "交ぜ餓鬼", "交ゼが来"
-        let pre_stemmed = vec![
-            "交ぜ書".to_string(),
-            "交ぜ餓鬼".to_string(),
-            "交ゼが来".to_string(),
-        ];
-        let pre_stems = extract_stem_candidates(&pre_stemmed, "き", "交ぜがき");
+        let pre_stemmed = ["交ぜ書", "交ぜ餓鬼", "交ゼが来"];
+        let pre_stems = extract_stem_candidates_borrowed(&pre_stemmed, "き", "交ぜがき");
         assert_eq!(pre_stems, vec!["交ぜ書"]);
 
         // "交ぜがく" に対する候補: 終止形動詞 "交ぜ書く" から語幹 "交ぜ書" が抽出され、名詞 "交ぜ学", "交是学" は除外される
-        let shuushi_cands = vec![
-            "交ぜ書く".to_string(),
-            "交ぜ学".to_string(),
-            "交是学".to_string(),
-        ];
-        let shuushi_stems = extract_stem_candidates(&shuushi_cands, "く", "交ぜがく");
+        let shuushi_cands = ["交ぜ書く", "交ぜ学", "交是学"];
+        let shuushi_stems = extract_stem_candidates_borrowed(&shuushi_cands, "く", "交ぜがく");
         assert_eq!(shuushi_stems, vec!["交ぜ書"]);
     }
 }

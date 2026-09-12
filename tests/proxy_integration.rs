@@ -910,6 +910,3 @@ async fn test_proxy_context_protected_against_completion_burst() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
-
-
-

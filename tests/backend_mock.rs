@@ -82,4 +82,3 @@ fn test_completion_merge_logic() {
     let formatted = ruskk::encoding::format_candidates_response(&merged);
     assert_eq!(formatted, "1/あ/い/う/\n".as_bytes());
 }
-

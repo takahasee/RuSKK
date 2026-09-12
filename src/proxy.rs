@@ -398,5 +398,3 @@ fn contains_kanji(s: &str) -> bool {
         )
     })
 }
-
-
