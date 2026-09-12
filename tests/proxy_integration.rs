@@ -395,6 +395,87 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
     upstream_handle.abort();
 }
 
+/// 複合語送りあり見出し（"交ぜGk", "まぜがk"）から、
+/// アップストリーム照会を経て "交ぜ書", "交ぜ書き" が返ることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        // 復元された "交ぜがき" または "まぜがき" に対するモックレスポンス
+                        if req.starts_with("1交ぜがき ".as_bytes()) {
+                            let _ = stream.write_all("1/交ぜ書き/交ぜ餓鬼/\n".as_bytes()).await;
+                        } else if req.starts_with("1まぜがき ".as_bytes()) {
+                            let _ = stream.write_all("1/混ぜ書き/交ぜ書き/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 大文字送りあり "1交ぜGk " -> 語幹 "交ぜ書" が返る（macSKK で送り仮名「き」が付与され「交ぜ書き」になる）
+    client.write_all("1交ぜGk \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.starts_with("1/交ぜ書/"), "unexpected resp: {}", resp);
+
+    // 2. 平仮名送りあり複合語 "1まぜがk " -> 語幹 "混ぜ書", "交ぜ書" が返る
+    client.write_all("1まぜがk \n".as_bytes()).await.unwrap();
+    let n2 = client.read(&mut buf).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf[..n2]);
+    assert!(resp2.starts_with("1/混ぜ書/"), "unexpected resp2: {}", resp2);
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 /// 送り復元が無効（okuri_expansion: false）のときは、
 /// 従来通り元の見出し語（"かk"）がそのまま照会されることを検証するテスト。
 #[tokio::test]

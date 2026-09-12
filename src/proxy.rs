@@ -192,35 +192,49 @@ async fn handle_client(
                 let mut final_response = None;
                 let mut top_candidate_for_context: Option<String> = None;
 
-                // 送りあり見出し（例: "かk" -> "かく", "きr" -> "きる"）の活用復元試行
-                if proxy.okuri_expansion
-                    && let Some((full_kana, okuri_suffix)) =
-                        crate::okuri::expand_okuri_to_full_kana(&midashi_str)
-                {
-                    let okuri_req = Request::Lookup(full_kana.as_bytes().to_vec());
-                    let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
+                // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき"）の活用復元試行
+                if proxy.okuri_expansion {
+                    let variations = crate::okuri::expand_okuri_variations(&midashi_str);
+                    let mut found_response = None;
 
-                    if is_found(&okuri_resp) {
-                        let raw_cands = parse_candidates_borrowed(&okuri_resp);
-                        let stem_cands = crate::okuri::extract_stem_candidates_borrowed(&raw_cands, okuri_suffix);
+                    for var in variations {
+                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes().to_vec());
+                        let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
 
-                        if !stem_cands.is_empty() {
+                        if is_found(&okuri_resp) {
+                            let raw_cands = parse_candidates_borrowed(&okuri_resp);
+                            let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
+                                &raw_cands,
+                                var.okuri_suffix,
+                                &var.query_midashi,
+                            );
+
                             debug!(
                                 midashi = %midashi_str,
-                                full_kana = %full_kana,
-                                stems_count = stem_cands.len(),
-                                "okuri expansion resolved candidates"
+                                query = %var.query_midashi,
+                                suffix = %var.okuri_suffix,
+                                resp = ?String::from_utf8_lossy(&okuri_resp),
+                                stems = ?stem_cands,
+                                "okuri variation checked"
                             );
-                            let ranked = {
-                                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &stem_cands)
-                            };
-                            if let Some(&top) = ranked.first() {
-                                top_candidate_for_context = Some(top.to_string());
+
+                            if !stem_cands.is_empty() {
+                                let ranked = {
+                                    let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                                    guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &stem_cands)
+                                };
+                                if let Some(&top) = ranked.first() {
+                                    top_candidate_for_context = Some(top.to_string());
+                                }
+                                found_response = Some(format_candidates_response_str(&ranked));
+                                break;
                             }
-                            final_response = Some(format_candidates_response_str(&ranked));
-                            okuri_handled = true;
                         }
+                    }
+
+                    if let Some(resp) = found_response {
+                        final_response = Some(resp);
+                        okuri_handled = true;
                     }
                 }
 

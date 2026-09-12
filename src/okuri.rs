@@ -5,63 +5,227 @@
 /// 送りキー（アルファベット1文字）から終止形などの送り仮名（平仮名）を返すマッピング。
 /// 五段活用、一段活用、形容詞の代表的活用語尾に対応。
 pub fn okuri_key_to_suffix(key: char) -> Option<&'static str> {
+    okuri_key_to_suffixes(key).first().copied()
+}
+
+/// 送りキー（アルファベット1文字）から終止形・連用形などの送り仮名（平仮名）のリストを返す。
+pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
     match key.to_ascii_lowercase() {
-        'k' => Some("く"), // カ行五段 (書く, 咲く, 動く, 描く, 働く)
-        's' => Some("す"), // サ行五段 (話す, 差す, 押す, 出す, 直す)
-        't' => Some("つ"), // タ行五段 (待つ, 立つ, 勝つ, 保つ, 持つ)
-        'n' => Some("ぬ"), // ナ行五段 (死ぬ)
-        'm' => Some("む"), // マ行五段 (読む, 飲む, 休む, 頼む, 噛む)
-        'r' => Some("る"), // ラ行五段 / 一段 (切る, 着る, 走る, 食べる, 見る)
-        'g' => Some("ぐ"), // ガ行五段 (泳ぐ, 脱ぐ, 防ぐ, 騒ぐ)
-        'b' => Some("ぶ"), // バ行五段 (遊ぶ, 飛ぶ, 呼ぶ, 結ぶ, 喜ぶ)
-        'u' | 'w' => Some("う"), // ワ行五段 (思う, 買う, 言う, 会う, 使う)
-        'i' => Some("い"), // 形容詞 (美しい, 高い, 広い, 赤い)
-        'd' => Some("だ"), // 形容動詞
+        'k' => &["く", "き"], // カ行五段 (書く/書き, 咲く/咲き, 交ぜ書き)
+        's' => &["す", "し"], // サ行五段 (話す/話し, 出す/出し)
+        't' => &["つ", "ち"], // タ行五段 (待つ/待ち, 立つ/立ち)
+        'n' => &["ぬ", "に"], // ナ行五段 (死ぬ/死に)
+        'm' => &["む", "み"], // マ行五段 (読む/読み, 頼む/頼み)
+        'r' => &["る", "り"], // ラ行五段/一段 (切る/切り, 着る/着)
+        'g' => &["ぐ", "ぎ"], // ガ行五段 (泳ぐ/泳ぎ, 騒ぐ/騒ぎ)
+        'b' => &["ぶ", "び"], // バ行五段 (遊ぶ/遊び, 結ぶ/結び)
+        'u' | 'w' => &["う", "い"], // ワ行五段 (思う/思い, 買う/買い)
+        'i' => &["い", "く"], // 形容詞 (美しい/美しく)
+        'd' => &["だ", "で"], // 形容動詞
+        _ => &[],
+    }
+}
+
+/// 大文字子音キー（例: 'G', 'K', 'S'）から平仮名子音・濁音へのマッピング。
+/// 複合語の送りあり接尾辞（例: "交ぜGk" -> "交ぜがk"）の復元に使用。
+pub fn upper_key_to_kana(upper: char) -> Option<&'static str> {
+    match upper.to_ascii_uppercase() {
+        'G' => Some("が"),
+        'K' => Some("か"),
+        'S' => Some("さ"),
+        'T' => Some("た"),
+        'D' => Some("だ"),
+        'N' => Some("な"),
+        'H' => Some("は"),
+        'B' => Some("ば"),
+        'P' => Some("ぱ"),
+        'M' => Some("ま"),
+        'R' => Some("ら"),
+        'W' => Some("わ"),
+        'Y' => Some("や"),
+        'Z' => Some("ざ"),
+        'J' => Some("じゃ"),
         _ => None,
     }
 }
 
-/// SKKの送りあり見出し（例: "かk", "きr", "おもu"）か判定し、
-/// 送りありの場合は `(語幹, 送りキー)` を返す。
-pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
+/// パースされた送りあり見出しの種別
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum OkuriMidashi<'a> {
+    /// 通常の送りあり（例: "かk", "きr", "まぜがk"）
+    Simple { stem: &'a str, key: char },
+    /// 複合語・大文字接尾辞送りあり（例: "交ぜGk", "まぜGk"）
+    Compound {
+        prefix: &'a str,
+        upper_key: char,
+        okuri_key: char,
+    },
+}
+
+/// 送りあり見出し（通常・大文字複合語）を拡張パースする。
+pub fn parse_okuri_midashi_extended(midashi: &str) -> Option<OkuriMidashi<'_>> {
     let mut chars = midashi.chars().rev();
     let last = chars.next()?;
     let prev = chars.next()?;
 
-    // 末尾が ASCII アルファベットで、その直前が非ASCII文字（ひらがな等）の場合に送りありと判定
-    if last.is_ascii_alphabetic() && !prev.is_ascii() {
-        let stem_len = midashi.len() - last.len_utf8();
-        Some((&midashi[..stem_len], last))
-    } else {
-        None
+    if last.is_ascii_alphabetic() {
+        // パターン 1: 大文字接尾辞 + 小文字送りキー（例: "交ぜGk"）
+        if prev.is_ascii_uppercase() && last.is_ascii_lowercase() {
+            let prefix_len = midashi.len() - last.len_utf8() - prev.len_utf8();
+            let prefix = &midashi[..prefix_len];
+            if !prefix.is_empty() && !prefix.is_ascii() {
+                return Some(OkuriMidashi::Compound {
+                    prefix,
+                    upper_key: prev,
+                    okuri_key: last,
+                });
+            }
+        }
+        // パターン 2: 通常の送りあり（例: "かk", "まぜがk", "交ぜがk"）
+        if !prev.is_ascii() {
+            let stem_len = midashi.len() - last.len_utf8();
+            return Some(OkuriMidashi::Simple {
+                stem: &midashi[..stem_len],
+                key: last,
+            });
+        }
+    }
+    None
+}
+
+/// SKKの送りあり見出し（例: "かk", "きr", "おもu", "交ぜGk"）か判定し、
+/// 送りありの場合は `(語幹, 送りキー)` を返す（後方互換用）。
+pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
+    match parse_okuri_midashi_extended(midashi)? {
+        OkuriMidashi::Simple { stem, key } => Some((stem, key)),
+        OkuriMidashi::Compound { prefix, okuri_key, .. } => Some((prefix, okuri_key)),
     }
 }
 
-/// 送りあり見出しから、azooKey 照会用の完全な平仮名活用形と送り仮名を復元する。
-/// 例: "かk" -> ("かく", "く")
-/// 例: "きr" -> ("きる", "る")
-/// 例: "おもu" -> ("おもう", "う")
-pub fn expand_okuri_to_full_kana(midashi: &str) -> Option<(String, &'static str)> {
-    let (stem, key) = parse_okuri_midashi(midashi)?;
-    let suffix = okuri_key_to_suffix(key)?;
-    let mut full = String::with_capacity(stem.len() + suffix.len());
-    full.push_str(stem);
-    full.push_str(suffix);
-    Some((full, suffix))
+/// 照会用の活用形バリエーション
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OkuriVariation {
+    /// アップストリーム照会用見出し（例: "交ぜがき", "交ぜがく", "かく"）
+    pub query_midashi: String,
+    /// 語幹抽出用の送り仮名（例: "き", "く"）
+    pub okuri_suffix: &'static str,
 }
 
-/// azooKey が返した活用形候補（例: ["書く", "各", "描く", "辛く"]）から、
-/// 送り仮名（例: "く"）で終わる候補のみを抽出し、送り仮名を剥がして語幹（単漢字）リストをゼロコピーで返す。
-pub fn extract_stem_candidates_borrowed<'a>(candidates: &[&'a str], okuri_suffix: &str) -> Vec<&'a str> {
-    let mut stems = Vec::with_capacity(candidates.len());
+/// 送りあり見出しから、azooKey / yaskkserv2 に照会すべき全平仮名・語幹バリエーションを展開する。
+/// 例: "交ぜGk" -> [("交ぜがき", "き"), ("交ぜがく", "く")]
+/// 例: "まぜがk" -> [("まぜがき", "き"), ("まぜがく", "く")]
+/// 例: "かk"     -> [("かく", "く"), ("かき", "き")]
+pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
+    let parsed = match parse_okuri_midashi_extended(midashi) {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+
+    let mut variations = Vec::new();
+
+    match parsed {
+        OkuriMidashi::Compound { prefix, upper_key, okuri_key } => {
+            if let Some(upper_kana) = upper_key_to_kana(upper_key) {
+                let suffixes = okuri_key_to_suffixes(okuri_key);
+                // 複合語・名詞化（例: 交ぜ書き）では連用形「き」を最優先で照会
+                let ordered_suffixes: Vec<&'static str> = if suffixes.contains(&"き") {
+                    let mut s = vec!["き"];
+                    s.extend(suffixes.iter().copied().filter(|&x| x != "き"));
+                    s
+                } else {
+                    suffixes.to_vec()
+                };
+
+                for suffix in ordered_suffixes {
+                    let mut q = String::with_capacity(prefix.len() + upper_kana.len() + suffix.len());
+                    q.push_str(prefix);
+                    q.push_str(upper_kana);
+                    q.push_str(suffix);
+                    variations.push(OkuriVariation {
+                        query_midashi: q,
+                        okuri_suffix: suffix,
+                    });
+                }
+            }
+        }
+        OkuriMidashi::Simple { stem, key } => {
+            let suffixes = okuri_key_to_suffixes(key);
+            // stem の末尾が助詞連濁（「が」「に」など）または2文字以上の複合語の場合、
+            // 連用形（「き」〜書き）も優先順位高く生成
+            let is_compound = stem.chars().count() >= 3 || stem.ends_with('が') || stem.ends_with('に');
+            let ordered_suffixes: Vec<&'static str> = if is_compound && suffixes.contains(&"き") {
+                let mut s = vec!["き"];
+                s.extend(suffixes.iter().copied().filter(|&x| x != "き"));
+                s
+            } else {
+                suffixes.to_vec()
+            };
+
+            for suffix in ordered_suffixes {
+                let mut q = String::with_capacity(stem.len() + suffix.len());
+                q.push_str(stem);
+                q.push_str(suffix);
+                variations.push(OkuriVariation {
+                    query_midashi: q,
+                    okuri_suffix: suffix,
+                });
+            }
+        }
+    }
+
+    variations
+}
+
+/// 送りあり見出しから、azooKey 照会用の完全な平仮名活用形と送り仮名を復元する（後方互換用）。
+/// 例: "かk" -> ("かく", "く")
+pub fn expand_okuri_to_full_kana(midashi: &str) -> Option<(String, &'static str)> {
+    let vars = expand_okuri_variations(midashi);
+    vars.into_iter().next().map(|v| (v.query_midashi, v.okuri_suffix))
+}
+
+#[inline]
+pub fn is_kanji(c: char) -> bool {
+    matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
+}
+
+/// azooKey が返した活用形候補（例: ["交ぜ書き", "書く", "描く", "交ぜ書"]）から、
+/// 送り仮名（例: "き", "く"）で終わる語幹、またはすでに語幹化されている候補をゼロコピーで抽出する。
+pub fn extract_stem_candidates_borrowed<'a>(
+    candidates: &[&'a str],
+    okuri_suffix: &str,
+    query_midashi: &str,
+) -> Vec<&'a str> {
+    let mut stems = Vec::with_capacity(candidates.len() * 2);
+    let query_char_count = query_midashi.chars().count();
+    let suffix_char_count = okuri_suffix.chars().count();
+    let stem_char_count = query_char_count.saturating_sub(suffix_char_count);
 
     for &cand in candidates {
         let clean = clean_candidate(cand);
-        if let Some(stem) = clean.strip_suffix(okuri_suffix)
-            && !stem.is_empty()
-            && !stems.contains(&stem)
+        if clean.is_empty() {
+            continue;
+        }
+
+        // 1. 送り仮名（例: "き", "く"）を剥がした語幹（例: "交ぜ書き" -> "交ぜ書", "書く" -> "書"）を抽出
+        if let Some(stem) = clean.strip_suffix(okuri_suffix) {
+            if !stem.is_empty() && !stems.contains(&stem) {
+                stems.push(stem);
+            }
+            continue;
+        }
+
+        // 2. 複合語（語幹仮名長 >= 2）において、候補がすでに語幹そのもの（送り仮名なし）の場合
+        // 例: azooKey が "交ぜがき" に対して "交ぜ書" を返した場合
+        // - 末尾が漢字
+        // - 文字数が 2文字以上 かつ stem_char_count 以下（"交ぜ餓鬼" などの名詞を除外）
+        if stem_char_count >= 2
+            && clean.chars().count() >= 2
+            && clean.chars().count() <= stem_char_count
+            && let Some(last_char) = clean.chars().last()
+            && is_kanji(last_char)
+            && !stems.contains(&clean)
         {
-            stems.push(stem);
+            stems.push(clean);
         }
     }
 
@@ -69,9 +233,9 @@ pub fn extract_stem_candidates_borrowed<'a>(candidates: &[&'a str], okuri_suffix
 }
 
 /// azooKey が返した活用形候補から語幹リストを返す（String版）
-pub fn extract_stem_candidates(candidates: &[String], okuri_suffix: &str) -> Vec<String> {
+pub fn extract_stem_candidates(candidates: &[String], okuri_suffix: &str, query_midashi: &str) -> Vec<String> {
     let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-    extract_stem_candidates_borrowed(&borrowed, okuri_suffix)
+    extract_stem_candidates_borrowed(&borrowed, okuri_suffix, query_midashi)
         .into_iter()
         .map(|s| s.to_string())
         .collect()
@@ -90,6 +254,18 @@ mod tests {
         assert_eq!(parse_okuri_midashi("おもu"), Some(("おも", 'u')));
         assert_eq!(parse_okuri_midashi("おもU"), Some(("おも", 'U')));
         assert_eq!(parse_okuri_midashi("うつくしi"), Some(("うつくし", 'i')));
+        assert_eq!(parse_okuri_midashi("まぜがk"), Some(("まぜが", 'k')));
+        assert_eq!(parse_okuri_midashi("交ぜGk"), Some(("交ぜ", 'k')));
+
+        // 拡張パース
+        assert_eq!(
+            parse_okuri_midashi_extended("交ぜGk"),
+            Some(OkuriMidashi::Compound {
+                prefix: "交ぜ",
+                upper_key: 'G',
+                okuri_key: 'k',
+            })
+        );
 
         // 送りなし見出し
         assert_eq!(parse_okuri_midashi("とうきょう"), None);
@@ -99,16 +275,21 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_okuri_to_full_kana() {
-        assert_eq!(expand_okuri_to_full_kana("かk"), Some(("かく".to_string(), "く")));
-        assert_eq!(expand_okuri_to_full_kana("よm"), Some(("よむ".to_string(), "む")));
-        assert_eq!(expand_okuri_to_full_kana("きr"), Some(("きる".to_string(), "る")));
-        assert_eq!(expand_okuri_to_full_kana("はなs"), Some(("はなす".to_string(), "す")));
-        assert_eq!(expand_okuri_to_full_kana("おもu"), Some(("おもう".to_string(), "う")));
-        assert_eq!(expand_okuri_to_full_kana("おもU"), Some(("おもう".to_string(), "う")));
-        assert_eq!(expand_okuri_to_full_kana("うつくしi"), Some(("うつくしい".to_string(), "い")));
+    fn test_expand_okuri_variations() {
+        // 通常の動詞
+        let vars_kak = expand_okuri_variations("かk");
+        assert_eq!(vars_kak[0].query_midashi, "かく");
+        assert_eq!(vars_kak[0].okuri_suffix, "く");
 
-        assert_eq!(expand_okuri_to_full_kana("とうきょう"), None);
+        // 複合語 "まぜがk" -> 連用形 "まぜがき" が最優先
+        let vars_mazegak = expand_okuri_variations("まぜがk");
+        assert_eq!(vars_mazegak[0].query_midashi, "まぜがき");
+        assert_eq!(vars_mazegak[0].okuri_suffix, "き");
+
+        // 複合語大文字 "交ぜGk" -> "交ぜがき" が最優先
+        let vars_mazegk = expand_okuri_variations("交ぜGk");
+        assert_eq!(vars_mazegk[0].query_midashi, "交ぜがき");
+        assert_eq!(vars_mazegk[0].okuri_suffix, "き");
     }
 
     #[test]
@@ -121,7 +302,26 @@ mod tests {
             "辛く".to_string(),
             "書く;注釈あり".to_string(), // 重複 -> 重複排除されるべき
         ];
-        let stems = extract_stem_candidates(&candidates, "く");
+        let stems = extract_stem_candidates(&candidates, "く", "かく");
         assert_eq!(stems, vec!["書", "描", "辛"]);
+
+        // "交ぜがき" に対する azooKey 候補パターン A: "交ぜ書き", "混ぜ書き", "交ぜ餓鬼"
+        let comp_cands = vec![
+            "交ぜ書き".to_string(),
+            "混ぜ書き".to_string(),
+            "交ぜ餓鬼".to_string(),
+        ];
+        let comp_stems = extract_stem_candidates(&comp_cands, "き", "交ぜがき");
+        // 語幹 "交ぜ書", "混ぜ書" が抽出され、名詞 "交ぜ餓鬼" は除外される
+        assert_eq!(comp_stems, vec!["交ぜ書", "混ぜ書"]);
+
+        // "交ぜがき" に対する azooKey 候補パターン B: すでに語幹化された "交ぜ書", "交ぜ餓鬼", "交ゼが来"
+        let pre_stemmed = vec![
+            "交ぜ書".to_string(),
+            "交ぜ餓鬼".to_string(),
+            "交ゼが来".to_string(),
+        ];
+        let pre_stems = extract_stem_candidates(&pre_stemmed, "き", "交ぜがき");
+        assert_eq!(pre_stems, vec!["交ぜ書"]);
     }
 }
