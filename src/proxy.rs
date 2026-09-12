@@ -36,6 +36,17 @@ impl Proxy {
 
         let proxy = Arc::new(self);
 
+        // Primary バックエンド（azooKey）をバックグラウンドでウォームアップ
+        // （macOS の App Nap による初回スリープを解除し、モデルロードを先行完了させる）
+        {
+            let warmup_primary = proxy.primary.clone();
+            tokio::spawn(async move {
+                let req = Request::Lookup(b"\xca\xa1".to_vec()); // EUC-JP "あ"
+                let _ = warmup_primary.query_with_timeout(&req, Duration::from_secs(3)).await;
+                tracing::debug!("primary backend warmup complete");
+            });
+        }
+
         loop {
             match listener.accept().await {
                 Ok((stream, peer)) => {
@@ -260,8 +271,8 @@ enum BackendHit {
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
 async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, BackendHit) {
     let start = Instant::now();
-    let overall_deadline = Duration::from_millis(950);
-    let primary_timeout = proxy.primary.timeout.min(Duration::from_millis(300));
+    let overall_deadline = (proxy.primary.timeout + proxy.fallback.timeout).max(Duration::from_millis(1500));
+    let primary_timeout = proxy.primary.timeout;
 
     match proxy.primary.query_with_timeout(request, primary_timeout).await {
         Ok(response) if is_found(&response) => {
