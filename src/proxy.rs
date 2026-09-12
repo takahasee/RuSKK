@@ -22,6 +22,13 @@ pub struct Proxy {
     pub context_ranking: bool,
 }
 
+#[derive(Debug, Default)]
+struct SharedContextState {
+    session_context: Vec<String>,
+    pending_context: Option<(String, String, Instant)>,
+    last_response_time: Option<Instant>,
+}
+
 impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.listen).await?;
@@ -35,6 +42,7 @@ impl Proxy {
         );
 
         let proxy = Arc::new(self);
+        let shared_context = Arc::new(tokio::sync::Mutex::new(SharedContextState::default()));
 
         // Primary バックエンド（azooKey）をバックグラウンドでウォームアップ
         // （macOS の App Nap による初回スリープを解除し、モデルロードを先行完了させる）
@@ -52,8 +60,9 @@ impl Proxy {
                 Ok((stream, peer)) => {
                     debug!(%peer, "client connected");
                     let proxy = Arc::clone(&proxy);
+                    let shared_context = Arc::clone(&shared_context);
                     tokio::spawn(async move {
-                        if let Err(err) = handle_client(proxy, stream).await {
+                        if let Err(err) = handle_client(proxy, shared_context, stream).await {
                             debug!(%peer, error = %err, "client session ended");
                         }
                     });
@@ -66,15 +75,15 @@ impl Proxy {
     }
 }
 
-async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<()> {
+async fn handle_client(
+    proxy: Arc<Proxy>,
+    shared_context: Arc<tokio::sync::Mutex<SharedContextState>>,
+    stream: TcpStream,
+) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::new();
-
-    let mut session_context: Vec<String> = Vec::new();
-    let mut pending_context: Option<(String, String, Instant)> = None;
-    let mut last_response_time: Option<Instant> = None;
 
     loop {
         line.clear();
@@ -123,47 +132,52 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let midashi_str = decode_midashi(midashi);
                 let now = Instant::now();
 
-                // macSKK の自動補完スキャンの検出:
-                // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
-                // macSKK はキー入力時に内部補完候補を 5〜40ms 間隔で連射して Lookup を飛ばす仕様がある。
-                // 人間の手動タイピング・Space押下（通常 150ms 以上）と明確に区別し、
-                // 自動補完スキャンを文脈昇格・pending_context 更新から除外して文脈を保護する。
-                let is_completion_scan = last_response_time
-                    .map(|t| now.duration_since(t) < Duration::from_millis(60))
-                    .unwrap_or(false);
+                // 複数 TCP 接続を跨いで文脈を安全に共有・判定する
+                let (is_completion_scan, session_ctx_snapshot) = {
+                    let mut ctx = shared_context.lock().await;
 
-                // 文脈連動（context_ranking）が有効な場合、
-                // 手動での通常変換（補完スキャンでない）かつ見出し語が変わった時点で、
-                // 前回の単語が確定されたとみなして session_context に昇格する。
-                if proxy.context_ranking {
-                    if is_completion_scan {
-                        debug!(
-                            midashi = %midashi_str,
-                            "ignored rapid completion scan from context promotion"
-                        );
-                    } else if let Some((prev_midashi, prev_word, time)) = pending_context.take() {
-                        if prev_midashi != midashi_str {
-                            // 60秒以内の入力のみ文脈として保持
-                            if now.duration_since(time) <= Duration::from_secs(60) {
-                                session_context.clear();
-                                session_context.push(prev_word);
-                                debug!(
-                                    context = ?session_context,
-                                    new_midashi = %midashi_str,
-                                    "promoted pending context"
-                                );
+                    // macSKK の自動補完スキャンの検出:
+                    // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
+                    let is_completion_scan = ctx
+                        .last_response_time
+                        .map(|t| now.duration_since(t) < Duration::from_millis(60))
+                        .unwrap_or(false);
+
+                    // 文脈連動（context_ranking）が有効な場合、
+                    // 手動での通常変換（補完スキャンでない）かつ見出し語が変わった時点で、
+                    // 前回の単語が確定されたとみなして session_context に昇格する。
+                    if proxy.context_ranking {
+                        if is_completion_scan {
+                            debug!(
+                                midashi = %midashi_str,
+                                "ignored rapid completion scan from context promotion"
+                            );
+                        } else if let Some((prev_midashi, prev_word, time)) = ctx.pending_context.take() {
+                            if prev_midashi != midashi_str {
+                                // 60秒以内の入力のみ文脈として保持
+                                if now.duration_since(time) <= Duration::from_secs(60) {
+                                    ctx.session_context.clear();
+                                    ctx.session_context.push(prev_word);
+                                    debug!(
+                                        context = ?ctx.session_context,
+                                        new_midashi = %midashi_str,
+                                        "promoted pending context"
+                                    );
+                                } else {
+                                    ctx.session_context.clear();
+                                }
                             } else {
-                                session_context.clear();
+                                // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
+                                ctx.pending_context = Some((prev_midashi, prev_word, time));
                             }
-                        } else {
-                            // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
-                            pending_context = Some((prev_midashi, prev_word, time));
                         }
                     }
-                }
+
+                    (is_completion_scan, ctx.session_context.clone())
+                };
 
                 let ctx_ref = if proxy.context_ranking {
-                    &session_context[..]
+                    &session_ctx_snapshot[..]
                 } else {
                     &[]
                 };
@@ -236,23 +250,22 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 {
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
-                        pending_context = Some((midashi_str.clone(), clean.to_string(), now));
+                        let mut ctx = shared_context.lock().await;
+                        ctx.pending_context = Some((midashi_str.clone(), clean.to_string(), now));
                     }
                 }
 
                 writer.write_all(&resp_to_send).await?;
             }
             Request::Completion(_) => {
-                // 補完クエリに対しては常に「候補なし (4\n)」を返す。
-                // macSKK が補完候補を取得すると、入力停止後（約0.3秒〜0.5秒）に
-                // 候補を勝手にテキストに確定出力（addFixedText）してしまうため、
-                // 補完候補の返却を停止し、勝手な自動確定を 100% 物理的に防止する。
-                // 確定はユーザーが Space で通常変換（Lookup）して手動で行う。
                 writer.write_all(b"4\n").await?;
             }
         }
         writer.flush().await?;
-        last_response_time = Some(Instant::now());
+        {
+            let mut ctx = shared_context.lock().await;
+            ctx.last_response_time = Some(Instant::now());
+        }
     }
 
     Ok(())

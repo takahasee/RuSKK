@@ -577,6 +577,8 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         assert_eq!(resp, "1/切/着/伐/\n");
     }
 
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
     // --- ケース 2: 服 -> 着る（着） ---
     {
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
@@ -593,6 +595,8 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         // 文脈「服」により「着」が第1候補！
         assert_eq!(resp, "1/着/切/伐/\n");
     }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
 
     // --- ケース 3: 木 -> 伐る（伐） ---
     {
