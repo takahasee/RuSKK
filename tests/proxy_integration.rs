@@ -465,6 +465,12 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.starts_with("1/交ぜ書/"), "unexpected resp: {}", resp);
 
+    // 1b. 大文字ローマ字送りあり "1交ぜGak " -> 語幹 "交ぜ書" が返る
+    client.write_all("1交ぜGak \n".as_bytes()).await.unwrap();
+    let n1b = client.read(&mut buf).await.unwrap();
+    let resp1b = String::from_utf8_lossy(&buf[..n1b]);
+    assert!(resp1b.starts_with("1/交ぜ書/"), "unexpected resp1b: {}", resp1b);
+
     // 2. 平仮名送りあり複合語 "1まぜがk " -> 語幹 "混ぜ書", "交ぜ書" が返る
     client.write_all("1まぜがk \n".as_bytes()).await.unwrap();
     let n2 = client.read(&mut buf).await.unwrap();

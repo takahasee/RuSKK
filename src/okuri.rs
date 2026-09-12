@@ -26,27 +26,153 @@ pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
     }
 }
 
-/// 大文字子音キー（例: 'G', 'K', 'S'）から平仮名子音・濁音へのマッピング。
-/// 複合語の送りあり接尾辞（例: "交ぜGk" -> "交ぜがk"）の復元に使用。
-pub fn upper_key_to_kana(upper: char) -> Option<&'static str> {
-    match upper.to_ascii_uppercase() {
-        'G' => Some("が"),
-        'K' => Some("か"),
-        'S' => Some("さ"),
-        'T' => Some("た"),
-        'D' => Some("だ"),
-        'N' => Some("な"),
-        'H' => Some("は"),
-        'B' => Some("ば"),
-        'P' => Some("ぱ"),
-        'M' => Some("ま"),
-        'R' => Some("ら"),
-        'W' => Some("わ"),
-        'Y' => Some("や"),
-        'Z' => Some("ざ"),
-        'J' => Some("じゃ"),
+/// 大文字で始まるローマ字（例: "Ga", "G", "Ka", "To", "Shi" など）を平仮名に変換する。
+/// 複合語の送りあり接尾辞（例: "交ぜGak" -> "交ぜがk", "交ぜGk" -> "交ぜがk"）の復元に使用。
+pub fn romaji_to_hiragana(romaji: &str) -> Option<&'static str> {
+    let mut lower = [0u8; 8];
+    if romaji.is_empty() || romaji.len() > lower.len() {
+        return None;
+    }
+    for (i, b) in romaji.bytes().enumerate() {
+        lower[i] = b.to_ascii_lowercase();
+    }
+    let s = std::str::from_utf8(&lower[..romaji.len()]).ok()?;
+
+    match s {
+        // 母音
+        "a" => Some("あ"),
+        "i" => Some("い"),
+        "u" => Some("う"),
+        "e" => Some("え"),
+        "o" => Some("お"),
+
+        // か行・が行
+        "ka" => Some("か"),
+        "ki" => Some("き"),
+        "ku" => Some("く"),
+        "ke" => Some("け"),
+        "ko" => Some("こ"),
+        "ga" => Some("が"),
+        "gi" => Some("ぎ"),
+        "gu" => Some("ぐ"),
+        "ge" => Some("げ"),
+        "go" => Some("ご"),
+
+        // さ行・ざ行
+        "sa" => Some("さ"),
+        "si" | "shi" => Some("し"),
+        "su" => Some("す"),
+        "se" => Some("せ"),
+        "so" => Some("そ"),
+        "za" => Some("ざ"),
+        "zi" | "ji" => Some("じ"),
+        "zu" => Some("ず"),
+        "ze" => Some("ぜ"),
+        "zo" => Some("ぞ"),
+
+        // た行・だ行
+        "ta" => Some("た"),
+        "ti" | "chi" => Some("ち"),
+        "tu" | "tsu" => Some("つ"),
+        "te" => Some("て"),
+        "to" => Some("と"),
+        "da" => Some("だ"),
+        "di" => Some("ぢ"),
+        "du" => Some("づ"),
+        "de" => Some("で"),
+        "do" => Some("ど"),
+
+        // な行
+        "na" => Some("な"),
+        "ni" => Some("に"),
+        "nu" => Some("ぬ"),
+        "ne" => Some("ね"),
+        "no" => Some("の"),
+
+        // は行・ば行・ぱ行
+        "ha" => Some("は"),
+        "hi" => Some("ひ"),
+        "hu" | "fu" => Some("ふ"),
+        "he" => Some("へ"),
+        "ho" => Some("ほ"),
+        "ba" => Some("ば"),
+        "bi" => Some("び"),
+        "bu" => Some("ぶ"),
+        "be" => Some("べ"),
+        "bo" => Some("ぼ"),
+        "pa" => Some("ぱ"),
+        "pi" => Some("ぴ"),
+        "pu" => Some("ぷ"),
+        "pe" => Some("ぺ"),
+        "po" => Some("ぽ"),
+
+        // ま行
+        "ma" => Some("ま"),
+        "mi" => Some("み"),
+        "mu" => Some("む"),
+        "me" => Some("め"),
+        "mo" => Some("も"),
+
+        // や行
+        "ya" => Some("や"),
+        "yu" => Some("ゆ"),
+        "yo" => Some("よ"),
+
+        // ら行
+        "ra" => Some("ら"),
+        "ri" => Some("り"),
+        "ru" => Some("る"),
+        "re" => Some("れ"),
+        "ro" => Some("ろ"),
+
+        // わ行
+        "wa" => Some("わ"),
+        "wo" => Some("を"),
+        "nn" => Some("ん"),
+
+        // 代表的な拗音
+        "kya" => Some("きゃ"), "kyu" => Some("きゅ"), "kyo" => Some("きょ"),
+        "gya" => Some("ぎゃ"), "gyu" => Some("ぎゅ"), "gyo" => Some("ぎょ"),
+        "sya" | "sha" => Some("しゃ"), "syu" | "shu" => Some("しゅ"), "syo" | "sho" => Some("しょ"),
+        "zya" | "ja" | "jya" => Some("じゃ"), "zyu" | "ju" | "jyu" => Some("じゅ"), "zyo" | "jo" | "jyo" => Some("じょ"),
+        "tya" | "cha" => Some("ちゃ"), "tyu" | "chu" => Some("ちゅ"), "tyo" | "cho" => Some("ちょ"),
+        "nya" => Some("にゃ"), "nyu" => Some("にゅ"), "nyo" => Some("にょ"),
+        "hya" => Some("ひゃ"), "hyu" => Some("ひゅ"), "hyo" => Some("ひょ"),
+        "bya" => Some("びゃ"), "byu" => Some("びゅ"), "byo" => Some("びょ"),
+        "pya" => Some("ぴゃ"), "pyu" => Some("ぴゅ"), "pyo" => Some("ぴょ"),
+        "mya" => Some("みゃ"), "myu" => Some("みゅ"), "myo" => Some("みょ"),
+        "rya" => Some("りゃ"), "ryu" => Some("りゅ"), "ryo" => Some("りょ"),
+
+        // 連濁・複合語頻出（gaki -> がき 等）
+        "gaki" => Some("がき"),
+        "kaki" => Some("かき"),
+
+        // 後方互換（大文字子音単体）: "G" -> "が", "K" -> "か" 等
+        "g" => Some("が"),
+        "k" => Some("か"),
+        "s" => Some("さ"),
+        "t" => Some("た"),
+        "d" => Some("だ"),
+        "n" => Some("な"),
+        "h" => Some("は"),
+        "b" => Some("ば"),
+        "p" => Some("ぱ"),
+        "m" => Some("ま"),
+        "r" => Some("ら"),
+        "w" => Some("わ"),
+        "y" => Some("や"),
+        "z" => Some("ざ"),
+        "j" => Some("じゃ"),
+
         _ => None,
     }
+}
+
+/// 大文字子音キー（例: 'G', 'K', 'S'）から平仮名子音・濁音へのマッピング（後方互換用）。
+pub fn upper_key_to_kana(upper: char) -> Option<&'static str> {
+    let mut buf = [0u8; 4];
+    let s = upper.encode_utf8(&mut buf);
+    romaji_to_hiragana(s)
 }
 
 /// パースされた送りあり見出しの種別
@@ -54,46 +180,54 @@ pub fn upper_key_to_kana(upper: char) -> Option<&'static str> {
 pub enum OkuriMidashi<'a> {
     /// 通常の送りあり（例: "かk", "きr", "まぜがk"）
     Simple { stem: &'a str, key: char },
-    /// 複合語・大文字接尾辞送りあり（例: "交ぜGk", "まぜGk"）
+    /// 複合語・大文字接尾辞送りあり（例: "交ぜGak", "交ぜGk", "まぜGak"）
     Compound {
         prefix: &'a str,
-        upper_key: char,
+        romaji: &'a str,
         okuri_key: char,
     },
 }
 
 /// 送りあり見出し（通常・大文字複合語）を拡張パースする。
 pub fn parse_okuri_midashi_extended(midashi: &str) -> Option<OkuriMidashi<'_>> {
-    let mut chars = midashi.chars().rev();
-    let last = chars.next()?;
-    let prev = chars.next()?;
+    let alpha_len = midashi.bytes().rev().take_while(|b| b.is_ascii_alphabetic()).count();
+    if alpha_len == 0 {
+        return None;
+    }
 
-    if last.is_ascii_alphabetic() {
-        // パターン 1: 大文字接尾辞 + 小文字送りキー（例: "交ぜGk"）
-        if prev.is_ascii_uppercase() && last.is_ascii_lowercase() {
-            let prefix_len = midashi.len() - last.len_utf8() - prev.len_utf8();
-            let prefix = &midashi[..prefix_len];
-            if !prefix.is_empty() && !prefix.is_ascii() {
-                return Some(OkuriMidashi::Compound {
-                    prefix,
-                    upper_key: prev,
-                    okuri_key: last,
-                });
-            }
-        }
-        // パターン 2: 通常の送りあり（例: "かk", "まぜがk", "交ぜがk"）
-        if !prev.is_ascii() {
-            let stem_len = midashi.len() - last.len_utf8();
-            return Some(OkuriMidashi::Simple {
-                stem: &midashi[..stem_len],
-                key: last,
+    let prefix = &midashi[..midashi.len() - alpha_len];
+    if prefix.is_empty() || prefix.is_ascii() {
+        return None;
+    }
+
+    let alpha = &midashi[midashi.len() - alpha_len..];
+    let first = alpha.chars().next()?;
+    let last = alpha.chars().last()?;
+
+    // パターン 1: 大文字から始まる複合語接尾辞（例: "交ぜGak", "交ぜGk", "交ぜGAk"）
+    if first.is_ascii_uppercase() && alpha_len >= 2 && last.is_ascii_lowercase() {
+        let romaji_part = &alpha[..alpha.len() - last.len_utf8()];
+        if !romaji_part.is_empty() && romaji_to_hiragana(romaji_part).is_some() {
+            return Some(OkuriMidashi::Compound {
+                prefix,
+                romaji: romaji_part,
+                okuri_key: last,
             });
         }
     }
+
+    // パターン 2: 通常の送りあり（例: "かk", "きr", "まぜがk", "おもu"）
+    if alpha_len == 1 {
+        return Some(OkuriMidashi::Simple {
+            stem: prefix,
+            key: last,
+        });
+    }
+
     None
 }
 
-/// SKKの送りあり見出し（例: "かk", "きr", "おもu", "交ぜGk"）か判定し、
+/// SKKの送りあり見出し（例: "かk", "きr", "おもu", "交ぜGak", "交ぜGk"）か判定し、
 /// 送りありの場合は `(語幹, 送りキー)` を返す（後方互換用）。
 pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
     match parse_okuri_midashi_extended(midashi)? {
@@ -112,6 +246,7 @@ pub struct OkuriVariation {
 }
 
 /// 送りあり見出しから、azooKey / yaskkserv2 に照会すべき全平仮名・語幹バリエーションを展開する。
+/// 例: "交ぜGak" -> [("交ぜがき", "き"), ("交ぜがく", "く")]
 /// 例: "交ぜGk" -> [("交ぜがき", "き"), ("交ぜがく", "く")]
 /// 例: "まぜがk" -> [("まぜがき", "き"), ("まぜがく", "く")]
 /// 例: "かk"     -> [("かく", "く"), ("かき", "き")]
@@ -124,8 +259,8 @@ pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
     let mut variations = Vec::new();
 
     match parsed {
-        OkuriMidashi::Compound { prefix, upper_key, okuri_key } => {
-            if let Some(upper_kana) = upper_key_to_kana(upper_key) {
+        OkuriMidashi::Compound { prefix, romaji, okuri_key } => {
+            if let Some(upper_kana) = romaji_to_hiragana(romaji) {
                 let suffixes = okuri_key_to_suffixes(okuri_key);
                 // 複合語・名詞化（例: 交ぜ書き）では連用形「き」を最優先で照会
                 let ordered_suffixes: Vec<&'static str> = if suffixes.contains(&"き") {
@@ -215,10 +350,11 @@ pub fn extract_stem_candidates_borrowed<'a>(
         }
 
         // 2. 複合語（語幹仮名長 >= 2）において、候補がすでに語幹そのもの（送り仮名なし）の場合
-        // 例: azooKey が "交ぜがき" に対して "交ぜ書" を返した場合
-        // - 末尾が漢字
-        // - 文字数が 2文字以上 かつ stem_char_count 以下（"交ぜ餓鬼" などの名詞を除外）
-        if stem_char_count >= 2
+        // 連用形（"き", "り", "し", "み" 等）の場合のみ語幹名詞（例: "交ぜ書"）を抽出し、
+        // 終止形（"く", "る" 等）に対する名詞（例: "交ぜ学"）の誤認混入を確実に防止する。
+        let is_renyoukei = matches!(okuri_suffix, "き" | "り" | "し" | "み" | "い" | "ち" | "に" | "び" | "ぎ");
+        if is_renyoukei
+            && stem_char_count >= 2
             && clean.chars().count() >= 2
             && clean.chars().count() <= stem_char_count
             && let Some(last_char) = clean.chars().last()
@@ -262,16 +398,26 @@ mod tests {
             parse_okuri_midashi_extended("交ぜGk"),
             Some(OkuriMidashi::Compound {
                 prefix: "交ぜ",
-                upper_key: 'G',
+                romaji: "G",
                 okuri_key: 'k',
             })
         );
+        assert_eq!(
+            parse_okuri_midashi_extended("交ぜGak"),
+            Some(OkuriMidashi::Compound {
+                prefix: "交ぜ",
+                romaji: "Ga",
+                okuri_key: 'k',
+            })
+        );
+        assert_eq!(parse_okuri_midashi("交ぜGak"), Some(("交ぜ", 'k')));
 
         // 送りなし見出し
         assert_eq!(parse_okuri_midashi("とうきょう"), None);
         assert_eq!(parse_okuri_midashi("へんかん"), None);
         assert_eq!(parse_okuri_midashi("SKK"), None);
         assert_eq!(parse_okuri_midashi("k"), None);
+        assert_eq!(parse_okuri_midashi("Gak"), None);
     }
 
     #[test]
@@ -290,6 +436,11 @@ mod tests {
         let vars_mazegk = expand_okuri_variations("交ぜGk");
         assert_eq!(vars_mazegk[0].query_midashi, "交ぜがき");
         assert_eq!(vars_mazegk[0].okuri_suffix, "き");
+
+        // 複合語ローマ字 "交ぜGak" -> "交ぜがき" が最優先
+        let vars_mazegak_romaji = expand_okuri_variations("交ぜGak");
+        assert_eq!(vars_mazegak_romaji[0].query_midashi, "交ぜがき");
+        assert_eq!(vars_mazegak_romaji[0].okuri_suffix, "き");
     }
 
     #[test]
@@ -323,5 +474,14 @@ mod tests {
         ];
         let pre_stems = extract_stem_candidates(&pre_stemmed, "き", "交ぜがき");
         assert_eq!(pre_stems, vec!["交ぜ書"]);
+
+        // "交ぜがく" に対する候補: 終止形動詞 "交ぜ書く" から語幹 "交ぜ書" が抽出され、名詞 "交ぜ学", "交是学" は除外される
+        let shuushi_cands = vec![
+            "交ぜ書く".to_string(),
+            "交ぜ学".to_string(),
+            "交是学".to_string(),
+        ];
+        let shuushi_stems = extract_stem_candidates(&shuushi_cands, "く", "交ぜがく");
+        assert_eq!(shuushi_stems, vec!["交ぜ書"]);
     }
 }
