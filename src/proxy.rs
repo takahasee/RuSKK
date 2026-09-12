@@ -63,6 +63,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
 
     let mut session_context: Vec<String> = Vec::new();
     let mut pending_context: Option<(String, String, Instant)> = None;
+    let mut last_response_time: Option<Instant> = None;
 
     loop {
         line.clear();
@@ -111,28 +112,42 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                 let midashi_str = decode_midashi(midashi);
                 let now = Instant::now();
 
+                // macSKK の自動補完スキャンの検出:
+                // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
+                // macSKK はキー入力時に内部補完候補を 5〜40ms 間隔で連射して Lookup を飛ばす仕様がある。
+                // 人間の手動タイピング・Space押下（通常 150ms 以上）と明確に区別し、
+                // 自動補完スキャンを文脈昇格・pending_context 更新から除外して文脈を保護する。
+                let is_completion_scan = last_response_time
+                    .map(|t| now.duration_since(t) < Duration::from_millis(60))
+                    .unwrap_or(false);
+
                 // 文脈連動（context_ranking）が有効な場合、
-                // 前回の単語と異なる新しい見出し語の変換が始まった時点で、
-                // 前回の単語がユーザーによって確定されたとみなして session_context に昇格する。
-                if proxy.context_ranking
-                    && let Some((prev_midashi, prev_word, time)) = pending_context.take()
-                {
-                    if prev_midashi != midashi_str {
-                        // 60秒以内の入力のみ文脈として保持
-                        if now.duration_since(time) <= Duration::from_secs(60) {
-                            session_context.clear();
-                            session_context.push(prev_word);
-                            debug!(
-                                context = ?session_context,
-                                new_midashi = %midashi_str,
-                                "promoted pending context"
-                            );
+                // 手動での通常変換（補完スキャンでない）かつ見出し語が変わった時点で、
+                // 前回の単語が確定されたとみなして session_context に昇格する。
+                if proxy.context_ranking {
+                    if is_completion_scan {
+                        debug!(
+                            midashi = %midashi_str,
+                            "ignored rapid completion scan from context promotion"
+                        );
+                    } else if let Some((prev_midashi, prev_word, time)) = pending_context.take() {
+                        if prev_midashi != midashi_str {
+                            // 60秒以内の入力のみ文脈として保持
+                            if now.duration_since(time) <= Duration::from_secs(60) {
+                                session_context.clear();
+                                session_context.push(prev_word);
+                                debug!(
+                                    context = ?session_context,
+                                    new_midashi = %midashi_str,
+                                    "promoted pending context"
+                                );
+                            } else {
+                                session_context.clear();
+                            }
                         } else {
-                            session_context.clear();
+                            // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
+                            pending_context = Some((prev_midashi, prev_word, time));
                         }
-                    } else {
-                        // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
-                        pending_context = Some((prev_midashi, prev_word, time));
                     }
                 }
 
@@ -202,8 +217,10 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
                     }
                 };
 
-                // 今回返却した第1候補が漢字を含む場合、次回の文脈候補として保留する
+                // 通常の手動変換（補完スキャンでない）であり、かつ返却第1候補が漢字を含む場合のみ保留する。
+                // macSKK の内部補完スキャンで返した単語は pending_context に入れず、前回の正当な保留を保護する。
                 if proxy.context_ranking
+                    && !is_completion_scan
                     && let Some(ref top) = top_candidate_for_context
                 {
                     let clean = crate::frequency::clean_candidate(top);
@@ -224,6 +241,7 @@ async fn handle_client(proxy: Arc<Proxy>, stream: TcpStream) -> anyhow::Result<(
             }
         }
         writer.flush().await?;
+        last_response_time = Some(Instant::now());
     }
 
     Ok(())

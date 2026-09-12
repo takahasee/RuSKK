@@ -568,6 +568,8 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
 
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
         client.write_all("1きr \n".as_bytes()).await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
@@ -583,6 +585,8 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
 
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
         client.write_all("1きr \n".as_bytes()).await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
         let resp = String::from_utf8_lossy(&buf[..n]);
@@ -597,6 +601,8 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         client.write_all("1き \n".as_bytes()).await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
         assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/木/\n");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
 
         client.write_all("1きr \n".as_bytes()).await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
@@ -700,5 +706,121 @@ async fn test_proxy_context_ranking_disabled() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+/// macSKK の補完バースト（ミリ秒単位の連続 Lookup）が発生しても、
+/// 直前の確定単語「肉」が保護され、次の手動変換「きr」で「切」が第1候補になることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_context_protected_against_completion_burst() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1にく ".as_bytes()) {
+                            let _ = stream.write_all("1/肉/\n".as_bytes()).await;
+                        } else if req.starts_with("1にほん ".as_bytes()) {
+                            let _ = stream.write_all("1/日本/\n".as_bytes()).await;
+                        } else if req.starts_with("1にほんご ".as_bytes()) {
+                            let _ = stream.write_all("1/日本語/\n".as_bytes()).await;
+                        } else if req.starts_with("1きる ".as_bytes()) {
+                            let _ = stream.write_all("1/着る/切る/伐る/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.frequencies.insert("きr".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着".to_string(), 3);
+        m.insert("切".to_string(), 2);
+        m.insert("伐".to_string(), 1);
+        m
+    });
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
+    // 日本語に対しては別の単語（仮）
+    predictor.context_frequencies.insert("日本語".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 50);
+        m
+    });
+
+    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend {
+            name: "mock-primary".into(),
+            addr: upstream_addr,
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_secs(1),
+        },
+        fallback: Backend {
+            name: "mock-fallback-down".into(),
+            addr: "127.0.0.1:1".parse().unwrap(),
+            encoding: UpstreamEncoding::Utf8,
+            timeout: Duration::from_millis(50),
+        },
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. ユーザーが手動で「肉」を通常変換（Lookup）
+    client.write_all("1にく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
+
+    // 2. macSKK がキー入力開始により、10ms 間隔で補完スキャン Lookup を連射！
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    client.write_all("1にほんご \n".as_bytes()).await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    // 3. ユーザーが手動で「きr」を通常変換（Spaceキー押下、200ms後）
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // 補完スキャン「日本語」によって汚染されず、直前の正当な文脈「肉」が保持されたため、
+    // 「切」が第1候補として返る！
+    assert_eq!(resp, "1/切/着/伐/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 
 

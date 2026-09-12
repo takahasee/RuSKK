@@ -170,6 +170,18 @@ impl FrequencyPredictor {
         Ok(())
     }
 
+    /// context_frequencies から文脈マップを取得する。
+    /// 完全一致を最優先し、見つからない場合は単漢字（"切"）と活用形（"切る"）の表記差を柔軟に吸収する。
+    fn get_context_map_flexible<'a>(&'a self, ctx: &str) -> Option<&'a HashMap<String, u64>> {
+        if let Some(map) = self.context_frequencies.get(ctx) {
+            return Some(map);
+        }
+        self.context_frequencies
+            .iter()
+            .find(|(k, _)| k.starts_with(ctx) || ctx.starts_with(k.as_str()))
+            .map(|(_, map)| map)
+    }
+
     /// seed データの頻度と文脈共起に基づいて候補を並び替える。
     /// 候補文字列に注釈（`;` 以降）が含まれる場合や、
     /// 送りあり単漢字（"切"）と活用形（"切る"）の表記差がある場合も柔軟にスコアを照合する。
@@ -197,8 +209,7 @@ impl FrequencyPredictor {
                     context
                         .iter()
                         .map(|ctx| {
-                            self.context_frequencies
-                                .get(ctx)
+                            self.get_context_map_flexible(ctx)
                                 .map(|m| get_score_flexible(m, clean))
                                 .unwrap_or(0)
                         })
@@ -363,6 +374,16 @@ mod tests {
         assert_eq!(ranked_ki[0], "伐る");
         let ranked_ki_stem = predictor.rank_candidates(&["木".to_string()], "きr", &stem_candidates);
         assert_eq!(ranked_ki_stem[0], "伐");
+
+        // 4. 文脈キー側の柔軟照合: 辞書キーが「切る」でも、文脈が語幹「切」でヒットすること
+        predictor.context_frequencies.insert("切る".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("包丁".to_string(), 10);
+            m
+        });
+        let nouchi_cands = vec!["包丁".to_string(), "庖丁".to_string()];
+        let ranked_hocho = predictor.rank_candidates(&["切".to_string()], "ほうちょう", &nouchi_cands);
+        assert_eq!(ranked_hocho[0], "包丁");
     }
 
     #[test]
