@@ -8,7 +8,7 @@ use ruskk::config::Args;
 use ruskk::frequency::FrequencyPredictor;
 use ruskk::proxy::Proxy;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(

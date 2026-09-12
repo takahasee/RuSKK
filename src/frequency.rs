@@ -184,12 +184,12 @@ impl FrequencyPredictor {
 
     /// 見出し語または現在の文脈に対して、並び替えルールが存在するかを超高速判定する。
     /// これが false の場合、候補のパースや並び替え処理を一切行わずに直結バイパス（完全ゼロコピー）できる。
-    pub fn should_rank(&self, context: &[String], midashi: &str) -> bool {
+    pub fn should_rank(&self, context: &[&str], midashi: &str) -> bool {
         if self.frequencies.get(midashi).map(|m| !m.is_empty()).unwrap_or(false) {
             return true;
         }
         if !context.is_empty() && !self.context_frequencies.is_empty() {
-            for ctx in context {
+            for &ctx in context {
                 if self.get_context_map_flexible(ctx).is_some() {
                     return true;
                 }
@@ -201,7 +201,7 @@ impl FrequencyPredictor {
     /// 借用スライス (&str) を対象に、アロケーションなしで候補を並び替える。
     pub fn rank_candidates_borrowed<'a>(
         &self,
-        context: &[String],
+        context: &[&str],
         midashi: &str,
         candidates: &[&'a str],
     ) -> Vec<&'a str> {
@@ -212,16 +212,23 @@ impl FrequencyPredictor {
         let freq_map = self.frequencies.get(midashi);
         let has_freq = freq_map.map(|m| !m.is_empty()).unwrap_or(false);
 
-        let active_context_maps: Vec<&HashMap<String, u64>> = if !context.is_empty() && !self.context_frequencies.is_empty() {
-            context
-                .iter()
-                .filter_map(|ctx| self.get_context_map_flexible(ctx))
-                .collect()
+        // 文脈マップの取得: 文脈が空の場合は完全スキップ、1個の場合は Vec 確保を回避
+        let (has_context, single_context_map, multi_context_maps) = if !context.is_empty() && !self.context_frequencies.is_empty() {
+            if context.len() == 1 {
+                let map = self.get_context_map_flexible(context[0]);
+                (map.is_some(), map, None)
+            } else {
+                let maps: Vec<&HashMap<String, u64>> = context
+                    .iter()
+                    .filter_map(|&ctx| self.get_context_map_flexible(ctx))
+                    .collect();
+                (!maps.is_empty(), None, Some(maps))
+            }
         } else {
-            Vec::new()
+            (false, None, None)
         };
 
-        if !has_freq && active_context_maps.is_empty() {
+        if !has_freq && !has_context {
             return candidates.to_vec();
         }
 
@@ -231,10 +238,13 @@ impl FrequencyPredictor {
             .map(|(idx, &cand)| {
                 let clean = clean_candidate(cand);
                 let global_count = freq_map.map(|m| get_score_flexible(m, clean)).unwrap_or(0);
-                let context_score: u64 = active_context_maps
-                    .iter()
-                    .map(|m| get_score_flexible(m, clean))
-                    .sum();
+                let context_score: u64 = if let Some(map) = single_context_map {
+                    get_score_flexible(map, clean)
+                } else if let Some(ref maps) = multi_context_maps {
+                    maps.iter().map(|m| get_score_flexible(m, clean)).sum()
+                } else {
+                    0
+                };
 
                 let total_score = global_count + context_score * 10;
                 (idx, cand, total_score)
@@ -256,7 +266,7 @@ impl FrequencyPredictor {
     /// seed データの頻度と文脈共起に基づいて候補を並び替える。
     /// 候補文字列に注釈（`;` 以降）が含まれる場合や、
     /// 送りあり単漢字（"切"）と活用形（"切る"）の表記差がある場合も柔軟にスコアを照合する。
-    pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
+    pub fn rank_candidates(&self, context: &[&str], midashi: &str, candidates: &[String]) -> Vec<String> {
         let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
         ranked.into_iter().map(|s| s.to_string()).collect()
@@ -383,21 +393,21 @@ mod tests {
         });
 
         // 1. 文脈「肉」のとき、「切る」（および語幹「切」）が第1候補
-        let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
+        let ranked_niku = predictor.rank_candidates(&["肉"], "きる", &candidates);
         assert_eq!(ranked_niku[0], "切る");
-        let ranked_niku_stem = predictor.rank_candidates(&["肉".to_string()], "きr", &stem_candidates);
+        let ranked_niku_stem = predictor.rank_candidates(&["肉"], "きr", &stem_candidates);
         assert_eq!(ranked_niku_stem[0], "切");
 
         // 2. 文脈「服」のとき、「着る」（および語幹「着」）が第1候補
-        let ranked_fuku = predictor.rank_candidates(&["服".to_string()], "きる", &candidates);
+        let ranked_fuku = predictor.rank_candidates(&["服"], "きる", &candidates);
         assert_eq!(ranked_fuku[0], "着る");
-        let ranked_fuku_stem = predictor.rank_candidates(&["服".to_string()], "きr", &stem_candidates);
+        let ranked_fuku_stem = predictor.rank_candidates(&["服"], "きr", &stem_candidates);
         assert_eq!(ranked_fuku_stem[0], "着");
 
         // 3. 文脈「木」のとき、「伐る」（および語幹「伐」）が第1候補
-        let ranked_ki = predictor.rank_candidates(&["木".to_string()], "きる", &candidates);
+        let ranked_ki = predictor.rank_candidates(&["木"], "きる", &candidates);
         assert_eq!(ranked_ki[0], "伐る");
-        let ranked_ki_stem = predictor.rank_candidates(&["木".to_string()], "きr", &stem_candidates);
+        let ranked_ki_stem = predictor.rank_candidates(&["木"], "きr", &stem_candidates);
         assert_eq!(ranked_ki_stem[0], "伐");
 
         // 4. 文脈キー側の柔軟照合: 辞書キーが「切る」でも、文脈が語幹「切」でヒットすること
@@ -407,7 +417,7 @@ mod tests {
             m
         });
         let nouchi_cands = vec!["包丁".to_string(), "庖丁".to_string()];
-        let ranked_hocho = predictor.rank_candidates(&["切".to_string()], "ほうちょう", &nouchi_cands);
+        let ranked_hocho = predictor.rank_candidates(&["切"], "ほうちょう", &nouchi_cands);
         assert_eq!(ranked_hocho[0], "包丁");
     }
 
@@ -509,7 +519,7 @@ mod tests {
         let mut predictor = FrequencyPredictor::new(None);
         // ルールが何もない場合は false
         assert!(!predictor.should_rank(&[], "とうきょう"));
-        assert!(!predictor.should_rank(&["服".to_string()], "とうきょう"));
+        assert!(!predictor.should_rank(&["服"], "とうきょう"));
 
         // 文脈ルールがある場合は true
         predictor.context_frequencies.insert("服".to_string(), {
@@ -517,9 +527,9 @@ mod tests {
             m.insert("着る".to_string(), 10);
             m
         });
-        assert!(predictor.should_rank(&["服".to_string()], "きr"));
+        assert!(predictor.should_rank(&["服"], "きr"));
         // 文脈と一致しない場合は false
-        assert!(!predictor.should_rank(&["車".to_string()], "きr"));
+        assert!(!predictor.should_rank(&["車"], "きr"));
 
         // 単語頻度ルールがある場合は true
         predictor.frequencies.insert("あい".to_string(), {
