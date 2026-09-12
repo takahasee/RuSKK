@@ -61,21 +61,21 @@ pub enum Command {
 
 impl Args {
     pub fn primary(&self) -> Backend {
-        Backend {
-            name: "azoo-key-skkserv".to_owned(),
-            addr: self.azookey,
-            encoding: UpstreamEncoding::EucJpRequestUtf8Response,
-            timeout: Duration::from_millis(self.azookey_timeout_ms),
-        }
+        Backend::new(
+            "azoo-key-skkserv",
+            self.azookey,
+            UpstreamEncoding::EucJpRequestUtf8Response,
+            Duration::from_millis(self.azookey_timeout_ms),
+        )
     }
 
     pub fn fallback(&self) -> Backend {
-        Backend {
-            name: "yaskkserv2".to_owned(),
-            addr: self.yaskkserv2,
-            encoding: UpstreamEncoding::EucJp,
-            timeout: Duration::from_millis(self.yaskkserv2_timeout_ms),
-        }
+        Backend::new(
+            "yaskkserv2",
+            self.yaskkserv2,
+            UpstreamEncoding::EucJp,
+            Duration::from_millis(self.yaskkserv2_timeout_ms),
+        )
     }
 
     pub fn is_okuri_expansion_enabled(&self) -> bool {

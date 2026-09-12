@@ -82,7 +82,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
         m
     });
 
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -92,18 +92,18 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
     // Fallback is yaskkserv2 with UpstreamEncoding::EucJp
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "azookey-primary-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
-        fallback: Backend {
-            name: "yaskkserv2-fallback".into(),
-            addr: yaskkserv2_addr,
-            encoding: UpstreamEncoding::EucJp,
-            timeout: Duration::from_secs(1),
-        },
+        primary: Backend::new(
+            "azookey-primary-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        fallback: Backend::new(
+            "yaskkserv2-fallback",
+            yaskkserv2_addr,
+            UpstreamEncoding::EucJp,
+            Duration::from_secs(1),
+        ),
         predictor: shared_predictor.clone(),
         okuri_expansion: false,
         context_ranking: false,

@@ -1,7 +1,6 @@
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use clap::Parser;
-use tokio::sync::Mutex;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -51,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    let predictor = Arc::new(Mutex::new(FrequencyPredictor::new(history_path)));
+    let predictor = Arc::new(RwLock::new(FrequencyPredictor::new(history_path)));
 
     let proxy = Proxy {
         listen: args.listen.clone(),

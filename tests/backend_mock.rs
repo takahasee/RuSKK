@@ -15,12 +15,7 @@ async fn backend_utf8_passthrough() {
     })
     .await;
 
-    let backend = Backend {
-        name: "mock-utf8".into(),
-        addr,
-        encoding: UpstreamEncoding::Utf8,
-        timeout: Duration::from_secs(1),
-    };
+    let backend = Backend::new("mock-utf8", addr, UpstreamEncoding::Utf8, Duration::from_secs(1));
     let resp = backend
         .query(&Request::Lookup(b"a".to_vec()))
         .await
@@ -37,12 +32,7 @@ async fn backend_euc_converts_to_utf8() {
     })
     .await;
 
-    let backend = Backend {
-        name: "mock-euc".into(),
-        addr,
-        encoding: UpstreamEncoding::EucJp,
-        timeout: Duration::from_secs(1),
-    };
+    let backend = Backend::new("mock-euc", addr, UpstreamEncoding::EucJp, Duration::from_secs(1));
     let resp = backend
         .query(&Request::Lookup(b"a".to_vec()))
         .await
@@ -53,12 +43,7 @@ async fn backend_euc_converts_to_utf8() {
 #[tokio::test]
 async fn backend_not_found() {
     let addr = spawn_mock(|_| b"4\n".to_vec()).await;
-    let backend = Backend {
-        name: "mock-miss".into(),
-        addr,
-        encoding: UpstreamEncoding::Utf8,
-        timeout: Duration::from_secs(1),
-    };
+    let backend = Backend::new("mock-miss", addr, UpstreamEncoding::Utf8, Duration::from_secs(1));
     let resp = backend
         .query(&Request::Lookup(b"zzz".to_vec()))
         .await

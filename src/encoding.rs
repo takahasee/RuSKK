@@ -1,12 +1,14 @@
+use std::borrow::Cow;
 use encoding_rs::EUC_JP;
 
-/// Decode bytes that may be EUC-JP or already UTF-8 into a UTF-8 String.
-pub fn decode_euc_or_utf8(bytes: &[u8]) -> String {
+/// Decode bytes that may be EUC-JP or already UTF-8 into a UTF-8 String or slice.
+/// Returns Cow::Borrowed for UTF-8 bytes to avoid unnecessary heap allocation.
+pub fn decode_euc_or_utf8(bytes: &[u8]) -> Cow<'_, str> {
     if let Ok(s) = std::str::from_utf8(bytes) {
-        return s.to_owned();
+        return Cow::Borrowed(s);
     }
     let (cow, _, _) = EUC_JP.decode(bytes);
-    cow.into_owned()
+    cow
 }
 
 /// Encode a UTF-8 string to EUC-JP bytes. Unmappable chars are replaced.
@@ -25,7 +27,7 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
     match response[0] {
         b'1' => convert_candidates_response(response),
         b'4' => convert_not_found_response(response),
-        _ => decode_euc_or_utf8(response).into_bytes(),
+        _ => decode_euc_or_utf8(response).as_bytes().to_vec(),
     }
 }
 
@@ -73,9 +75,10 @@ fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
 }
 
 /// Decode a midashi from request bytes (EUC-JP or UTF-8) into UTF-8.
-pub fn decode_midashi(bytes: &[u8]) -> String {
+pub fn decode_midashi(bytes: &[u8]) -> Cow<'_, str> {
     decode_euc_or_utf8(bytes)
 }
+
 pub fn parse_candidates(response: &[u8]) -> Vec<String> {
     if !response.starts_with(b"1") {
         return Vec::new();
@@ -93,7 +96,8 @@ pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
     if candidates.is_empty() {
         return b"4\n".to_vec();
     }
-    let mut out = Vec::new();
+    let total_len: usize = candidates.iter().map(|c| c.len() + 1).sum();
+    let mut out = Vec::with_capacity(total_len + 3);
     out.push(b'1');
     for cand in candidates {
         out.push(b'/');

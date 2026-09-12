@@ -70,9 +70,7 @@ pub fn extract_stem_candidates(candidates: &[String], okuri_suffix: &str) -> Vec
     stems
 }
 
-fn clean_candidate(cand: &str) -> &str {
-    cand.split(';').next().unwrap_or(cand).trim()
-}
+use crate::frequency::clean_candidate;
 
 #[cfg(test)]
 mod tests {

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use std::sync::RwLock;
 use tracing::debug;
 
 const LEGACY_HISTORY_FILES: &[&str] = &[
@@ -190,12 +190,21 @@ impl FrequencyPredictor {
             return candidates.to_vec();
         }
 
-        let empty_map = HashMap::new();
-        let freq_map = self.frequencies.get(midashi).unwrap_or(&empty_map);
-        let has_context = !context.is_empty() && !self.context_frequencies.is_empty();
+        let freq_map = self.frequencies.get(midashi);
+        let has_freq = freq_map.map(|m| !m.is_empty()).unwrap_or(false);
+
+        // 事前に文脈マップを収集（各候補のループ内での再検索を排除）
+        let active_context_maps: Vec<&HashMap<String, u64>> = if !context.is_empty() && !self.context_frequencies.is_empty() {
+            context
+                .iter()
+                .filter_map(|ctx| self.get_context_map_flexible(ctx))
+                .collect()
+        } else {
+            Vec::new()
+        };
 
         // 頻度情報も文脈情報もない場合は、無駄な計算やソートを完全スキップして即座に返却
-        if freq_map.is_empty() && !has_context {
+        if !has_freq && active_context_maps.is_empty() {
             return candidates.to_vec();
         }
 
@@ -204,19 +213,11 @@ impl FrequencyPredictor {
             .enumerate()
             .map(|(idx, cand)| {
                 let clean = clean_candidate(cand);
-                let global_count = get_score_flexible(freq_map, clean);
-                let context_score: u64 = if has_context {
-                    context
-                        .iter()
-                        .map(|ctx| {
-                            self.get_context_map_flexible(ctx)
-                                .map(|m| get_score_flexible(m, clean))
-                                .unwrap_or(0)
-                        })
-                        .sum()
-                } else {
-                    0
-                };
+                let global_count = freq_map.map(|m| get_score_flexible(m, clean)).unwrap_or(0);
+                let context_score: u64 = active_context_maps
+                    .iter()
+                    .map(|m| get_score_flexible(m, clean))
+                    .sum();
 
                 // 文脈共起は10倍の重みで評価する
                 let total_score = global_count + context_score * 10;
@@ -307,7 +308,7 @@ pub struct FrequencyPredictorData {
 }
 
 
-pub type SharedPredictor = Arc<Mutex<FrequencyPredictor>>;
+pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
 
 #[cfg(test)]
 mod tests {

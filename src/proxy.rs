@@ -42,7 +42,7 @@ impl Proxy {
         );
 
         let proxy = Arc::new(self);
-        let shared_context = Arc::new(tokio::sync::Mutex::new(SharedContextState::default()));
+        let shared_context = Arc::new(std::sync::Mutex::new(SharedContextState::default()));
 
         // Primary バックエンド（azooKey）をバックグラウンドでウォームアップ
         // （macOS の App Nap による初回スリープを解除し、モデルロードを先行完了させる）
@@ -59,6 +59,7 @@ impl Proxy {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(%peer, "client connected");
+                    let _ = stream.set_nodelay(true);
                     let proxy = Arc::clone(&proxy);
                     let shared_context = Arc::clone(&shared_context);
                     tokio::spawn(async move {
@@ -77,7 +78,7 @@ impl Proxy {
 
 async fn handle_client(
     proxy: Arc<Proxy>,
-    shared_context: Arc<tokio::sync::Mutex<SharedContextState>>,
+    shared_context: Arc<std::sync::Mutex<SharedContextState>>,
     stream: TcpStream,
 ) -> anyhow::Result<()> {
     let peer = stream.peer_addr().ok();
@@ -108,6 +109,8 @@ async fn handle_client(
             line.truncate(line.len() - 1);
         }
 
+        debug!(?peer, raw_line = ?String::from_utf8_lossy(&line), "received request from client");
+
         let request = match parse_request(&line) {
             Ok(req) => req,
             Err(err) => {
@@ -134,7 +137,7 @@ async fn handle_client(
 
                 // 複数 TCP 接続を跨いで文脈を安全に共有・判定する
                 let (is_completion_scan, session_ctx_snapshot) = {
-                    let mut ctx = shared_context.lock().await;
+                    let mut ctx = shared_context.lock().unwrap();
 
                     // macSKK の自動補完スキャンの検出:
                     // 直前のレスポンス返却から 60ms 未満の超短時間で届いた場合（macSKK のローカル辞書補完連射）。
@@ -206,7 +209,7 @@ async fn handle_client(
                                 "okuri expansion resolved candidates"
                             );
                             let ranked = {
-                                let guard = proxy.predictor.lock().await;
+                                let guard = proxy.predictor.read().unwrap();
                                 guard.rank_candidates(ctx_ref, &midashi_str, &stem_cands)
                             };
                             if let Some(top) = ranked.first() {
@@ -227,7 +230,7 @@ async fn handle_client(
                         let cands = parse_candidates(&response);
                         if !cands.is_empty() {
                             let ranked = {
-                                let guard = proxy.predictor.lock().await;
+                                let guard = proxy.predictor.read().unwrap();
                                 guard.rank_candidates(ctx_ref, &midashi_str, &cands)
                             };
                             if let Some(top) = ranked.first() {
@@ -250,20 +253,23 @@ async fn handle_client(
                 {
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
-                        let mut ctx = shared_context.lock().await;
-                        ctx.pending_context = Some((midashi_str.clone(), clean.to_string(), now));
+                        let mut ctx = shared_context.lock().unwrap();
+                        ctx.pending_context = Some((midashi_str.to_string(), clean.to_string(), now));
                     }
                 }
 
+                debug!(?peer, resp = ?String::from_utf8_lossy(&resp_to_send), "sending response to client");
                 writer.write_all(&resp_to_send).await?;
             }
             Request::Completion(_) => {
-                writer.write_all(b"4\n").await?;
+                let (response, hit) = lookup_with_fallback(&proxy, &request).await;
+                debug!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
+                writer.write_all(&response).await?;
             }
         }
         writer.flush().await?;
         {
-            let mut ctx = shared_context.lock().await;
+            let mut ctx = shared_context.lock().unwrap();
             ctx.last_response_time = Some(Instant::now());
         }
     }
@@ -284,8 +290,9 @@ enum BackendHit {
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
 async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, BackendHit) {
     let start = Instant::now();
-    let overall_deadline = (proxy.primary.timeout + proxy.fallback.timeout).max(Duration::from_millis(1500));
-    let primary_timeout = proxy.primary.timeout;
+    // macSKK の 1.0秒 (1000ms) 制限を絶対に超えないよう、全体デッドラインを 850ms に制限
+    let overall_deadline = Duration::from_millis(850);
+    let primary_timeout = proxy.primary.timeout.min(Duration::from_millis(600));
 
     match proxy.primary.query_with_timeout(request, primary_timeout).await {
         Ok(response) if is_found(&response) => {
@@ -315,9 +322,10 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
 
     let elapsed = start.elapsed();
     let fallback_timeout = if overall_deadline > elapsed {
-        (overall_deadline - elapsed).max(Duration::from_millis(200))
+        overall_deadline - elapsed
     } else {
-        Duration::from_millis(200)
+        debug!("overall deadline reached before fallback, returning not found immediately");
+        return (b"4\n".to_vec(), BackendHit::None);
     };
 
     match proxy.fallback.query_with_timeout(request, fallback_timeout).await {

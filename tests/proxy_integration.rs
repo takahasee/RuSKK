@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -45,7 +45,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
         m
     });
 
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -53,18 +53,18 @@ async fn test_proxy_ranks_by_seed_frequency() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "mock-primary-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
-        fallback: Backend {
-            name: "mock-fallback".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
+        primary: Backend::new(
+            "mock-primary-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        fallback: Backend::new(
+            "mock-fallback",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
         predictor: shared_predictor.clone(),
         okuri_expansion: false,
         context_ranking: false,
@@ -120,7 +120,7 @@ async fn test_proxy_basic_lookup_passthrough() {
     });
 
     let predictor = FrequencyPredictor::new(None);
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -128,18 +128,18 @@ async fn test_proxy_basic_lookup_passthrough() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "fallback".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
+        primary: Backend::new(
+            "primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
@@ -176,10 +176,10 @@ async fn test_proxy_basic_lookup_passthrough() {
     upstream_handle.abort();
 }
 
-/// macSKK の補完クエリ（Request::Completion）に対して常に 4\n を返し、
-/// macSKK の勝手な確定（タイピング停止後の誤爆確定）を物理的に防止することを検証するテスト。
+/// 補完リクエスト（4ki ）が upstream に照会され、
+/// 補完結果（1/kiru/kiku/\n）がクライアントに返却されることを検証するテスト。
 #[tokio::test]
-async fn test_proxy_returns_not_found_on_completion() {
+async fn test_proxy_forwards_completion() {
     let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let upstream_addr = upstream_listener.local_addr().unwrap();
 
@@ -192,7 +192,6 @@ async fn test_proxy_returns_not_found_on_completion() {
                         if n == 0 { break; }
                         let req = &buf[..n];
                         if req.starts_with(b"4ki") {
-                            // upstream が補完候補を持っていたとしても
                             let _ = stream.write_all("1/kiru/kiku/\n".as_bytes()).await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
@@ -204,7 +203,7 @@ async fn test_proxy_returns_not_found_on_completion() {
     });
 
     let predictor = FrequencyPredictor::new(None);
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -212,18 +211,18 @@ async fn test_proxy_returns_not_found_on_completion() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "fallback".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
+        primary: Backend::new(
+            "primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
@@ -238,11 +237,10 @@ async fn test_proxy_returns_not_found_on_completion() {
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
-    // macSKK が補完クエリ "4ki " を投げても、プロキシは直ちに 4\n を返す
     client.write_all(b"4ki \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "4\n", "補完クエリには常に 4\\n を返して macSKK の自動確定を防ぐ");
+    assert_eq!(resp, "1/kiru/kiku/\n", "upstream からの補完候補が返却されること");
 
     drop(client);
     proxy_handle.abort();
@@ -276,7 +274,7 @@ async fn test_proxy_single_char_lookup_works_immediately() {
     });
 
     let predictor = FrequencyPredictor::new(None);
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -284,18 +282,18 @@ async fn test_proxy_single_char_lookup_works_immediately() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "fallback".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
+        primary: Backend::new(
+            "primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
@@ -350,7 +348,7 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
     });
 
     let predictor = FrequencyPredictor::new(None);
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -358,18 +356,18 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "azookey-mock".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "fallback-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
         predictor: shared_predictor,
         okuri_expansion: true, // 送り復元有効
         context_ranking: false,
@@ -425,7 +423,7 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
     });
 
     let predictor = FrequencyPredictor::new(None);
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -433,18 +431,18 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "azookey-mock".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "fallback-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
         predictor: shared_predictor,
         okuri_expansion: false, // 送り復元無効（従来動作）
         context_ranking: false,
@@ -529,7 +527,7 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         m
     });
 
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -537,18 +535,18 @@ async fn test_proxy_context_ranking_promotes_candidates() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "mock-primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "mock-fallback-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
+        primary: Backend::new(
+            "mock-primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "mock-fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: true,
@@ -661,7 +659,7 @@ async fn test_proxy_context_ranking_disabled() {
         m
     });
 
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -669,18 +667,18 @@ async fn test_proxy_context_ranking_disabled() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "mock-primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "mock-fallback-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
+        primary: Backend::new(
+            "mock-primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "mock-fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false, // 文脈連動無効
@@ -763,7 +761,7 @@ async fn test_proxy_context_protected_against_completion_burst() {
         m
     });
 
-    let shared_predictor: SharedPredictor = Arc::new(tokio::sync::Mutex::new(predictor));
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_addr = proxy_listener.local_addr().unwrap();
@@ -771,18 +769,18 @@ async fn test_proxy_context_protected_against_completion_burst() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend {
-            name: "mock-primary".into(),
-            addr: upstream_addr,
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_secs(1),
-        },
-        fallback: Backend {
-            name: "mock-fallback-down".into(),
-            addr: "127.0.0.1:1".parse().unwrap(),
-            encoding: UpstreamEncoding::Utf8,
-            timeout: Duration::from_millis(50),
-        },
+        primary: Backend::new(
+            "mock-primary",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "mock-fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: true,
