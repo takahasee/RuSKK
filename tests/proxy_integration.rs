@@ -482,6 +482,159 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
     upstream_handle.abort();
 }
 
+/// 複合語の送りあり見出し（例: "ToiawaS ->e" -> "といあわs"）で、
+/// 下一段・名詞形 "といあわせ" が照会され、語幹 "問い合わ", "問合" が返ることを検証する結合テスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        // 複合語として優先展開された "といあわす", "といあわせ" に対する upstream レスポンス
+                        if req.starts_with("1といあわす ".as_bytes()) {
+                            let _ = stream.write_all("1/問い合わす/\n".as_bytes()).await;
+                        } else if req.starts_with("1といあわせ ".as_bytes()) {
+                            let _ = stream.write_all("1/問い合わせ/問合せ/問い合せ/問合わせ/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // "1といあわs " -> 終止形・下一段形からマージされ、語幹 "問い合わ", "問合" が返る
+    // （macSKK で送り仮名「せ」が付加されると「問い合わせ」「問合せ」になる）
+    client.write_all("1といあわs \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("/問合/"), "expected '問合' in resp: {}", resp);
+    assert!(resp.contains("/問い合わ/"), "expected '問い合わ' in resp: {}", resp);
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+/// 複合語五段動詞（例: "KakiokoS ->i" -> "かきおこs"）で、
+/// 終止形 "かきおこす" 由来の「書起こ」と連用形 "かきおこし" がマージされて返ることを検証する結合テスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1かきおこす ".as_bytes()) {
+                            let _ = stream.write_all("1/書き起こす/書き起す/書起こす/\n".as_bytes()).await;
+                        } else if req.starts_with("1かきおこし ".as_bytes()) {
+                            let _ = stream.write_all("1/書き起こし/掻き起し/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // "1かきおこs " -> 終止形由来の "書起こ" も連用形由来の "掻き起" もマージされて返る
+    client.write_all("1かきおこs \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("/書き起こ/"), "expected '書き起こ' in resp: {}", resp);
+    assert!(resp.contains("/書起こ/"), "expected '書起こ' in resp: {}", resp);
+    assert!(resp.contains("/掻き起/"), "expected '掻き起' in resp: {}", resp);
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 /// 送り復元が無効（okuri_expansion: false）のときは、
 /// 従来通り元の見出し語（"かk"）がそのまま照会されることを検証するテスト。
 #[tokio::test]

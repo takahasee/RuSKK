@@ -191,48 +191,54 @@ async fn handle_client(
                 let mut final_response = None;
                 let mut top_candidate_for_context: Option<String> = None;
 
-                // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき"）の活用復元試行
+                // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき", "かきおこs" -> "かきおこす"）の活用復元試行
                 if proxy.okuri_expansion {
                     let variations = crate::okuri::expand_okuri_variations(&midashi_str);
-                    let mut found_response = None;
+                    let mut responses = Vec::with_capacity(variations.len());
 
                     for var in variations {
                         let okuri_req = Request::Lookup(var.query_midashi.as_bytes().to_vec());
                         let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
 
                         if is_found(&okuri_resp) {
-                            let raw_cands = parse_candidates_borrowed(&okuri_resp);
-                            let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
-                                &raw_cands,
-                                var.okuri_suffix,
-                                &var.query_midashi,
-                            );
+                            responses.push((okuri_resp, var));
+                        }
+                    }
 
-                            debug!(
-                                midashi = %midashi_str,
-                                query = %var.query_midashi,
-                                suffix = %var.okuri_suffix,
-                                resp = ?String::from_utf8_lossy(&okuri_resp),
-                                stems = ?stem_cands,
-                                "okuri variation checked"
-                            );
+                    let mut all_stem_cands = Vec::new();
+                    for (resp, var) in &responses {
+                        let raw_cands = parse_candidates_borrowed(resp);
+                        let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
+                            &raw_cands,
+                            var.okuri_suffix,
+                            &var.query_midashi,
+                        );
 
-                            if !stem_cands.is_empty() {
-                                let ranked = {
-                                    let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                    guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &stem_cands)
-                                };
-                                if let Some(&top) = ranked.first() {
-                                    top_candidate_for_context = Some(top.to_string());
-                                }
-                                found_response = Some(format_candidates_response_str(&ranked));
-                                break;
+                        debug!(
+                            midashi = %midashi_str,
+                            query = %var.query_midashi,
+                            suffix = %var.okuri_suffix,
+                            resp = ?String::from_utf8_lossy(resp),
+                            stems = ?stem_cands,
+                            "okuri variation checked"
+                        );
+
+                        for stem in stem_cands {
+                            if !all_stem_cands.contains(&stem) {
+                                all_stem_cands.push(stem);
                             }
                         }
                     }
 
-                    if let Some(resp) = found_response {
-                        final_response = Some(resp);
+                    if !all_stem_cands.is_empty() {
+                        let ranked = {
+                            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                            guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &all_stem_cands)
+                        };
+                        if let Some(&top) = ranked.first() {
+                            top_candidate_for_context = Some(top.to_string());
+                        }
+                        final_response = Some(format_candidates_response_str(&ranked));
                         okuri_handled = true;
                     }
                 }
