@@ -2,6 +2,8 @@
 //! MeCab / ChaSen の活用表規則に基づき、SKKの送りキー（アルファベット）から
 //! 終止形・活用形の平仮名を合成し、azooKey から返った候補から語幹（単漢字）を抽出する。
 
+use crate::frequency::clean_candidate;
+
 /// 送りキー（アルファベット1文字）から終止形・連用形・下一段（名詞形）などの送り仮名（平仮名）のリストを返す。
 pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
     match key.to_ascii_lowercase() {
@@ -236,22 +238,22 @@ pub struct OkuriVariation {
 /// - 短語（語幹 1〜2文字、例: "かk", "きr", "よm"）: 五段終止形・連用形を最優先し、既存動作を完全保持。
 /// - 複合語（語幹 3文字以上、または助詞連濁、例: "といあわs", "わりあt", "うけつk", "まぜがk"）:
 ///   下一段・名詞形（"せ", "て", "け", "げ", "れ", "み" 等）を最優先で照会し、一発で「問合せ」「割当て」等を抽出する。
-fn order_suffixes_for_stem(stem: &str, key: char, default_suffixes: &'static [&'static str]) -> Vec<&'static str> {
+fn order_suffixes_for_stem(stem: &str, key: char, default_suffixes: &'static [&'static str]) -> &'static [&'static str] {
     let is_compound = stem.chars().count() >= 3 || stem.ends_with('が') || stem.ends_with('に');
     if !is_compound {
-        return default_suffixes.to_vec();
+        return default_suffixes;
     }
 
     match key.to_ascii_lowercase() {
-        's' => vec!["す", "し", "せ"], // 書き起こす/書起こし (五段), 問い合わせ/問合せ (下一段)
-        't' => vec!["て", "つ", "ち"], // 割り当て/割当て (下一段), 待つ/立ち (五段)
-        'k' => vec!["き", "く", "け"], // 交ぜ書き (連用形), 書く (五段), 受付け (下一段)
-        'g' => vec!["げ", "ぐ", "ぎ"], // 売上げ/引き上げ (下一段), 泳ぐ/騒ぎ (五段)
-        'r' => vec!["る", "り", "れ"], // 切る (五段), 乗り換え (連用形), 引き入れ (下一段)
-        'm' => vec!["み", "む", "め"], // 申込み/申込 (連用形), 読む (五段), 早め/詰め (下一段)
-        'b' => vec!["ぶ", "び", "べ"], // 結ぶ/遊び (五段), 調べ/並べ (下一段)
-        'u' | 'w' => vec!["う", "い", "え"], // 思う (五段), 取扱い/立ち会い (連用形)
-        _ => default_suffixes.to_vec(),
+        's' => &["す", "し", "せ"], // 書き起こす/書起こし (五段), 問い合わせ/問合せ (下一段)
+        't' => &["て", "つ", "ち"], // 割り当て/割当て (下一段), 待つ/立ち (五段)
+        'k' => &["き", "く", "け"], // 交ぜ書き (連用形), 書く (五段), 受付け (下一段)
+        'g' => &["げ", "ぐ", "ぎ"], // 売上げ/引き上げ (下一段), 泳ぐ/騒ぎ (五段)
+        'r' => &["る", "り", "れ"], // 切る (五段), 乗り換え (連用形), 引き入れ (下一段)
+        'm' => &["み", "む", "め"], // 申込み/申込 (連用形), 読む (五段), 早め/詰め (下一段)
+        'b' => &["ぶ", "び", "べ"], // 結ぶ/遊び (五段), 調べ/並べ (下一段)
+        'u' | 'w' => &["う", "い", "え"], // 思う (五段), 取扱い/立ち会い (連用形)
+        _ => default_suffixes,
     }
 }
 
@@ -278,7 +280,7 @@ pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
                 full_stem.push_str(upper_kana);
                 let ordered_suffixes = order_suffixes_for_stem(&full_stem, okuri_key, suffixes);
 
-                for suffix in ordered_suffixes {
+                for &suffix in ordered_suffixes {
                     let mut q = String::with_capacity(full_stem.len() + suffix.len());
                     q.push_str(&full_stem);
                     q.push_str(suffix);
@@ -293,7 +295,7 @@ pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
             let suffixes = okuri_key_to_suffixes(key);
             let ordered_suffixes = order_suffixes_for_stem(stem, key, suffixes);
 
-            for suffix in ordered_suffixes {
+            for &suffix in ordered_suffixes {
                 let mut q = String::with_capacity(stem.len() + suffix.len());
                 q.push_str(stem);
                 q.push_str(suffix);
@@ -347,10 +349,11 @@ pub fn extract_stem_candidates_borrowed<'a>(
             "き" | "り" | "し" | "み" | "い" | "ち" | "に" | "び" | "ぎ"
                 | "せ" | "て" | "け" | "げ" | "れ" | "め" | "べ"
         );
+        let clean_char_count = clean.chars().count();
         if is_noun_stem
             && stem_char_count >= 2
-            && clean.chars().count() >= 2
-            && clean.chars().count() <= stem_char_count
+            && clean_char_count >= 2
+            && clean_char_count <= stem_char_count
             && let Some(last_char) = clean.chars().last()
             && is_kanji(last_char)
             && !stems.contains(&clean)
@@ -361,8 +364,6 @@ pub fn extract_stem_candidates_borrowed<'a>(
 
     stems
 }
-
-use crate::frequency::clean_candidate;
 
 #[cfg(test)]
 mod tests {

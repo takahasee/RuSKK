@@ -81,6 +81,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
         m.insert("着る".to_string(), 10);
         m
     });
+    predictor.expand_aliases();
 
     let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
 

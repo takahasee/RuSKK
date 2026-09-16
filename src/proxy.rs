@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
 use crate::encoding::{
-    decode_midashi, extract_first_candidate, format_candidates_response_str,
+    decode_euc_or_utf8, extract_first_candidate, format_candidates_response_str,
     parse_candidates_borrowed,
 };
 use crate::frequency::SharedPredictor;
@@ -128,7 +128,8 @@ async fn handle_client(
                 break;
             }
             Request::Version => {
-                writer.write_all(b"ruskk/0.1.0 ").await?;
+                const VERSION_RESP: &[u8] = concat!("ruskk/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
+                writer.write_all(VERSION_RESP).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Host => {
@@ -137,7 +138,7 @@ async fn handle_client(
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Lookup(ref midashi) => {
-                let midashi_str = decode_midashi(midashi);
+                let midashi_str = decode_euc_or_utf8(midashi);
                 let now = Instant::now();
 
                 // 同一 TCP コネクション内での直前レスポンスからの経過時間を判定。
@@ -396,11 +397,5 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, Bac
 /// 文字列にCJK漢字が含まれているかを判定する。
 /// 文脈候補（session_context / pending_context）には漢字を含む単語のみを積む。
 fn contains_kanji(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(c,
-            '\u{4E00}'..='\u{9FFF}'   // CJK統合漢字
-            | '\u{3400}'..='\u{4DBF}' // CJK統合漢字拡張A
-            | '\u{F900}'..='\u{FAFF}' // CJK互換漢字
-        )
-    })
+    s.chars().any(crate::okuri::is_kanji)
 }

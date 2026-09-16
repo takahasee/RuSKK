@@ -73,12 +73,17 @@ fn test_completion_merge_logic() {
     let primary_utf8 = ruskk::encoding::response_euc_to_utf8(primary_resp);
     let fallback_utf8 = ruskk::encoding::response_euc_to_utf8(&fallback_resp);
 
-    let primary_cands = ruskk::encoding::parse_candidates(&primary_utf8);
-    let fallback_cands = ruskk::encoding::parse_candidates(&fallback_utf8);
+    let primary_cands = ruskk::encoding::parse_candidates_borrowed(&primary_utf8);
+    let fallback_cands = ruskk::encoding::parse_candidates_borrowed(&fallback_utf8);
 
-    let merged = ruskk::encoding::merge_candidates(&primary_cands, &fallback_cands);
+    let mut merged = primary_cands;
+    for cand in fallback_cands {
+        if !merged.contains(&cand) {
+            merged.push(cand);
+        }
+    }
     assert_eq!(merged, vec!["あ", "い", "う"]);
 
-    let formatted = ruskk::encoding::format_candidates_response(&merged);
+    let formatted = ruskk::encoding::format_candidates_response_str(&merged);
     assert_eq!(formatted, "1/あ/い/う/\n".as_bytes());
 }

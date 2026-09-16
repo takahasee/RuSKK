@@ -44,6 +44,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
         m.insert("着る".to_string(), 10);
         m
     });
+    predictor.expand_aliases();
 
     let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
@@ -766,6 +767,7 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         m.insert("伐る".to_string(), 10);
         m
     });
+    predictor.expand_aliases();
 
     let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
@@ -898,6 +900,7 @@ async fn test_proxy_context_ranking_disabled() {
         m.insert("切る".to_string(), 10);
         m
     });
+    predictor.expand_aliases();
 
     let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 
@@ -1000,6 +1003,7 @@ async fn test_proxy_context_protected_against_completion_burst() {
         m.insert("着る".to_string(), 50);
         m
     });
+    predictor.expand_aliases();
 
     let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
 

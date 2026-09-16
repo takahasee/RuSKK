@@ -23,60 +23,14 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
     if response.is_empty() {
         return Vec::new();
     }
-
-    match response[0] {
-        b'1' => convert_candidates_response(response),
-        b'4' => convert_not_found_response(response),
-        _ => decode_euc_or_utf8(response).as_bytes().to_vec(),
-    }
-}
-
-fn convert_candidates_response(response: &[u8]) -> Vec<u8> {
-    // Format: 1/<cand>/<cand>/...\n
-    let mut out = Vec::with_capacity(response.len() * 2);
-    out.push(b'1');
-
-    let rest = &response[1..];
-    let body = trim_trailing_newline(rest);
-
-    // split("/あ/い/") => ["", "あ", "い", ""] — skip the leading empty segment
-    for part in body.split(|&b| b == b'/').skip(1) {
-        out.push(b'/');
-        if !part.is_empty() {
-            out.extend_from_slice(decode_euc_or_utf8(part).as_bytes());
-        }
-    }
-
-    if rest.ends_with(b"\n") {
-        out.push(b'\n');
-    }
-    out
-}
-
-fn convert_not_found_response(response: &[u8]) -> Vec<u8> {
-    // Format: 4\n  or  4<midashi> \n
-    if response == b"4\n" || response == b"4" {
+    // すでに UTF-8（ASCII のみを含む場合など）であれば、そのまま返す
+    if std::str::from_utf8(response).is_ok() {
         return response.to_vec();
     }
-
-    let mut out = Vec::with_capacity(response.len() * 2);
-    out.push(b'4');
-    let rest = &response[1..];
-    let body = trim_trailing_newline(rest);
-    out.extend_from_slice(decode_euc_or_utf8(body).as_bytes());
-    if rest.ends_with(b"\n") {
-        out.push(b'\n');
-    }
-    out
-}
-
-fn trim_trailing_newline(bytes: &[u8]) -> &[u8] {
-    bytes.strip_suffix(b"\n").unwrap_or(bytes)
-}
-
-/// Decode a midashi from request bytes (EUC-JP or UTF-8) into UTF-8.
-pub fn decode_midashi(bytes: &[u8]) -> Cow<'_, str> {
-    decode_euc_or_utf8(bytes)
+    // EUC-JP のマルチバイトコード (0xA1..=0xFE) は ASCII 記号 (0x00..=0x7F: '/', '1', '4', '\n') と
+    // バイト値が衝突しないため、一括デコードするだけで区切り文字を完全に維持した UTF-8 バイト列が得られる。
+    let (cow, _, _) = EUC_JP.decode(response);
+    cow.as_bytes().to_vec()
 }
 
 /// レスポンスバイト列から第1候補（最初の / と / の間）をゼロアロケーションで抽出
@@ -98,18 +52,11 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     if !response.starts_with(b"1") {
         return Vec::new();
     }
-    let body = trim_trailing_newline(&response[1..]);
+    let body = response[1..].strip_suffix(b"\n").unwrap_or(&response[1..]);
     body.split(|&b| b == b'/')
         .skip(1)
         .filter(|part| !part.is_empty())
         .filter_map(|part| std::str::from_utf8(part).ok())
-        .collect()
-}
-
-pub fn parse_candidates(response: &[u8]) -> Vec<String> {
-    parse_candidates_borrowed(response)
-        .into_iter()
-        .map(|s| s.to_string())
         .collect()
 }
 
@@ -128,25 +75,6 @@ pub fn format_candidates_response_str(candidates: &[&str]) -> Vec<u8> {
     out.push(b'/');
     out.push(b'\n');
     out
-}
-
-/// Format a list of candidates into an skkserv response (e.g. `1/cand1/cand2/\n`).
-pub fn format_candidates_response(candidates: &[String]) -> Vec<u8> {
-    let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-    format_candidates_response_str(&borrowed)
-}
-
-/// Merge candidate lists from primary and fallback, preserving order and removing duplicates.
-pub fn merge_candidates(primary: &[String], fallback: &[String]) -> Vec<String> {
-    let mut merged = Vec::with_capacity(primary.len() + fallback.len());
-    let mut seen = std::collections::HashSet::new();
-
-    for cand in primary.iter().chain(fallback.iter()) {
-        if seen.insert(cand) {
-            merged.push(cand.clone());
-        }
-    }
-    merged
 }
 
 
@@ -179,20 +107,25 @@ mod tests {
     fn decode_midashi_euc_jp() {
         // "あい" in EUC-JP
         let midashi = [0xA4, 0xA2, 0xA4, 0xA4];
-        assert_eq!(decode_midashi(&midashi), "あい");
+        assert_eq!(decode_euc_or_utf8(&midashi), "あい");
     }
 
     #[test]
-    fn test_merge_candidates_dedup() {
-        let primary = vec!["あい".to_string(), "愛".to_string()];
-        let fallback = vec!["愛".to_string(), "相".to_string(), "藍".to_string()];
-        let merged = merge_candidates(&primary, &fallback);
+    fn test_merge_candidates_borrowed() {
+        let primary = vec!["あい", "愛"];
+        let fallback = vec!["愛", "相", "藍"];
+        let mut merged = primary;
+        for cand in fallback {
+            if !merged.contains(&cand) {
+                merged.push(cand);
+            }
+        }
         assert_eq!(merged, vec!["あい", "愛", "相", "藍"]);
 
-        let formatted = format_candidates_response(&merged);
+        let formatted = format_candidates_response_str(&merged);
         assert_eq!(formatted, "1/あい/愛/相/藍/\n".as_bytes());
 
-        let parsed = parse_candidates(&formatted);
+        let parsed = parse_candidates_borrowed(&formatted);
         assert_eq!(parsed, merged);
     }
 

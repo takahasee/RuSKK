@@ -31,12 +31,14 @@ impl FrequencyPredictor {
         let mut predictor = Self {
             frequencies: HashMap::new(),
             context_frequencies: HashMap::new(),
-            storage_path,
+            storage_path: None,
         };
-        if let Some(ref path) = predictor.storage_path.clone()
-            && let Err(err) = predictor.load_with_legacy_fallback(path) {
-                debug!(error = %err, "no existing frequency data loaded, starting fresh");
-            }
+        if let Some(ref path) = storage_path
+            && let Err(err) = predictor.load_with_legacy_fallback(path)
+        {
+            debug!(error = %err, "no existing frequency data loaded, starting fresh");
+        }
+        predictor.storage_path = storage_path;
         predictor
     }
 
@@ -64,6 +66,7 @@ impl FrequencyPredictor {
         let loaded: FrequencyPredictorData = serde_json::from_str(&data)?;
         self.frequencies = loaded.frequencies;
         self.context_frequencies = loaded.context_frequencies.unwrap_or_default();
+        self.expand_aliases();
         Ok(())
     }
 
@@ -99,6 +102,7 @@ impl FrequencyPredictor {
                 }
             }
         }
+        self.expand_aliases();
         Ok(())
     }
 
@@ -109,7 +113,9 @@ impl FrequencyPredictor {
             let preset = Self::default_preset_data()?;
             self.frequencies = preset.frequencies;
             self.context_frequencies = preset.context_frequencies.unwrap_or_default();
+            self.expand_aliases();
         } else {
+            // merge_default_presets 内で expand_aliases が呼ばれる
             self.merge_default_presets()?;
         }
         self.save()?;
@@ -161,7 +167,10 @@ impl FrequencyPredictor {
         
         // context_frequencies が空なら、デフォルトプリセットも一緒に初期化
         if self.context_frequencies.is_empty() {
+            // merge_default_presets 内で expand_aliases が呼ばれる
             let _ = self.merge_default_presets();
+        } else {
+            self.expand_aliases();
         }
 
         // インポートした結果を保存する
@@ -171,15 +180,9 @@ impl FrequencyPredictor {
     }
 
     /// context_frequencies から文脈マップを取得する。
-    /// 完全一致を最優先し、見つからない場合は単漢字（"切"）と活用形（"切る"）の表記差を柔軟に吸収する。
-    fn get_context_map_flexible<'a>(&'a self, ctx: &str) -> Option<&'a HashMap<String, u64>> {
-        if let Some(map) = self.context_frequencies.get(ctx) {
-            return Some(map);
-        }
-        self.context_frequencies
-            .iter()
-            .find(|(k, _)| k.starts_with(ctx) || ctx.starts_with(k.as_str()))
-            .map(|(_, map)| map)
+    /// expand_aliases() によりロード時にエイリアスが展開済みのため、O(1) の HashMap::get のみで完結する。
+    fn get_context_map<'a>(&'a self, ctx: &str) -> Option<&'a HashMap<String, u64>> {
+        self.context_frequencies.get(ctx)
     }
 
     /// 見出し語または現在の文脈に対して、並び替えルールが存在するかを超高速判定する。
@@ -190,7 +193,7 @@ impl FrequencyPredictor {
         }
         if !context.is_empty() && !self.context_frequencies.is_empty() {
             for ctx in context {
-                if self.get_context_map_flexible(ctx).is_some() {
+                if self.get_context_map(ctx).is_some() {
                     return true;
                 }
             }
@@ -212,16 +215,21 @@ impl FrequencyPredictor {
         let freq_map = self.frequencies.get(midashi);
         let has_freq = freq_map.map(|m| !m.is_empty()).unwrap_or(false);
 
-        let active_context_maps: Vec<&HashMap<String, u64>> = if !context.is_empty() && !self.context_frequencies.is_empty() {
-            context
-                .iter()
-                .filter_map(|ctx| self.get_context_map_flexible(ctx))
-                .collect()
+        // 文脈マップの取得: RuSKK の文脈は通常直前の確定単語1語（要素数 0 または 1）
+        // 大半のケースで中間 Vec を作らずゼロアロケーションで処理する
+        let single_ctx_map = if context.len() == 1 && !self.context_frequencies.is_empty() {
+            self.get_context_map(&context[0])
+        } else {
+            None
+        };
+        let multi_ctx_maps: Vec<&HashMap<String, u64>> = if context.len() > 1 && !self.context_frequencies.is_empty() {
+            context.iter().filter_map(|ctx| self.get_context_map(ctx)).collect()
         } else {
             Vec::new()
         };
 
-        if !has_freq && active_context_maps.is_empty() {
+        let has_context = single_ctx_map.is_some() || !multi_ctx_maps.is_empty();
+        if !has_freq && !has_context {
             return candidates.to_vec();
         }
 
@@ -230,11 +238,14 @@ impl FrequencyPredictor {
             .enumerate()
             .map(|(idx, &cand)| {
                 let clean = clean_candidate(cand);
-                let global_count = freq_map.map(|m| get_score_flexible(m, clean)).unwrap_or(0);
-                let context_score: u64 = active_context_maps
-                    .iter()
-                    .map(|m| get_score_flexible(m, clean))
-                    .sum();
+                let global_count = freq_map.map(|m| get_score(m, clean)).unwrap_or(0);
+                let context_score: u64 = if let Some(m) = single_ctx_map {
+                    get_score(m, clean)
+                } else if !multi_ctx_maps.is_empty() {
+                    multi_ctx_maps.iter().map(|m| get_score(m, clean)).sum()
+                } else {
+                    0
+                };
 
                 let total_score = global_count + context_score * 10;
                 (idx, cand, total_score)
@@ -245,7 +256,7 @@ impl FrequencyPredictor {
             return candidates.to_vec();
         }
 
-        indexed_cands.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+        indexed_cands.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
         indexed_cands
             .into_iter()
@@ -253,32 +264,102 @@ impl FrequencyPredictor {
             .collect()
     }
 
-    /// seed データの頻度と文脈共起に基づいて候補を並び替える。
-    /// 候補文字列に注釈（`;` 以降）が含まれる場合や、
-    /// 送りあり単漢字（"切"）と活用形（"切る"）の表記差がある場合も柔軟にスコアを照合する。
-    pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
-        let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-        let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
-        ranked.into_iter().map(|s| s.to_string()).collect()
+    /// seed ロード時に frequencies / context_frequencies の各マップに対して、
+    /// 前方一致で繋がるエイリアス（「切 → 切る」「切る → 切」等）を展開する。
+    /// これによりランタイムのスコア照合が HashMap::get の O(1) のみで完結する。
+    /// データを直接設定した後にも呼び出し可能。
+    pub fn expand_aliases(&mut self) {
+        expand_map_aliases(&mut self.frequencies);
+        expand_context_map_aliases(&mut self.context_frequencies);
     }
 }
 
-/// マップからスコアを取得する。完全一致を最優先し、
-/// 見つからない場合は送りあり単漢字（"切"）と活用形（"切る"）の前方一致を許容する。
-fn get_score_flexible(map: &HashMap<String, u64>, target: &str) -> u64 {
-    if let Some(&score) = map.get(target) {
-        return score;
+/// マップからスコアを取得する。
+/// expand_aliases() によりロード時にエイリアスが展開済みのため、O(1) の HashMap::get のみで完結する。
+#[inline]
+fn get_score(map: &HashMap<String, u64>, target: &str) -> u64 {
+    map.get(target).copied().unwrap_or(0)
+}
+
+/// frequencies マップの内部マップに前方一致エイリアスを展開する。
+/// 例: {"切る": 3} に対して "切" をキーとして同スコアを追加（既存値がある場合は大きい方を採用）。
+fn expand_map_aliases(map: &mut HashMap<String, HashMap<String, u64>>) {
+    for inner in map.values_mut() {
+        expand_inner_aliases(inner);
     }
-    map.iter()
-        .filter(|(k, _)| k.starts_with(target) || target.starts_with(k.as_str()))
-        .map(|(_, &score)| score)
-        .max()
-        .unwrap_or(0)
+}
+
+/// context_frequencies マップのキー側とバリュー側の両方にエイリアスを展開する。
+/// キー側: "切る" があれば "切" でも同じマップを参照できるようにエントリを追加。
+/// バリュー側: 各内部マップの値にも前方一致エイリアスを展開。
+fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>>) {
+    // 1. バリュー側のエイリアス展開
+    for inner in ctx_map.values_mut() {
+        expand_inner_aliases(inner);
+    }
+
+    // 2. キー側のエイリアス展開: "切る" があれば "切" でも参照できるようにする
+    let aliases: Vec<(String, HashMap<String, u64>)> = ctx_map
+        .iter()
+        .flat_map(|(k, v)| {
+            let mut pairs = Vec::new();
+            // k が他のキーの前方一致になる場合のエイリアス（例: "切る" → "切"）
+            for (idx, _) in k.char_indices().skip(1) {
+                let prefix = k[..idx].to_string();
+                if !ctx_map.contains_key(&prefix) {
+                    pairs.push((prefix, v.clone()));
+                }
+            }
+            pairs
+        })
+        .collect();
+
+    for (alias_key, alias_map) in aliases {
+        let entry = ctx_map.entry(alias_key).or_default();
+        for (cand, score) in alias_map {
+            let current = entry.entry(cand).or_insert(0);
+            *current = (*current).max(score);
+        }
+    }
+}
+
+/// 内部マップ（候補 → スコア）に対して前方一致エイリアスを展開する。
+/// 例: {"切る": 3} → {"切る": 3, "切": 3} を追加（既存値がある場合は大きい方を採用）。
+fn expand_inner_aliases(inner: &mut HashMap<String, u64>) {
+    let aliases: Vec<(String, u64)> = inner
+        .iter()
+        .flat_map(|(k, &score)| {
+            let mut pairs = Vec::new();
+            // "切る" → "切"、"書き起こす" → "書き起こ" 等のプレフィックスを生成
+            for (idx, _) in k.char_indices().skip(1) {
+                pairs.push((k[..idx].to_string(), score));
+            }
+            // 逆方向: 既存キー同士で前方一致が成立する場合
+            // （例: "切" が既にあって "切る" も追加する場合）
+            for (other_k, &other_score) in inner.iter() {
+                if other_k != k && (other_k.starts_with(k.as_str()) || k.starts_with(other_k.as_str())) {
+                    // 短い方のキーに長い方のスコアを伝播
+                    if k.len() < other_k.len() {
+                        pairs.push((k.clone(), other_score));
+                    }
+                }
+            }
+            pairs
+        })
+        .collect();
+
+    for (alias_key, score) in aliases {
+        let current = inner.entry(alias_key).or_insert(0);
+        *current = (*current).max(score);
+    }
 }
 
 /// 候補文字列から注釈（`;` 以降）を除去した本体文字列を返す。
 pub fn clean_candidate(cand: &str) -> &str {
-    cand.split(';').next().unwrap_or(cand).trim()
+    match cand.split_once(';') {
+        Some((word, _)) => word.trim(),
+        None => cand.trim(),
+    }
 }
 
 /// SKK 辞書エントリの候補部分（`/[る/着/切/伐/]/[り/切/]/` や `/変換/返還/`）から、
@@ -334,6 +415,16 @@ pub struct FrequencyPredictorData {
 
 pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
 
+/// テスト専用: 所有権版の rank_candidates
+#[cfg(test)]
+impl FrequencyPredictor {
+    pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
+        let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
+        let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
+        ranked.into_iter().map(|s| s.to_string()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +445,7 @@ mod tests {
             m.insert("藍".to_string(), 7);
             m
         });
+        predictor.expand_aliases();
 
         let ranked_after = predictor.rank_candidates(&[], "あい", &candidates);
         assert_eq!(ranked_after, vec!["藍", "相", "愛"]);
@@ -381,6 +473,7 @@ mod tests {
             m.insert("伐る".to_string(), 4);
             m
         });
+        predictor.expand_aliases();
 
         // 1. 文脈「肉」のとき、「切る」（および語幹「切」）が第1候補
         let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
@@ -406,6 +499,7 @@ mod tests {
             m.insert("包丁".to_string(), 10);
             m
         });
+        predictor.expand_aliases();
         let nouchi_cands = vec!["包丁".to_string(), "庖丁".to_string()];
         let ranked_hocho = predictor.rank_candidates(&["切".to_string()], "ほうちょう", &nouchi_cands);
         assert_eq!(ranked_hocho[0], "包丁");
@@ -517,6 +611,7 @@ mod tests {
             m.insert("着る".to_string(), 10);
             m
         });
+        predictor.expand_aliases();
         assert!(predictor.should_rank(&["服".to_string()], "きr"));
         // 文脈と一致しない場合は false
         assert!(!predictor.should_rank(&["車".to_string()], "きr"));
@@ -527,6 +622,7 @@ mod tests {
             m.insert("愛".to_string(), 5);
             m
         });
+        predictor.expand_aliases();
         assert!(predictor.should_rank(&[], "あい"));
     }
 }

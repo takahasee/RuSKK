@@ -79,29 +79,24 @@ impl Args {
     }
 
     pub fn is_okuri_expansion_enabled(&self) -> bool {
-        if let Ok(val) = std::env::var("RUSKK_OKURI_EXPANSION") {
-            let val = val.trim().to_lowercase();
-            if val == "0" || val == "false" || val == "no" || val == "off" {
-                return false;
-            }
-            if val == "1" || val == "true" || val == "yes" || val == "on" {
-                return true;
-            }
-        }
-        self.okuri_expansion
+        parse_bool_env("RUSKK_OKURI_EXPANSION", self.okuri_expansion)
     }
 
     pub fn is_context_ranking_enabled(&self) -> bool {
-        if let Ok(val) = std::env::var("RUSKK_CONTEXT_RANKING") {
-            let val = val.trim().to_lowercase();
-            if val == "0" || val == "false" || val == "no" || val == "off" {
-                return false;
-            }
-            if val == "1" || val == "true" || val == "yes" || val == "on" {
-                return true;
-            }
-        }
-        self.context_ranking
+        parse_bool_env("RUSKK_CONTEXT_RANKING", self.context_ranking)
     }
+}
+
+fn parse_bool_env(var: &str, default: bool) -> bool {
+    if let Ok(val) = std::env::var(var) {
+        let val = val.trim().to_lowercase();
+        if matches!(val.as_str(), "0" | "false" | "no" | "off") {
+            return false;
+        }
+        if matches!(val.as_str(), "1" | "true" | "yes" | "on") {
+            return true;
+        }
+    }
+    default
 }
 
