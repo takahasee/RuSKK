@@ -94,14 +94,14 @@ fn parse_candidates_from_str(body_str: &str) -> Vec<String> {
         if in_block {
             if let Some(cand) = part.strip_suffix(']') {
                 let cand = cand.trim();
-                if !cand.is_empty() && !cands.contains(&cand.to_string()) {
+                if !cand.is_empty() && !cands.iter().any(|c| c == cand) {
                     cands.push(cand.to_string());
                 }
                 in_block = false;
-            } else if !part.is_empty() && !cands.contains(&part.to_string()) {
+            } else if !part.is_empty() && !cands.iter().any(|c| c == part) {
                 cands.push(part.to_string());
             }
-        } else if !cands.contains(&part.to_string()) {
+        } else if !part.is_empty() && !cands.iter().any(|c| c == part) {
             cands.push(part.to_string());
         }
     }
