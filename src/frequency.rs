@@ -187,13 +187,13 @@ impl FrequencyPredictor {
 
     /// 見出し語または現在の文脈に対して、並び替えルールが存在するかを超高速判定する。
     /// これが false の場合、候補のパースや並び替え処理を一切行わずに直結バイパス（完全ゼロコピー）できる。
-    pub fn should_rank(&self, context: &[String], midashi: &str) -> bool {
+    pub fn should_rank<S: AsRef<str>>(&self, context: &[S], midashi: &str) -> bool {
         if self.frequencies.get(midashi).map(|m| !m.is_empty()).unwrap_or(false) {
             return true;
         }
         if !context.is_empty() && !self.context_frequencies.is_empty() {
             for ctx in context {
-                if self.get_context_map(ctx).is_some() {
+                if self.get_context_map(ctx.as_ref()).is_some() {
                     return true;
                 }
             }
@@ -202,9 +202,9 @@ impl FrequencyPredictor {
     }
 
     /// 借用スライス (&str) を対象に、アロケーションなしで候補を並び替える。
-    pub fn rank_candidates_borrowed<'a>(
+    pub fn rank_candidates_borrowed<'a, S: AsRef<str>>(
         &self,
-        context: &[String],
+        context: &[S],
         midashi: &str,
         candidates: &[&'a str],
     ) -> Vec<&'a str> {
@@ -218,12 +218,12 @@ impl FrequencyPredictor {
         // 文脈マップの取得: RuSKK の文脈は通常直前の確定単語1語（要素数 0 または 1）
         // 大半のケースで中間 Vec を作らずゼロアロケーションで処理する
         let single_ctx_map = if context.len() == 1 && !self.context_frequencies.is_empty() {
-            self.get_context_map(&context[0])
+            self.get_context_map(context[0].as_ref())
         } else {
             None
         };
         let multi_ctx_maps: Vec<&HashMap<String, u64>> = if context.len() > 1 && !self.context_frequencies.is_empty() {
-            context.iter().filter_map(|ctx| self.get_context_map(ctx)).collect()
+            context.iter().filter_map(|ctx| self.get_context_map(ctx.as_ref())).collect()
         } else {
             Vec::new()
         };
@@ -418,7 +418,7 @@ pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
 /// テスト専用: 所有権版の rank_candidates
 #[cfg(test)]
 impl FrequencyPredictor {
-    pub fn rank_candidates(&self, context: &[String], midashi: &str, candidates: &[String]) -> Vec<String> {
+    pub fn rank_candidates<S: AsRef<str>>(&self, context: &[S], midashi: &str, candidates: &[String]) -> Vec<String> {
         let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
         ranked.into_iter().map(|s| s.to_string()).collect()
@@ -435,7 +435,7 @@ mod tests {
         let candidates = vec!["愛".to_string(), "相".to_string(), "藍".to_string()];
 
         // 初期状態ではスコアがないため元の順序を維持
-        let ranked = predictor.rank_candidates(&[], "あい", &candidates);
+        let ranked = predictor.rank_candidates(&[] as &[String], "あい", &candidates);
         assert_eq!(ranked, vec!["愛", "相", "藍"]);
 
         // seed データを直接設定（手動編集を模倣）
@@ -447,7 +447,7 @@ mod tests {
         });
         predictor.expand_aliases();
 
-        let ranked_after = predictor.rank_candidates(&[], "あい", &candidates);
+        let ranked_after = predictor.rank_candidates(&[] as &[String], "あい", &candidates);
         assert_eq!(ranked_after, vec!["藍", "相", "愛"]);
     }
 
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(kir_freqs.get("伐").copied().unwrap_or(0), 1);
 
         // 注釈付き候補（例: "切;注釈あり"）でもスコア照合できていること
-        let ranked = predictor.rank_candidates(&[], "きr", &["伐".to_string(), "切;注釈あり".to_string(), "着".to_string()]);
+        let ranked = predictor.rank_candidates(&[] as &[String], "きr", &["伐".to_string(), "切;注釈あり".to_string(), "着".to_string()]);
         assert_eq!(ranked[0], "着");
         assert_eq!(ranked[1], "切;注釈あり");
         assert_eq!(ranked[2], "伐");
@@ -602,7 +602,7 @@ mod tests {
     fn test_should_rank_fast_path() {
         let mut predictor = FrequencyPredictor::new(None);
         // ルールが何もない場合は false
-        assert!(!predictor.should_rank(&[], "とうきょう"));
+        assert!(!predictor.should_rank(&[] as &[String], "とうきょう"));
         assert!(!predictor.should_rank(&["服".to_string()], "とうきょう"));
 
         // 文脈ルールがある場合は true
@@ -623,6 +623,6 @@ mod tests {
             m
         });
         predictor.expand_aliases();
-        assert!(predictor.should_rank(&[], "あい"));
+        assert!(predictor.should_rank(&[] as &[String], "あい"));
     }
 }

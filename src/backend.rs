@@ -67,13 +67,13 @@ impl Backend {
         }
     }
 
-    pub async fn query(&self, request: &Request) -> Result<Vec<u8>, BackendError> {
+    pub async fn query(&self, request: &Request<'_>) -> Result<Vec<u8>, BackendError> {
         self.query_with_timeout(request, self.timeout).await
     }
 
     pub async fn query_with_timeout(
         &self,
-        request: &Request,
+        request: &Request<'_>,
         timeout_duration: Duration,
     ) -> Result<Vec<u8>, BackendError> {
         // EUC-JP リクエストを必要とするバックエンドは見出し語を EUC-JP にエンコード

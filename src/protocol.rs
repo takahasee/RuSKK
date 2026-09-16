@@ -3,17 +3,17 @@
 use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Request {
+pub enum Request<'a> {
     /// opcode `0` — disconnect
     End,
     /// opcode `1` — dictionary lookup
-    Lookup(Vec<u8>),
+    Lookup(&'a [u8]),
     /// opcode `2` — server version
     Version,
     /// opcode `3` — host info
     Host,
     /// opcode `4` — server completion
-    Completion(Vec<u8>),
+    Completion(&'a [u8]),
 }
 
 #[derive(Debug, Error)]
@@ -32,7 +32,7 @@ pub enum ProtocolError {
 /// - `2` / `2 ` — version
 /// - `3` / `3 ` — host
 /// - `4<midashi> ` — completion (trailing space optional)
-pub fn parse_request(line: &[u8]) -> Result<Request, ProtocolError> {
+pub fn parse_request(line: &[u8]) -> Result<Request<'_>, ProtocolError> {
     let line = trim_ascii_whitespace_end(line);
     if line.is_empty() {
         return Err(ProtocolError::Empty);
@@ -52,7 +52,7 @@ pub fn parse_request(line: &[u8]) -> Result<Request, ProtocolError> {
 }
 
 /// Rebuild a wire request for forwarding to an upstream skkserv.
-fn encode_request_inner(request: &Request, is_euc: bool) -> Vec<u8> {
+fn encode_request_inner(request: &Request<'_>, is_euc: bool) -> Vec<u8> {
     use crate::encoding::{decode_euc_or_utf8, encode_euc_jp};
 
     let (opcode, midashi) = match request {
@@ -80,13 +80,13 @@ fn encode_request_inner(request: &Request, is_euc: bool) -> Vec<u8> {
 }
 
 /// Rebuild a wire request for forwarding to an upstream skkserv (UTF-8).
-pub fn encode_request(request: &Request) -> Vec<u8> {
+pub fn encode_request(request: &Request<'_>) -> Vec<u8> {
     encode_request_inner(request, false)
 }
 
 /// EUC-JP バックエンド向けにリクエストを構築する。
 /// 見出し語を正しくデコードした上で EUC-JP にエンコードして送信する。
-pub fn encode_request_for_encoding(request: &Request) -> Vec<u8> {
+pub fn encode_request_for_encoding(request: &Request<'_>) -> Vec<u8> {
     encode_request_inner(request, true)
 }
 
@@ -94,8 +94,8 @@ pub fn is_found(response: &[u8]) -> bool {
     response.first() == Some(&b'1')
 }
 
-fn normalize_midashi(operand: &[u8]) -> Vec<u8> {
-    trim_ascii_whitespace_end(operand).to_vec()
+fn normalize_midashi(operand: &[u8]) -> &[u8] {
+    trim_ascii_whitespace_end(operand)
 }
 
 fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
@@ -115,11 +115,11 @@ mod tests {
     fn parse_lookup() {
         assert_eq!(
             parse_request(b"1ai ").unwrap(),
-            Request::Lookup(b"ai".to_vec())
+            Request::Lookup(b"ai")
         );
         assert_eq!(
             parse_request(b"1ai").unwrap(),
-            Request::Lookup(b"ai".to_vec())
+            Request::Lookup(b"ai")
         );
     }
 
@@ -134,13 +134,13 @@ mod tests {
     fn parse_completion() {
         assert_eq!(
             parse_request(b"4kan ").unwrap(),
-            Request::Completion(b"kan".to_vec())
+            Request::Completion(b"kan")
         );
     }
 
     #[test]
     fn encode_lookup_roundtrip() {
-        let req = Request::Lookup(b"test".to_vec());
+        let req = Request::Lookup(b"test");
         let wire = encode_request(&req);
         assert_eq!(wire, b"1test \n");
     }

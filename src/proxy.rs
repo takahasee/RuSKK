@@ -27,8 +27,8 @@ pub struct Proxy {
 
 #[derive(Debug, Default)]
 struct SharedContextState {
-    session_context: Vec<String>,
-    pending_context: Option<(String, String, Instant)>,
+    session_context: Option<Arc<str>>,
+    pending_context: Option<(String, Arc<str>, Instant)>,
 }
 
 impl Proxy {
@@ -51,7 +51,7 @@ impl Proxy {
         {
             let warmup_primary = proxy.primary.clone();
             tokio::spawn(async move {
-                let req = Request::Lookup(b"\xca\xa1".to_vec()); // EUC-JP "あ"
+                let req = Request::Lookup(b"\xca\xa1"); // EUC-JP "あ"
                 let _ = warmup_primary.query_with_timeout(&req, Duration::from_secs(3)).await;
                 tracing::debug!("primary backend warmup complete");
             });
@@ -137,7 +137,7 @@ async fn handle_client(
                 writer.write_all(host.as_bytes()).await?;
                 conn_last_response_time = Some(Instant::now());
             }
-            Request::Lookup(ref midashi) => {
+            Request::Lookup(midashi) => {
                 let midashi_str = decode_euc_or_utf8(midashi);
                 let now = Instant::now();
 
@@ -166,15 +166,14 @@ async fn handle_client(
                         } else {
                             // 見出し語が変わったため、前回の単語が確定したと判定して昇格
                             if now.duration_since(time) <= Duration::from_secs(60) {
-                                ctx.session_context.clear();
-                                ctx.session_context.push(prev_word);
+                                ctx.session_context = Some(prev_word);
                                 debug!(
                                     context = ?ctx.session_context,
                                     new_midashi = %midashi_str,
                                     "promoted pending context"
                                 );
                             } else {
-                                ctx.session_context.clear();
+                                ctx.session_context = None;
                             }
                         }
                     }
@@ -183,7 +182,11 @@ async fn handle_client(
                 };
 
                 let ctx_ref = if proxy.context_ranking {
-                    &session_ctx_snapshot[..]
+                    if let Some(ref c) = session_ctx_snapshot {
+                        std::slice::from_ref(c)
+                    } else {
+                        &[]
+                    }
                 } else {
                     &[]
                 };
@@ -198,7 +201,7 @@ async fn handle_client(
                     let mut responses = Vec::with_capacity(variations.len());
 
                     for var in variations {
-                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes().to_vec());
+                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
                         let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
 
                         if is_found(&okuri_resp) {
@@ -291,7 +294,7 @@ async fn handle_client(
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
                         let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
-                        ctx.pending_context = Some((midashi_str.to_string(), clean.to_string(), now));
+                        ctx.pending_context = Some((midashi_str.to_string(), Arc::from(clean), now));
                     }
                 }
 
@@ -323,7 +326,7 @@ enum BackendHit {
 /// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
 /// 全体デッドライン（950ms）から動的タイムアウトを計算し、macSKK の 1.0秒制限を超えないようにする。
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
-async fn lookup_with_fallback(proxy: &Proxy, request: &Request) -> (Vec<u8>, BackendHit) {
+async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>, BackendHit) {
     let start = Instant::now();
     // macSKK の 1.0秒 (1000ms) 制限を絶対に超えないよう、全体デッドラインを 850ms に制限
     let overall_deadline = Duration::from_millis(850);
