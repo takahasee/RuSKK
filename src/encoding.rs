@@ -60,6 +60,54 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
         .collect()
 }
 
+/// レスポンスバイト列から候補リストをパースする。
+/// SKKの送りあり辞書エントリ（例: `1/[っ/思/]/重/御持/想;注釈/`）に含まれる
+/// 角括弧ブロック `[送り仮名/候補...]` も適切に展開し、語幹候補を抽出する。
+pub fn parse_candidates_unpacked(response: &[u8]) -> Vec<String> {
+    if !response.starts_with(b"1") {
+        return Vec::new();
+    }
+    let body = response[1..].strip_suffix(b"\n").unwrap_or(&response[1..]);
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        let (cow, _, _) = encoding_rs::EUC_JP.decode(body);
+        return parse_candidates_from_str(&cow);
+    };
+    parse_candidates_from_str(body_str)
+}
+
+fn parse_candidates_from_str(body_str: &str) -> Vec<String> {
+    let mut cands = Vec::new();
+    let mut in_block = false;
+
+    for part in body_str.split('/') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if part.starts_with('[') {
+            in_block = true;
+            // `[okuri` または `[[okuri` などのヘッダをスキップ
+            continue;
+        }
+
+        if in_block {
+            if let Some(cand) = part.strip_suffix(']') {
+                let cand = cand.trim();
+                if !cand.is_empty() && !cands.contains(&cand.to_string()) {
+                    cands.push(cand.to_string());
+                }
+                in_block = false;
+            } else if !part.is_empty() && !cands.contains(&part.to_string()) {
+                cands.push(part.to_string());
+            }
+        } else if !cands.contains(&part.to_string()) {
+            cands.push(part.to_string());
+        }
+    }
+    cands
+}
+
 /// Format a list of borrowed candidate strings into an skkserv response.
 pub fn format_candidates_response_str(candidates: &[&str]) -> Vec<u8> {
     if candidates.is_empty() {
@@ -150,6 +198,21 @@ mod tests {
         assert_eq!(borrowed, vec!["着", "切", "伐"]);
         let formatted = format_candidates_response_str(&borrowed);
         assert_eq!(formatted, resp);
+    }
+
+    #[test]
+    fn test_parse_candidates_unpacked() {
+        let resp = "1/[っ/思/]/重/御持/お持/想;注釈/\n".as_bytes();
+        let unpacked = parse_candidates_unpacked(resp);
+        assert_eq!(unpacked, vec!["思", "重", "御持", "お持", "想;注釈"]);
+
+        let resp2 = "1/[ち/待/]/[っ/[つ/[て/舞/俟/\n".as_bytes();
+        let unpacked2 = parse_candidates_unpacked(resp2);
+        assert_eq!(unpacked2, vec!["待", "舞", "俟"]);
+
+        let resp3 = "1/来/切/着/\n".as_bytes();
+        let unpacked3 = parse_candidates_unpacked(resp3);
+        assert_eq!(unpacked3, vec!["来", "切", "着"]);
     }
 }
 

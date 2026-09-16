@@ -235,9 +235,35 @@ async fn handle_client(
                     }
 
                     if !all_stem_cands.is_empty() {
+                        let mut merged_cands: Vec<String> =
+                            all_stem_cands.into_iter().map(|s| s.to_string()).collect();
+
+                        // 元の見出し語（midashi_str）で Fallback (yaskkserv2 / 巨大SKK辞書) を照会し、
+                        // 辞書が本来持っている全候補（異体字・専門用語・注釈付き）を末尾に重複排除してマージする。
+                        // これにより azooKey の賢い促音・活用語幹が最優先となりつつ、
+                        // 辞書の全候補も漏れなく提供され、変換候補数が少なくなる現象を根本的に解消する。
+                        let fallback_req = Request::Lookup(midashi_str.as_bytes());
+                        let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200));
+                        if let Ok(fallback_resp) = proxy.fallback.query_with_timeout(&fallback_req, fb_timeout).await
+                            && is_found(&fallback_resp)
+                        {
+                            let fb_cands = crate::encoding::parse_candidates_unpacked(&fallback_resp);
+                            for cand in fb_cands {
+                                let clean = crate::frequency::clean_candidate(&cand);
+                                if !clean.is_empty()
+                                    && !merged_cands
+                                        .iter()
+                                        .any(|c| crate::frequency::clean_candidate(c) == clean)
+                                {
+                                    merged_cands.push(cand);
+                                }
+                            }
+                        }
+
+                        let cands_refs: Vec<&str> = merged_cands.iter().map(|s| s.as_str()).collect();
                         let ranked = {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                            guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &all_stem_cands)
+                            guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &cands_refs)
                         };
                         if let Some(&top) = ranked.first() {
                             top_candidate_for_context = Some(top.to_string());
