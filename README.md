@@ -206,18 +206,26 @@ macSKK はローカルの「ユーザー辞書」および「追加辞書」を 
 - macSKK 側で追加していた静的辞書（`SKK-JISYO.L`, `neologd`, `jawiki`, `hatena` 等）は、`yaskkserv2_make_dictionary` で 1 つの統合バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に集約し、yaskkserv2（:1179）に持たせます。
 - macSKK の「辞書」設定画面では、追加辞書をすべて OFF（無効化）にし、SKKServ（`127.0.0.1:1178`、UTF-8）のみを有効にします。
 
-### ② 補完機能の誤爆確定防止設定
-macSKK 内部では、補完候補表示後に一定時間（標準 0.5〜1.0秒）経過すると、タイピング途中の打鍵が候補選択キーと誤認されて勝手に確定される仕様があります。
+### ② 補完機能の確定・誤爆防止設定
+macSKK 内部では、補完候補表示後に一定時間（`completionConfirmationTimeLimit`、ミリ秒）経過すると、各候補の左端に表示されるキー（`A`, `S` など）で候補を直接確定できるようになります。
 
-リアルタイム補完を快適に使いつつ誤爆確定を防ぐため、以下の設定をターミナルで実行することを推奨します（補完選択は Tab キーで行います）：
+タイピング速度やお好みの操作スタイルに合わせて、以下のいずれかの設定を推奨します：
 
-```sh
-# 読み入力から候補選択に切り替わるまでの時間を 5秒（5000ms）に延長
-defaults write net.mtgto.inputmethod.macSKK completionConfirmationTimeLimit -int 5000
+- **スタイルA：補完候補確定キー（A, S...）で素早く確定する場合（推奨）**
+  ```sh
+  # 読み入力から候補選択に切り替わるまでの時間を 300ミリ秒 (0.3秒) に設定
+  defaults write net.mtgto.inputmethod.macSKK completionConfirmationTimeLimit -int 300
+  ```
+  ※ 補完表示から 0.3秒後に `A` キーを押すだけで即座に第1候補で確定入力されます。
 
-# ピリオド確定を無効化
-defaults write net.mtgto.inputmethod.macSKK fixedCompletionByPeriod -int 0
-```
+- **スタイルB：補完選択を Tab キーのみに限定し、タイピング途中のキー誤爆を完全に防止する場合**
+  ```sh
+  # 待機時間を 5秒（5000ms）に延長し、キーボードの A〜L 打鍵による誤確定を防止（選択は Tab キーで行う）
+  defaults write net.mtgto.inputmethod.macSKK completionConfirmationTimeLimit -int 5000
+
+  # ピリオド確定を無効化
+  defaults write net.mtgto.inputmethod.macSKK fixedCompletionByPeriod -int 0
+  ```
 
 ---
 
