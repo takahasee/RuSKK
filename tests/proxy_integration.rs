@@ -636,6 +636,79 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
     upstream_handle.abort();
 }
 
+/// 複合語下一段動詞（例: "NeaG ->e" -> "ねあg"）で、
+/// 下一段 "ねあげ" 由来の「値上」が第1候補として返ることを検証する結合テスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_compound_neage() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 { break; }
+                        let req = &buf[..n];
+                        if req.starts_with("1ねあげ ".as_bytes()) {
+                            let _ = stream.write_all("1/値上げ/値上/\n".as_bytes()).await;
+                        } else if req.starts_with("1ねあぐ ".as_bytes()) {
+                            let _ = stream.write_all("1/寝あぐ/寝アグ/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1ねあg \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.starts_with("1/値上/"), "expected '値上' as top candidate, got: {}", resp);
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 /// 送り復元が無効（okuri_expansion: false）のときは、
 /// 従来通り元の見出し語（"かk"）がそのまま照会されることを検証するテスト。
 #[tokio::test]

@@ -47,13 +47,25 @@ impl Proxy {
         let shared_context = Arc::new(std::sync::Mutex::new(SharedContextState::default()));
 
         // Primary バックエンド（azooKey）をバックグラウンドでウォームアップ
-        // （macOS の App Nap による初回スリープを解除し、モデルロードを先行完了させる）
+        // （macOS の App Nap による初回スリープを解除し、通常変換・補完エンジンを先行初期化する）
         {
             let warmup_primary = proxy.primary.clone();
             tokio::spawn(async move {
-                let req = Request::Lookup(b"\xca\xa1"); // EUC-JP "あ"
-                let _ = warmup_primary.query_with_timeout(&req, Duration::from_secs(3)).await;
-                tracing::debug!("primary backend warmup complete");
+                // 1. 通常変換（Lookup）モデルのウォームアップ
+                let req_lookup = Request::Lookup(b"\xca\xa1"); // EUC-JP "あ"
+                let _ = warmup_primary.query_with_timeout(&req_lookup, Duration::from_secs(3)).await;
+
+                // 2. 補完（Completion）エンジンのウォームアップ（五十音の代表文字を照会してトライ木等をメモリ展開）
+                // EUC-JP: あ(\xca\xa1), か(\xab\xa1), さ(\xbb\xa1), た(\xc2\xa1), な(\xc7\xa1), は(\xce\xa1), ま(\xd1\xa1), や(\xd4\xa1), ら(\xd7\xa1), わ(\xda\xa1)
+                const WARMUP_CHARS: &[&[u8]] = &[
+                    b"\xca\xa1", b"\xab\xa1", b"\xbb\xa1", b"\xc2\xa1", b"\xc7\xa1",
+                    b"\xce\xa1", b"\xd1\xa1", b"\xd4\xa1", b"\xd7\xa1", b"\xda\xa1",
+                ];
+                for &kana in WARMUP_CHARS {
+                    let req_comp = Request::Completion(kana);
+                    let _ = warmup_primary.query_with_timeout(&req_comp, Duration::from_millis(500)).await;
+                }
+                tracing::debug!("primary backend lookup and completion warmup complete");
             });
         }
 
@@ -200,11 +212,19 @@ async fn handle_client(
                     let variations = crate::okuri::expand_okuri_variations(&midashi_str);
                     let mut responses = Vec::with_capacity(variations.len());
 
-                    for var in variations {
-                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
-                        let (okuri_resp, _hit) = lookup_with_fallback(&proxy, &okuri_req).await;
+                    let start_okuri = Instant::now();
+                    let max_total_okuri = Duration::from_millis(600);
 
-                        if is_found(&okuri_resp) {
+                    for var in variations {
+                        if start_okuri.elapsed() >= max_total_okuri {
+                            break;
+                        }
+                        let remaining = max_total_okuri.saturating_sub(start_okuri.elapsed());
+                        let okuri_timeout = proxy.primary.timeout.min(Duration::from_millis(300)).min(remaining);
+                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
+                        if let Ok(okuri_resp) = proxy.primary.query_with_timeout(&okuri_req, okuri_timeout).await
+                            && is_found(&okuri_resp)
+                        {
                             responses.push((okuri_resp, var));
                         }
                     }
@@ -214,7 +234,7 @@ async fn handle_client(
                         let raw_cands = parse_candidates_borrowed(resp);
                         let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
                             &raw_cands,
-                            var.okuri_suffix,
+                            &var.okuri_suffix,
                             &var.query_midashi,
                         );
 
