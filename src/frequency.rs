@@ -325,26 +325,19 @@ fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>
 
 /// 内部マップ（候補 → スコア）に対して前方一致エイリアスを展開する。
 /// 例: {"切る": 3} → {"切る": 3, "切": 3} を追加（既存値がある場合は大きい方を採用）。
+/// 全キーのすべてのプレフィックスを生成してスコアを伝播させるため、
+/// 逆方向（短いキーへの長いキーのスコア伝播）も前半ループで網羅される。
 fn expand_inner_aliases(inner: &mut HashMap<String, u64>) {
     let aliases: Vec<(String, u64)> = inner
         .iter()
         .flat_map(|(k, &score)| {
-            let mut pairs = Vec::new();
-            // "切る" → "切"、"書き起こす" → "書き起こ" 等のプレフィックスを生成
-            for (idx, _) in k.char_indices().skip(1) {
-                pairs.push((k[..idx].to_string(), score));
-            }
-            // 逆方向: 既存キー同士で前方一致が成立する場合
-            // （例: "切" が既にあって "切る" も追加する場合）
-            for (other_k, &other_score) in inner.iter() {
-                if other_k != k && (other_k.starts_with(k.as_str()) || k.starts_with(other_k.as_str())) {
-                    // 短い方のキーに長い方のスコアを伝播
-                    if k.len() < other_k.len() {
-                        pairs.push((k.clone(), other_score));
-                    }
-                }
-            }
-            pairs
+            // "切る" → "切"、"書き起こす" → "書き起こ" 等、すべての前方プレフィックスを生成。
+            // これにより「切る」→「切」も「書き起こす」→「書き起こ」→「書き起こ」も一括で展開され、
+            // 逆方向ループは不要（かつ Clippy 警告の原因）になるため削除。
+            k.char_indices()
+                .skip(1)
+                .map(|(idx, _)| (k[..idx].to_string(), score))
+                .collect::<Vec<_>>()
         })
         .collect();
 

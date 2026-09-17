@@ -405,12 +405,11 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>,
     }
 
     let elapsed = start.elapsed();
-    let fallback_timeout = if overall_deadline > elapsed {
-        overall_deadline - elapsed
-    } else {
+    let fallback_timeout = overall_deadline.saturating_sub(elapsed);
+    if fallback_timeout.is_zero() {
         debug!("overall deadline reached before fallback, returning not found immediately");
         return (b"4\n".to_vec(), BackendHit::None);
-    };
+    }
 
     match proxy.fallback.query_with_timeout(request, fallback_timeout).await {
         Ok(response) => {
