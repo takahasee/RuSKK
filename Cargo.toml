@@ -1,6 +1,6 @@
 [package]
 name = "ruskk"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 description = "RuSKK — skkserv proxy for macSKK: azoo-key-skkserv primary, yaskkserv2 fallback"
 license = "MIT"
