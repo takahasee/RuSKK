@@ -1363,4 +1363,79 @@ async fn test_proxy_okuri_expansion_resolves_youon_tabey() {
     upstream_handle.abort();
 }
 
+/// 送りキー 'e'（例: "つかe"）から "つかえ" を復元し、語幹 "使" が返ることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_okuri_expansion_resolves_tsukae() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with("1つかえ ".as_bytes()) {
+                            let _ = stream.write_all("1/使え/仕え/遣え/支え/\n".as_bytes()).await;
+                        } else if req.starts_with("1つかえる ".as_bytes()) {
+                            let _ = stream.write_all("1/使える/仕える/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "azookey-mock",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // "1つかe " -> "つかえ" から語幹 "使" が抽出される
+    client.write_all("1つかe \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp, "1/使/仕/遣/支/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
 
