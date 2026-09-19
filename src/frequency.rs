@@ -185,10 +185,23 @@ impl FrequencyPredictor {
         self.context_frequencies.get(ctx)
     }
 
+    /// frequencies から見出し語マップを取得する。
+    /// ASCII 大文字を含む場合（例: "てだR"）は小文字化（"てだr"）でも検索を試行する。
+    fn get_freq_map<'a>(&'a self, midashi: &str) -> Option<&'a HashMap<String, u64>> {
+        if let Some(map) = self.frequencies.get(midashi) {
+            return Some(map);
+        }
+        if midashi.bytes().any(|b| b.is_ascii_uppercase()) {
+            let lower = midashi.to_ascii_lowercase();
+            return self.frequencies.get(&lower);
+        }
+        None
+    }
+
     /// 見出し語または現在の文脈に対して、並び替えルールが存在するかを超高速判定する。
     /// これが false の場合、候補のパースや並び替え処理を一切行わずに直結バイパス（完全ゼロコピー）できる。
     pub fn should_rank<S: AsRef<str>>(&self, context: &[S], midashi: &str) -> bool {
-        if self.frequencies.get(midashi).map(|m| !m.is_empty()).unwrap_or(false) {
+        if self.get_freq_map(midashi).map(|m| !m.is_empty()).unwrap_or(false) {
             return true;
         }
         if !context.is_empty() && !self.context_frequencies.is_empty() {
@@ -212,7 +225,7 @@ impl FrequencyPredictor {
             return candidates.to_vec();
         }
 
-        let freq_map = self.frequencies.get(midashi);
+        let freq_map = self.get_freq_map(midashi);
         let has_freq = freq_map.map(|m| !m.is_empty()).unwrap_or(false);
 
         // 文脈マップの取得: RuSKK の文脈は通常直前の確定単語1語（要素数 0 または 1）
@@ -328,18 +341,12 @@ fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>
 /// 全キーのすべてのプレフィックスを生成してスコアを伝播させるため、
 /// 逆方向（短いキーへの長いキーのスコア伝播）も前半ループで網羅される。
 fn expand_inner_aliases(inner: &mut HashMap<String, u64>) {
-    let aliases: Vec<(String, u64)> = inner
-        .iter()
-        .flat_map(|(k, &score)| {
-            // "切る" → "切"、"書き起こす" → "書き起こ" 等、すべての前方プレフィックスを生成。
-            // これにより「切る」→「切」も「書き起こす」→「書き起こ」→「書き起こ」も一括で展開され、
-            // 逆方向ループは不要（かつ Clippy 警告の原因）になるため削除。
-            k.char_indices()
-                .skip(1)
-                .map(|(idx, _)| (k[..idx].to_string(), score))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut aliases = Vec::new();
+    for (k, &score) in inner.iter() {
+        for (idx, _) in k.char_indices().skip(1) {
+            aliases.push((k[..idx].to_string(), score));
+        }
+    }
 
     for (alias_key, score) in aliases {
         let current = inner.entry(alias_key).or_insert(0);
@@ -617,5 +624,28 @@ mod tests {
         });
         predictor.expand_aliases();
         assert!(predictor.should_rank(&[] as &[String], "あい"));
+    }
+
+    #[test]
+    fn test_tedare_ranking() {
+        let mut predictor = FrequencyPredictor::new(None);
+        predictor.frequencies.insert("てだr".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("手練".to_string(), 2);
+            m.insert("手".to_string(), 2);
+            m
+        });
+        predictor.expand_aliases();
+        let candidates = vec!["手だ", "手練", "て誰", "手足"];
+
+        // 小文字 "てだr" での並び替え
+        assert!(predictor.should_rank(&[] as &[String], "てだr"));
+        let ranked = predictor.rank_candidates_borrowed(&[] as &[&str], "てだr", &candidates);
+        assert_eq!(ranked[0], "手練");
+
+        // 大文字 "てだR" でも小文字正規化によりヒットすること
+        assert!(predictor.should_rank(&[] as &[String], "てだR"));
+        let ranked_upper = predictor.rank_candidates_borrowed(&[] as &[&str], "てだR", &candidates);
+        assert_eq!(ranked_upper[0], "手練");
     }
 }

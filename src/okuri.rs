@@ -257,6 +257,19 @@ pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
     }
 }
 
+/// 見出し語（例: "てだR", "てだ*れ", "かk"）を正規化された小文字の送りあり見出し（例: "てだr", "かk"）に変換する。
+/// 送りありでない場合は元の文字列のスライス借用またはクローンを返す。
+pub fn normalize_okuri_midashi_key(midashi: &str) -> String {
+    if let Some((stem, key)) = parse_okuri_midashi(midashi) {
+        let mut s = String::with_capacity(stem.len() + 1);
+        s.push_str(stem);
+        s.push(key.to_ascii_lowercase());
+        s
+    } else {
+        midashi.to_string()
+    }
+}
+
 /// 照会用の活用形バリエーション
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OkuriVariation {
@@ -375,6 +388,43 @@ pub fn is_kanji(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
 }
 
+/// 抽出された語幹候補が正当か（部分変換の残骸や無意味な平仮名末尾でないか）を判定する。
+/// - 短語幹（かな長 1文字、例: "かk" -> "書", "きr" -> "切"）: 漢字を1文字以上含むこと。
+/// - 複合語幹（かな長 2文字以上、例: "てだr", "みおk", "うけいr"）:
+///   1) 末尾が漢字であること（例: "手練", "見送", "受け入"）。
+///   2) 漢字が2文字以上含まれること（例: "問い合わ", "言い合わ"）。
+///   3) 漢字が1文字以上で、かつ末尾が一段動詞・形容詞の語幹語尾（い段・え段、例: "食べ", "教え", "調べ", "美し"）であること。
+///
+/// ※現代日本語の活用規則上、あ段・う段・お段・んで終わる用言語幹は存在しないため、
+/// 「てだり」->「手だ」（末尾: あ段「だ」）のような未知語の部分変換残骸を確実に排除する。
+#[inline]
+pub fn is_valid_stem(stem: &str, stem_char_count: usize) -> bool {
+    if stem.is_empty() {
+        return false;
+    }
+    if stem_char_count < 2 {
+        return stem.chars().any(is_kanji);
+    }
+    if let Some(last) = stem.chars().last() {
+        if is_kanji(last) {
+            return true;
+        }
+        let kanji_count = stem.chars().filter(|&c| is_kanji(c)).count();
+        if kanji_count >= 2 {
+            return true;
+        }
+        if kanji_count >= 1 {
+            // い段・え段のみ用言語幹（上一段・下一段・形容詞）として許容
+            return matches!(
+                last,
+                'い' | 'き' | 'し' | 'ち' | 'に' | 'ひ' | 'み' | 'り' | 'ぎ' | 'じ' | 'び' | 'ぴ'
+                | 'え' | 'け' | 'せ' | 'て' | 'ね' | 'へ' | 'め' | 'れ' | 'げ' | 'ぜ' | 'で' | 'べ' | 'ぺ'
+            );
+        }
+    }
+    false
+}
+
 /// azooKey が返した活用形候補（例: ["交ぜ書き", "書く", "描く", "交ぜ書"]）から、
 /// 送り仮名（例: "き", "く"）で終わる語幹、またはすでに語幹化されている候補をゼロコピーで抽出する。
 pub fn extract_stem_candidates_borrowed<'a>(
@@ -395,7 +445,7 @@ pub fn extract_stem_candidates_borrowed<'a>(
 
         // 1. 送り仮名（例: "き", "く"）を剥がした語幹（例: "交ぜ書き" -> "交ぜ書", "書く" -> "書"）を抽出
         if let Some(stem) = clean.strip_suffix(okuri_suffix) {
-            if !stem.is_empty() && !stems.contains(&stem) {
+            if is_valid_stem(stem, stem_char_count) && !stems.contains(&stem) {
                 stems.push(stem);
             }
             continue;
@@ -416,8 +466,7 @@ pub fn extract_stem_candidates_borrowed<'a>(
             && stem_char_count >= 2
             && clean_char_count >= 2
             && clean_char_count <= stem_char_count
-            && let Some(last_char) = clean.chars().last()
-            && is_kanji(last_char)
+            && is_valid_stem(clean, stem_char_count)
             && !stems.contains(&clean)
         {
             stems.push(clean);

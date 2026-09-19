@@ -281,9 +281,10 @@ async fn handle_client(
                         }
 
                         let cands_refs: Vec<&str> = merged_cands.iter().map(|s| s.as_str()).collect();
+                        let norm_midashi = crate::okuri::normalize_okuri_midashi_key(&midashi_str);
                         let ranked = {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                            guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &cands_refs)
+                            guard.rank_candidates_borrowed(ctx_ref, &norm_midashi, &cands_refs)
                         };
                         if let Some(&top) = ranked.first() {
                             top_candidate_for_context = Some(top.to_string());
