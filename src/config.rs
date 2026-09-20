@@ -7,7 +7,7 @@ use crate::backend::{Backend, UpstreamEncoding};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "ruskk",
+    name = "ruskkserv",
     about = "skkserv proxy: azoo-key-skkserv first, yaskkserv2 fallback",
     version
 )]
@@ -32,11 +32,11 @@ pub struct Args {
     #[arg(long, default_value_t = 700)]
     pub yaskkserv2_timeout_ms: u64,
 
-    /// 送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKK_OKURI_EXPANSION でも制御可能）
+    /// 送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能）
     #[arg(long, default_value_t = true)]
     pub okuri_expansion: bool,
 
-    /// 直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKK_CONTEXT_RANKING でも制御可能）
+    /// 直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能）
     #[arg(long, default_value_t = true)]
     pub context_ranking: bool,
 
@@ -50,11 +50,11 @@ pub enum Command {
     ImportUserDict {
         /// Path to macSKK user dictionary (e.g., skk-jisyo.utf8)
         path: std::path::PathBuf,
-        /// インポート成功後に実行中の ruskk プロセスに SIGHUP を送りホットリロードを行う
+        /// インポート成功後に実行中の ruskkserv プロセスに SIGHUP を送りホットリロードを行う
         #[arg(long, default_value_t = false)]
         send_reload: bool,
     },
-    /// Initialize or merge default context co-occurrence presets into ~/.ruskk-frequency.json
+    /// Initialize or merge default context co-occurrence presets into ~/.ruskkserv-frequency.json
     InitSeed {
         /// Overwrite completely with presets instead of merging with existing data
         #[arg(long, short)]
@@ -82,11 +82,11 @@ impl Args {
     }
 
     pub fn is_okuri_expansion_enabled(&self) -> bool {
-        parse_bool_env("RUSKK_OKURI_EXPANSION", self.okuri_expansion)
+        parse_bool_env("RUSKKSERV_OKURI_EXPANSION", self.okuri_expansion)
     }
 
     pub fn is_context_ranking_enabled(&self) -> bool {
-        parse_bool_env("RUSKK_CONTEXT_RANKING", self.context_ranking)
+        parse_bool_env("RUSKKSERV_CONTEXT_RANKING", self.context_ranking)
     }
 }
 

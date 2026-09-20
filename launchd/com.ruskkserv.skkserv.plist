@@ -3,15 +3,15 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ruskk.skkserv</string>
+    <string>com.ruskkserv.skkserv</string>
     <key>ProgramArguments</key>
     <array>
         <string>@WAIT_SCRIPT@</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
-        <key>RUSKK_BIN</key>
-        <string>@RUSKK_BIN@</string>
+        <key>RUSKKSERV_BIN</key>
+        <string>@RUSKKSERV_BIN@</string>
         <key>AZOOKEY_HOST</key>
         <string>127.0.0.1</string>
         <key>AZOOKEY_PORT</key>
@@ -21,19 +21,19 @@
         <key>YASKKSERV2_PORT</key>
         <string>1179</string>
         <key>RUST_LOG</key>
-        <string>ruskk=debug,info</string>
-        <key>RUSKK_OKURI_EXPANSION</key>
-        <string>@RUSKK_OKURI_EXPANSION@</string>
-        <key>RUSKK_CONTEXT_RANKING</key>
-        <string>@RUSKK_CONTEXT_RANKING@</string>
+        <string>ruskkserv=debug,info</string>
+        <key>RUSKKSERV_OKURI_EXPANSION</key>
+        <string>@RUSKKSERV_OKURI_EXPANSION@</string>
+        <key>RUSKKSERV_CONTEXT_RANKING</key>
+        <string>@RUSKKSERV_CONTEXT_RANKING@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>@LOG_DIR@/ruskk.log</string>
+    <string>@LOG_DIR@/ruskkserv.log</string>
     <key>StandardErrorPath</key>
-    <string>@LOG_DIR@/ruskk.err.log</string>
+    <string>@LOG_DIR@/ruskkserv.err.log</string>
 </dict>
 </plist>

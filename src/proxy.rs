@@ -37,7 +37,7 @@ struct SharedContextState {
 impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.listen).await?;
-        info!(listen = %self.listen, "ruskk listening");
+        info!(listen = %self.listen, "ruskkserv listening");
         info!(
             primary = %self.primary.name,
             primary_addr = %self.primary.addr,
@@ -143,12 +143,12 @@ async fn handle_client(
                 break;
             }
             Request::Version => {
-                const VERSION_RESP: &[u8] = concat!("ruskk/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
+                const VERSION_RESP: &[u8] = concat!("ruskkserv/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
                 writer.write_all(VERSION_RESP).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Host => {
-                let host = format!("ruskk/{}: ", proxy.listen);
+                let host = format!("ruskkserv/{}: ", proxy.listen);
                 writer.write_all(host.as_bytes()).await?;
                 conn_last_response_time = Some(Instant::now());
             }

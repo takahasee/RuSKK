@@ -5,9 +5,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use ruskk::backend::{Backend, UpstreamEncoding};
-use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
-use ruskk::proxy::Proxy;
+use ruskkserv::backend::{Backend, UpstreamEncoding};
+use ruskkserv::frequency::{FrequencyPredictor, SharedPredictor};
+use ruskkserv::proxy::Proxy;
 
 /// seed データの単語頻度（frequencies）に基づいて候補が並び替えられることをテストする。
 /// upstream は常に「切る/着る」の順で返すが、seed データの単語頻度により
@@ -37,7 +37,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
         }
     });
 
-    // seed データの単語頻度を手動設定（~/.ruskk-frequency.json に相当）
+    // seed データの単語頻度を手動設定（~/.ruskkserv-frequency.json に相当）
     let mut predictor = FrequencyPredictor::new(None);
     predictor.frequencies.insert("KiRu".to_string(), {
         let mut m = HashMap::new();

@@ -5,10 +5,10 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use ruskk::backend::{Backend, UpstreamEncoding};
-use ruskk::encoding::encode_euc_jp;
-use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
-use ruskk::proxy::Proxy;
+use ruskkserv::backend::{Backend, UpstreamEncoding};
+use ruskkserv::encoding::encode_euc_jp;
+use ruskkserv::frequency::{FrequencyPredictor, SharedPredictor};
+use ruskkserv::proxy::Proxy;
 
 #[tokio::test]
 async fn test_yaskkserv2_standalone_seed_ranking() {
@@ -74,7 +74,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
         }
     });
 
-    // 2. Setup FrequencyPredictor seed data (mocking ~/.ruskk-frequency.json)
+    // 2. Setup FrequencyPredictor seed data (mocking ~/.ruskkserv-frequency.json)
     let mut predictor = FrequencyPredictor::new(None);
     predictor.frequencies.insert("きr".to_string(), {
         let mut m = HashMap::new();

@@ -10,7 +10,7 @@ use tracing::debug;
 
 /// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
 /// skkserv プロトコルではユーザーの選択を知る手段がないため、自動学習は行わない。
-/// ユーザーが `~/.ruskk-frequency.json` を手動で編集し、seed データを投入する。
+/// ユーザーが `~/.ruskkserv-frequency.json` を手動で編集し、seed データを投入する。
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct FrequencyPredictor {
     /// 見出し語 → (候補 → 出現回数) のマッピング
@@ -88,7 +88,7 @@ impl FrequencyPredictor {
         Ok(())
     }
 
-    /// seed ファイル（~/.ruskk-frequency.json）を初期化またはマージして保存する。
+    /// seed ファイル（~/.ruskkserv-frequency.json）を初期化またはマージして保存する。
     /// force が true の場合はプリセットで完全上書きし、false の場合は既存データを保持したままマージする。
     pub fn init_seed(&mut self, force: bool) -> anyhow::Result<()> {
         if force {
@@ -210,7 +210,7 @@ impl FrequencyPredictor {
         let freq_map = self.get_freq_map(midashi);
         let has_freq = freq_map.map(|m| !m.is_empty()).unwrap_or(false);
 
-        // 文脈マップの取得: RuSKK の文脈は通常直前の確定単語1語（要素数 0 または 1）
+        // 文脈マップの取得: RuSKKserv の文脈は通常直前の確定単語1語（要素数 0 または 1）
         // 大半のケースで中間 Vec を作らずゼロアロケーションで処理する
         let single_ctx_map = if context.len() == 1 && !self.context_frequencies.is_empty() {
             self.get_context_map(context[0].as_ref())

@@ -5,9 +5,9 @@ use clap::Parser;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use ruskk::config::Args;
-use ruskk::frequency::{FrequencyPredictor, SharedPredictor};
-use ruskk::proxy::Proxy;
+use ruskkserv::config::Args;
+use ruskkserv::frequency::{FrequencyPredictor, SharedPredictor};
+use ruskkserv::proxy::Proxy;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -24,11 +24,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     let history_path = std::env::var("HOME")
         .ok()
-        .map(|h| PathBuf::from(h).join(".ruskk-frequency.json"));
+        .map(|h| PathBuf::from(h).join(".ruskkserv-frequency.json"));
     
     // サブコマンドが指定されている場合は、プロキシを起動せずに処理を実行して終了する
     match args.command {
-        Some(ruskk::config::Command::ImportUserDict { path, send_reload }) => {
+        Some(ruskkserv::config::Command::ImportUserDict { path, send_reload }) => {
             info!("Importing frequencies from {:?}", path);
             let mut predictor = FrequencyPredictor::new(history_path);
             if let Err(e) = predictor.import_from_skk_dict(&path) {
@@ -36,13 +36,13 @@ async fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             info!("Successfully imported frequencies and ensured context presets.");
-            // --send-reload が指定された場合、実行中の ruskk プロセスに SIGHUP を送りホットリロードを行う
+            // --send-reload が指定された場合、実行中の ruskkserv プロセスに SIGHUP を送りホットリロードを行う
             if send_reload {
-                send_sighup_to_ruskk();
+                send_sighup_to_ruskkserv();
             }
             return Ok(());
         }
-        Some(ruskk::config::Command::InitSeed { force }) => {
+        Some(ruskkserv::config::Command::InitSeed { force }) => {
             let mut predictor = FrequencyPredictor::new(history_path.clone());
             if let Err(e) = predictor.init_seed(force) {
                 tracing::error!("Failed to initialize seed file: {}", e);
@@ -80,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // SIGHUP を受け取ったら ~/.ruskk-frequency.json をホットリロードする。
+    // SIGHUP を受け取ったら ~/.ruskkserv-frequency.json をホットリロードする。
     // import-user-dict --send-reload 実行後に predictor を再起動なしで更新するために使用する。
     let reload = reload_on_sighup(Arc::clone(&predictor), history_path);
 
@@ -90,11 +90,11 @@ async fn main() -> anyhow::Result<()> {
         _ = reload => {}
     }
 
-    info!("ruskk shutting down");
+    info!("ruskkserv shutting down");
     Ok(())
 }
 
-/// SIGHUP を受け取るたびに predictor を ~/.ruskk-frequency.json から再ロードする。
+/// SIGHUP を受け取るたびに predictor を ~/.ruskkserv-frequency.json から再ロードする。
 /// このタスクは永久に実行され続け、プロセスが終了するまでシグナルを待ち受ける。
 async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
     use tokio::signal::unix::{signal, SignalKind};
@@ -114,19 +114,19 @@ async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
     }
 }
 
-/// インポート成功後に実行中の ruskk プロセスへ SIGHUP を送る。
+/// インポート成功後に実行中の ruskkserv プロセスへ SIGHUP を送る。
 /// macOS の pkill コマンドを使用する（`-x` で完全一致、誤送信防止）。
-fn send_sighup_to_ruskk() {
+fn send_sighup_to_ruskkserv() {
     match std::process::Command::new("pkill")
-        .args(["-HUP", "-x", "ruskk"])
+        .args(["-HUP", "-x", "ruskkserv"])
         .status()
     {
         Ok(status) if status.success() => {
-            info!("sent SIGHUP to ruskk — predictor hot-reload triggered");
+            info!("sent SIGHUP to ruskkserv — predictor hot-reload triggered");
         }
         Ok(status) => {
-            // 終了コード 1 = プロセスが見つからない（ruskk が起動していない場合）
-            tracing::debug!(%status, "pkill returned non-zero (ruskk may not be running)");
+            // 終了コード 1 = プロセスが見つからない（ruskkserv が起動していない場合）
+            tracing::debug!(%status, "pkill returned non-zero (ruskkserv may not be running)");
         }
         Err(e) => {
             tracing::warn!(error = %e, "failed to run pkill — SIGHUP not sent");

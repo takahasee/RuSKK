@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.ruskk.import-user-dict</string>
+    <string>com.ruskkserv.import-user-dict</string>
 
     <key>ProgramArguments</key>
     <array>

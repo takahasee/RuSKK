@@ -1,10 +1,10 @@
-# RuSKK
+# RuSKKserv
 
 macSKK 向けの高速・インテリジェントな skkserv プロキシサーバーです。  
 [azooKey SKKServ](https://github.com/gitusp/azoo-key-skkserv) を最優先し、見つからない場合のみ [yaskkserv2](https://github.com/wachikun/yaskkserv2)（Google Suggest 連携・統合辞書）にフォールバックします。
 
 ```text
-macSKK  →  RuSKK (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
+macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
                                  →  yaskkserv2 (:1179, Fallback)
 
 ※ 通常の単語は見つからない場合のみ Fallback に照会しますが、送りあり見出しの場合は Primary の活用形復元結果と Fallback の全候補を自動的にマージして返却します。
@@ -40,9 +40,9 @@ macSKK  →  RuSKK (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
   - azooKey（AI推論・日常語・送りあり）にない固有名詞・専門用語・Wikipedia 語は yaskkserv2 巨大辞書から自動補完
 - **見出し語リアルタイム補完（opcode 4）フォワード対応**:
   - 入力途中の推測補完リストを Primary / Fallback からシームレスに macSKK へ提供（Tab キーでの先読み補完）
-- **seed ファイル（`~/.ruskk-frequency.json`）による安全な並び替え**:
+- **seed ファイル（`~/.ruskkserv-frequency.json`）による安全な並び替え**:
   - 手動編集可能な単語頻度（`frequencies`）と文脈共起（`context_frequencies`）に基づき候補を整列
-  - 420 エントリ以上の充実した文脈プリセット（`ruskk init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent）を完備
+  - 420 エントリ以上の充実した文脈プリセット（`ruskkserv init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent）を完備
   - **SIGHUP ホットリロード対応**: 設定ファイル更新や辞書インポート後も、サーバー再起動なしで即座にメモリ上の頻度・文脈共起データを最新化
 - **ゼロコピー・徹底的な超低遅延設計**:
   - 並び替え不要な単語は不要なパース・ヒープ割り当てを完全スキップ（0.01ms 未満のゼロコピー直結転送）
@@ -59,7 +59,7 @@ macSKK  →  RuSKK (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
 SKK では動詞・形容詞の送り仮名の最初の子音/母音をローマ字（または大文字・アスタリスク記法）で入力します（例: `かk` で「書く」、`ねあg` で「値上げ」）。  
 これをそのまま azooKey SKKServ に問い合わせると、「化/家/下/科...」など大量の同音名詞の単漢字が返ってしまい、目的の動詞・複合語が数十番目に埋没してしまいます。また、DDSKK や macSKK のアスタリスク明示（`ねあ*げ`）や大文字キー（`ねあG`）、`交ぜGak` のような複合語では目的の動詞・名詞候補がヒットしません。
 
-RuSKK は DDSKK 仕様および日本語の動詞・形容詞活用体系に準拠し、特定子音のアドホック分岐を排除した体系的な復元と語幹抽出を行います：
+RuSKKserv は DDSKK 仕様および日本語の動詞・形容詞活用体系に準拠し、特定子音のアドホック分岐を排除した体系的な復元と語幹抽出を行います：
 
 1. **全子音の体系的活用合成（大域的展開）**:
    - 語幹文字数が 2 文字以上の見出し語（`char_count >= 2`）を複合語・多音節語として体系化。
@@ -89,12 +89,12 @@ RuSKK は DDSKK 仕様および日本語の動詞・形容詞活用体系に準�
 
 - **CLI / 一時実行**:
   ```sh
-  ruskk --okuri-expansion=false
+  ruskkserv --okuri-expansion=false
   # または
-  RUSKK_OKURI_EXPANSION=0 ./target/release/ruskk
+  RUSKKSERV_OKURI_EXPANSION=0 ./target/release/ruskkserv
   ```
 - **LaunchAgent 運用**:
-  `launchd/config.env` で `RUSKK_OKURI_EXPANSION=0` を設定し、`./scripts/install-launchd.sh install` を実行します。
+  `launchd/config.env` で `RUSKKSERV_OKURI_EXPANSION=0` を設定し、`./scripts/install-launchd.sh install` を実行します。
 
 ---
 
@@ -110,18 +110,18 @@ RuSKK は DDSKK 仕様および日本語の動詞・形容詞活用体系に準�
 ### 文脈連動機能の無効化（ロールバック）
 - **CLI / 一時実行**:
   ```sh
-  ruskk --context-ranking=false
+  ruskkserv --context-ranking=false
   # または
-  RUSKK_CONTEXT_RANKING=0 ./target/release/ruskk
+  RUSKKSERV_CONTEXT_RANKING=0 ./target/release/ruskkserv
   ```
 - **LaunchAgent 運用**:
-  `launchd/config.env` で `RUSKK_CONTEXT_RANKING=0` を設定し、`./scripts/install-launchd.sh install` を実行します。
+  `launchd/config.env` で `RUSKKSERV_CONTEXT_RANKING=0` を設定し、`./scripts/install-launchd.sh install` を実行します。
 
 ---
 
 ## 予測変換と補完の仕組み（3つのレイヤー）
 
-RuSKK の予測変換は、単一のエンジンではなく、以下の **3つの独立したレイヤーが役割分担して連携** することで、高い予測精度と超低遅延を両立しています。
+RuSKKserv の予測変換は、単一のエンジンではなく、以下の **3つの独立したレイヤーが役割分担して連携** することで、高い予測精度と超低遅延を両立しています。
 
 ```text
 macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ Primary/Fallback 透過照会 ──→ Tab 先読み補完
@@ -136,15 +136,15 @@ macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ Primary/Fallback 透過照�
 - ユーザーは `Tab` キーを押すだけで、長い単語を最後まで打たずに先読み確定できます。
 - **補完連射ガード**: macSKK がキー入力中に送信する 50ms 未満の機械的スキャンは文脈登録から自動除外されるため、タイピング途中の文字で文脈が誤って上書きされることはありません。
 
-### レイヤー 2: 直前確定単語に基づく文脈連動候補昇格（RuSKK 独自実装）
+### レイヤー 2: 直前確定単語に基づく文脈連動候補昇格（RuSKKserv 独自実装）
 - セッション内で直前に確定された単語（漢字を含む単語）を 60 秒間記憶。
-- `~/.ruskk-frequency.json` の共起辞書（`context_frequencies`）に基づき、候補スコアに重み付け加算（$\text{Context Score} \times 10$）。
+- `~/.ruskkserv-frequency.json` の共起辞書（`context_frequencies`）に基づき、候補スコアに重み付け加算（$\text{Context Score} \times 10$）。
 - 「服」の直後の「きr」は「着る（着）」、「肉」の直後なら「切る（切）」が自動的に第1候補へ昇格します。
 - skkserv プロトコルにはユーザーの最終選択通知が存在しないため、勝手な自動学習による誤爆を排除し、手動定義・確定プリセットのみに基づくクリーンな挙動を保証します。
 
 ### レイヤー 3: azooKey 言語モデル予測と活用形マージの融合
 - Primary の `azooKey skkserv.app` は、統計的言語モデルによる高精度な現代語・複合語予測変換エンジンを内蔵しています。
-- RuSKK は SKK の送りあり見出しを全活用形（終止形・連用形・下一段形）に展開して azooKey に照会し、得られた語幹候補を重複排除マージすることで、azooKey 本来の予測変換力を 100% 引き出します。
+- RuSKKserv は SKK の送りあり見出しを全活用形（終止形・連用形・下一段形）に展開して azooKey に照会し、得られた語幹候補を重複排除マージすることで、azooKey 本来の予測変換力を 100% 引き出します。
 
 ### パフォーマンス設計（ゼロコピー・O(1)・SIMD 最適化）
 - **ゼロコピー・ファストパス**: 並び替えルール（文脈共起や個別頻度）が存在しない大部分の通常単語では、候補リストの文字列パースやヒープ割り当てを完全にスキップし、バックエンドからのバイト列をクライアントへ直結転送（**0.01ms 未満**）します。
@@ -158,11 +158,11 @@ macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ Primary/Fallback 透過照�
 
 ---
 
-## 候補の並び替えと Seed ファイル (`~/.ruskk-frequency.json`)
+## 候補の並び替えと Seed ファイル (`~/.ruskkserv-frequency.json`)
 
-RuSKK は自動学習を行わず、ユーザーが手動で編集・確認できる読み取り専用の seed ファイル (`~/.ruskk-frequency.json`) を使って候補を安全に並び替えます。
+RuSKKserv は自動学習を行わず、ユーザーが手動で編集・確認できる読み取り専用の seed ファイル (`~/.ruskkserv-frequency.json`) を使って候補を安全に並び替えます。
 
-`~/.ruskk-frequency.json` 例:
+`~/.ruskkserv-frequency.json` 例:
 ```json
 {
   "frequencies": {
@@ -184,46 +184,46 @@ RuSKK は自動学習を行わず、ユーザーが手動で編集・確認で�
 
 ```sh
 # 既存の個人頻度データを保持したまま、文脈プリセットをマージ
-ruskk init-seed
+ruskkserv init-seed
 
 # 完全にプリセットの初期状態に戻す場合
-ruskk init-seed --force
+ruskkserv init-seed --force
 ```
 
 ### SIGHUP によるホットリロード
-RuSKK プロセスは `SIGHUP` シグナルを受信すると、プロキシ接続やサービスを中断することなく `~/.ruskk-frequency.json` を再読み込みし、最新の頻度・文脈共起データをインメモリへ即座に反映します。
+RuSKKserv プロセスは `SIGHUP` シグナルを受信すると、プロキシ接続やサービスを中断することなく `~/.ruskkserv-frequency.json` を再読み込みし、最新の頻度・文脈共起データをインメモリへ即座に反映します。
 
 ```sh
-# 実行中の RuSKK に SIGHUP を送信して設定を即時再読み込み
-pkill -HUP -x ruskk
+# 実行中の RuSKKserv に SIGHUP を送信して設定を即時再読み込み
+pkill -HUP -x ruskkserv
 # または
-kill -HUP $(pgrep -x ruskk)
+kill -HUP $(pgrep -x ruskkserv)
 ```
 
-手動で `~/.ruskk-frequency.json` を編集した際も、サーバーを再起動せずに即座に反映させることができます。
+手動で `~/.ruskkserv-frequency.json` を編集した際も、サーバーを再起動せずに即座に反映させることができます。
 
 ### macSKK ユーザー辞書からの自動インポート
 macSKK のローカル辞書（`skk-jisyo.utf8`）に蓄積されたユーザーの変換履歴を取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます）。
 
 ```sh
 # インポートのみ実行
-ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
+ruskkserv import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
 
-# インポート成功後に実行中の ruskk に自動で SIGHUP を送信して即座にホットリロード
-ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8 --send-reload
+# インポート成功後に実行中の ruskkserv に自動で SIGHUP を送信して即座にホットリロード
+ruskkserv import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8 --send-reload
 ```
 
 #### 1時間ごとの完全自動定期インポート (LaunchAgent)
-`launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、macOS の TCC 権限を恒久保持する専用アプリ `~/Applications/RuSKKImporter.app` が生成され、1時間ごとに自動インポートが実行されます（`--send-reload` 付きで実行されるため、インポート完了と同時に RuSKK へ自動反映されます）。
+`launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、macOS の TCC 権限を恒久保持する専用アプリ `~/Applications/RuSKKservImporter.app` が生成され、1時間ごとに自動インポートが実行されます（`--send-reload` 付きで実行されるため、インポート完了と同時に RuSKKserv へ自動反映されます）。
 
-初回のみ、「システム設定」→「プライバシーとセキュリティ」→「フルディスクアクセス」で `~/Applications/RuSKKImporter.app` を追加・許可してください。
+初回のみ、「システム設定」→「プライバシーとセキュリティ」→「フルディスクアクセス」で `~/Applications/RuSKKservImporter.app` を追加・許可してください。
 
 ---
 
 ## macSKK の推奨設定
 
 ### ① 辞書設定（Fallback 巨大辞書化の推奨）
-macSKK はローカルの「ユーザー辞書」および「追加辞書」を skkserv よりも最優先で表示する仕様があります。ローカル辞書が大量に有効化されていると、RuSKK や azooKey の高精度な文脈予測がローカル辞書の固定順で上書きされてしまいます。
+macSKK はローカルの「ユーザー辞書」および「追加辞書」を skkserv よりも最優先で表示する仕様があります。ローカル辞書が大量に有効化されていると、RuSKKserv や azooKey の高精度な文脈予測がローカル辞書の固定順で上書きされてしまいます。
 
 **推奨構成**:
 - macSKK 側で追加していた静的辞書（`SKK-JISYO.L`, `neologd`, `jawiki`, `hatena` 等）は、`yaskkserv2_make_dictionary` で 1 つの統合バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に集約し、yaskkserv2（:1179）に持たせます。
@@ -232,7 +232,7 @@ macSKK はローカルの「ユーザー辞書」および「追加辞書」を 
 ### ② 補完・予測変換の全体最適設定（プラン A: 誤爆ゼロ・ストレスフリー構成）
 macSKK 内部には、補完候補表示後にホームポジションキー（`ASDFGHJKL`）で候補確定するタイマー機能がありますが、AZIK やローマ字入力の打鍵キーとキー空間が 100% 衝突するため、タイピング途中に「勝手に確定される」「末尾に文字が漏れて誤確定される（例: すずきせいじゅんあ）」といった誤爆が原理的に発生します。また、ピリオド（`.`）確定も AZIK の句点打鍵と衝突します。
 
-RuSKK の真骨頂である **「文脈連動候補昇格」**（「肉」→「切る」、「服」→「着る」）や **「送りあり活用形復元」** は、SKK 本来の **「通常入力 ＋ Space 変換」** で 0ms・誤爆ゼロ・最高精度で動作します。
+RuSKKserv の真骨頂である **「文脈連動候補昇格」**（「肉」→「切る」、「服」→「着る」）や **「送りあり活用形復元」** は、SKK 本来の **「通常入力 ＋ Space 変換」** で 0ms・誤爆ゼロ・最高精度で動作します。
 
 このため、衝突を起こすタイマー機能とピリオド確定を無効化し、ストレスフリーで最速のタイピング環境を構築する**プラン A（SKK 王道・誤爆ゼロ構成）**を推奨します：
 
@@ -248,7 +248,7 @@ killall macSKK
 ```
 
 **操作方法**:
-- **基本の入力（高精度変換）**: 通常どおり見出し語を入力して **`Space`** を押すだけで、RuSKK と azooKey による文脈予測・活用形復元が適用された候補が一発変換されます。
+- **基本の入力（高精度変換）**: 通常どおり見出し語を入力して **`Space`** を押すだけで、RuSKKserv と azooKey による文脈予測・活用形復元が適用された候補が一発変換されます。
 - **長い単語の補完**: 見出し語を途中まで入力した状態で **`Tab`** キーを押すと、補完候補の選択モードに入ります。次候補送りも **`Tab`**（戻すのは `Shift-Tab`）、確定は **`Enter`** です（※macSKK の仕様上、補完選択中の `Space` は動作しません）。
 
 ---
@@ -257,12 +257,12 @@ killall macSKK
 
 ### ビルド
 ```sh
-cargo build --release  # ./target/release/ruskk
+cargo build --release  # ./target/release/ruskkserv
 cargo test             # 全 43 件のテスト合格を確認（ユニット・結合テスト）
 ```
 
 ### LaunchAgent による常駐運用
-macOS ログイン時に yaskkserv2 および RuSKK を自動起動します（azooKey SKKServ は macOS アプリ側で自動起動します）。
+macOS ログイン時に yaskkserv2 および RuSKKserv を自動起動します（azooKey SKKServ は macOS アプリ側で自動起動します）。
 
 ```sh
 # 1. 設定ファイルを作成・編集
@@ -279,19 +279,19 @@ cp launchd/config.env.example launchd/config.env
 ```
 
 ログファイル:
-- RuSKK 本体ログ: `~/Library/Logs/ruskk/ruskk.log`
-- 定期インポートログ: `~/Library/Logs/ruskk/import.log`
+- RuSKKserv 本体ログ: `~/Library/Logs/ruskkserv/ruskkserv.log`
+- 定期インポートログ: `~/Library/Logs/ruskkserv/import.log`
 
 ---
 
 ## CLI オプション一覧
 
 ```text
-Usage: ruskk [OPTIONS] [COMMAND]
+Usage: ruskkserv [OPTIONS] [COMMAND]
 
 Commands:
   import-user-dict  macSKK ユーザー辞書から頻度データをインポート
-  init-seed         ~/.ruskk-frequency.json に文脈共起プリセットを初期化/マージ
+  init-seed         ~/.ruskkserv-frequency.json に文脈共起プリセットを初期化/マージ
   help              ヘルプ表示
 
 Options:
@@ -300,18 +300,18 @@ Options:
   --yaskkserv2 <YASKKSERV2>              yaskkserv2 のアドレス [default: 127.0.0.1:1179]
   --azookey-timeout-ms <MS>              azooKey 照会のタイムアウト (ms) [default: 1500]
   --yaskkserv2-timeout-ms <MS>           yaskkserv2 照会のタイムアウト (ms) [default: 700]
-  --okuri-expansion                      送りあり見出し活用形復元 [default: true] [env: RUSKK_OKURI_EXPANSION]
-  --context-ranking                      直前確定単語に基づく文脈共起並び替え [default: true] [env: RUSKK_CONTEXT_RANKING]
+  --okuri-expansion                      送りあり見出し活用形復元 [default: true] [env: RUSKKSERV_OKURI_EXPANSION]
+  --context-ranking                      直前確定単語に基づく文脈共起並び替え [default: true] [env: RUSKKSERV_CONTEXT_RANKING]
   -h, --help                             ヘルプ表示
   -V, --version                          バージョン表示
 
 Subcommand: import-user-dict
-Usage: ruskk import-user-dict [OPTIONS] <PATH>
+Usage: ruskkserv import-user-dict [OPTIONS] <PATH>
   <PATH>                                 macSKK ユーザー辞書パス (skk-jisyo.utf8)
-  --send-reload                          インポート成功後に実行中の ruskk プロセスへ SIGHUP を送信しホットリロード
+  --send-reload                          インポート成功後に実行中の ruskkserv プロセスへ SIGHUP を送信しホットリロード
 
 Subcommand: init-seed
-Usage: ruskk init-seed [OPTIONS]
+Usage: ruskkserv init-seed [OPTIONS]
   -f, --force                            既存データをマージせずプリセットで完全上書き
 ```
 
@@ -323,6 +323,6 @@ Usage: ruskk init-seed [OPTIONS]
 | :---: | :--- | :--- |
 | `0` | 切断 | セッション終了 |
 | `1` | 変換照会 | 送りあり復元 → azooKey 照会 → yaskkserv2 フォールバック → 文脈・頻度整列 |
-| `2` | バージョン | `ruskk/<VERSION> ` を返却 |
+| `2` | バージョン | `ruskkserv/<VERSION> ` を返却 |
 | `3` | ホスト情報 | ホスト情報を返却 |
 | `4` | 補完照会 | azooKey / yaskkserv2 に照会して見出し補完リストを返却（文脈保留には影響しない） |

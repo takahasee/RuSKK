@@ -20,10 +20,10 @@ expand_path() {
   esac
 }
 
-RUSKK_BIN="$(expand_path "${RUSKK_BIN:-${SKK_PROXY_BIN:-}}")"
+RUSKKSERV_BIN="$(expand_path "${RUSKKSERV_BIN:-${SKK_PROXY_BIN:-}}")"
 MACSKK_USER_DICT_PATH="$(expand_path "${MACSKK_USER_DICT_PATH:-}")"
 
-APP_DIR="${HOME}/Applications/RuSKKImporter.app"
+APP_DIR="${HOME}/Applications/RuSKKservImporter.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
 MACOS_DIR="${CONTENTS_DIR}/MacOS"
 
@@ -36,11 +36,11 @@ cat <<EOF >"${CONTENTS_DIR}/Info.plist"
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.ruskk.importer</string>
+    <string>com.ruskkserv.importer</string>
     <key>CFBundleName</key>
-    <string>RuSKKImporter</string>
+    <string>RuSKKservImporter</string>
     <key>CFBundleExecutable</key>
-    <string>RuSKKImporter</string>
+    <string>RuSKKservImporter</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -54,16 +54,16 @@ cat <<EOF >"${CONTENTS_DIR}/Info.plist"
 EOF
 
 # Binary copy
-if [ ! -x "$RUSKK_BIN" ]; then
-  echo "error: ${RUSKK_BIN} が見つかりません。先に cargo build --release を実行してください。" >&2
+if [ ! -x "$RUSKKSERV_BIN" ]; then
+  echo "error: ${RUSKKSERV_BIN} が見つかりません。先に cargo build --release を実行してください。" >&2
   exit 1
 fi
 
-cp -p "$RUSKK_BIN" "${MACOS_DIR}/RuSKKImporter"
-chmod +x "${MACOS_DIR}/RuSKKImporter"
+cp -p "$RUSKKSERV_BIN" "${MACOS_DIR}/RuSKKservImporter"
+chmod +x "${MACOS_DIR}/RuSKKservImporter"
 
 # アプリバンドルとして固定署名 (Identifier を固定し、Designated Requirement を固定することで再コンパイル後も TCC 権限を維持)
-codesign --force --deep --sign - --identifier "com.ruskk.importer" -r='designated => identifier "com.ruskk.importer"' "$APP_DIR"
+codesign --force --deep --sign - --identifier "com.ruskkserv.importer" -r='designated => identifier "com.ruskkserv.importer"' "$APP_DIR"
 
-echo "Successfully built RuSKKImporter.app at ${APP_DIR}"
+echo "Successfully built RuSKKservImporter.app at ${APP_DIR}"
 

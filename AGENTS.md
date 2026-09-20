@@ -1,4 +1,4 @@
-# RuSKK プロジェクト知識・コンテキスト (AGENTS.md)
+# RuSKKserv プロジェクト知識・コンテキスト (AGENTS.md)
 
 本ドキュメントは、AI アシスタントがセッションを跨いでプロジェクトの設計方針・実装経緯（メモリ）を保持するための定義ファイルです。
 
@@ -6,9 +6,9 @@
 
 ## 1. プロジェクト概要
 
-- **名称**: RuSKK（旧称: `skk-proxy`）
-- **バイナリ / クレート名**: `ruskk`
-- **リポジトリ**: [GitHub: takahasee/RuSKK](https://github.com/takahasee/RuSKK)
+- **名称**: RuSKKserv（旧称: `skk-proxy`）
+- **バイナリ / クレート名**: `ruskkserv`
+- **リポジトリ**: [GitHub: takahasee/RuSKKserv](https://github.com/takahasee/RuSKKserv)
 - **目的**: macSKK 向けの高速・インテリジェントな skkserv プロキシサーバー。
   - **Primary**: `azoo-key-skkserv` (`127.0.0.1:1180`, UTF-8)
   - **Fallback**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, Google Suggest 連携)
@@ -25,25 +25,25 @@
   - 見出し語を EUC-JP にエンコードして送信、返却結果（EUC-JP）を UTF-8 にデコード（`UpstreamEncoding::EucJp`）。
 
 ### ② 手動単語頻度（`frequencies`）と文脈共起（`context_frequencies`）による候補整列
-- 候補の並び替えは、**手動で編集する seed ファイル (`~/.ruskk-frequency.json`)** に登録された単語頻度（`frequencies`）および文脈共起（`context_frequencies`）に基づいて行われます。
+- 候補の並び替えは、**手動で編集する seed ファイル (`~/.ruskkserv-frequency.json`)** に登録された単語頻度（`frequencies`）および文脈共起（`context_frequencies`）に基づいて行われます。
 - 補完リクエスト（opcode 4）が無効化されているため、サーバー側で文脈を参照しても macSKK 側で勝手な自動確定（`addFixedText`）が起きる心配は一切ありません。
-- **SIGHUP ホットリロード**: `ruskk` プロセスが SIGHUP を受信すると、`~/.ruskk-frequency.json` を再起動なしで即座に再読み込みする（`src/main.rs: reload_on_sighup()`）。`import-user-dict --send-reload` 実行後に自動で predictor が更新される。
+- **SIGHUP ホットリロード**: `ruskkserv` プロセスが SIGHUP を受信すると、`~/.ruskkserv-frequency.json` を再起動なしで即座に再読み込みする（`src/main.rs: reload_on_sighup()`）。`import-user-dict --send-reload` 実行後に自動で predictor が更新される。
 
 ### ③ 補完フォワード機能（`Request::Completion` / opcode 4）
 - **仕様 (`src/proxy.rs`)**:
   - macSKK からの補完リクエスト（opcode 4）を Primary (`azoo-key-skkserv`) / Fallback (`yaskkserv2`) へ照会し、返却された見出し語補完（`1/.../\n`）を macSKK へ返却します。
   - 補完は入力途中の推測であるため、文脈連動の確定判定（`pending_context` の昇格・更新）は行いません。
-  - macSKK のローカル辞書（ユーザー辞書や静的辞書）が空の場合でも、RuSKK（azooKey）から見出し補完がシームレスに提供されます。
+  - macSKK のローカル辞書（ユーザー辞書や静的辞書）が空の場合でも、RuSKKserv（azooKey）から見出し補完がシームレスに提供されます。
 - **macSKK 側の補完最適設定（プラン A: 誤爆ゼロ・ストレスフリー構成）**:
   - `completionConfirmationTimeLimit -int 86400000`（24 Hours）でホームポジション打鍵（`ASDFGHJKL`）による勝手な誤確定・文字漏れ（「すずきせいじゅんあ」等）を 100% 根絶。
   - `fixedCompletionByPeriod -int 0` により、AZIK の句点打鍵との衝突を根絶。
   - 補完は `Tab` キーで選択・巡回し、`Enter` で確定（macSKK 公式仕様準拠。※macSKK 内部で補完選択中の Space は未実装 `TODO` で握り潰されているため、通常の変換は SKK 王道の「見出し語 ＋ Space」で行う）。
 
 ### ④ Seed データファイルとプリセット
-- パス: `~/.ruskk-frequency.json`
-- 互換性: 読み取り専用の JSON ファイルとして扱われ、RuSKK プロセスからは書き込まれません。ユーザーが任意のエディタで編集して再起動することで反映されます。
+- パス: `~/.ruskkserv-frequency.json`
+- 互換性: 読み取り専用の JSON ファイルとして扱われ、RuSKKserv プロセスからは書き込まれません。ユーザーが任意のエディタで編集して再起動することで反映されます。
 - **ホットリロード**: SIGHUP シグナルを受信すると再起動不要で即座に再読み込みされます（`import-user-dict --send-reload` が自動的に SIGHUP を送信）。
-- 組み込みプリセット: `data/default-seed.json`（`ruskk init-seed` で既存データを維持したままマージ可能）。
+- 組み込みプリセット: `data/default-seed.json`（`ruskkserv init-seed` で既存データを維持したままマージ可能）。
   - `context_frequencies` は約 420 エントリ（着る/切る/伐る/斬る、計る/測る/量る/図る/謀る/諮る、観る/診る/看る、乗る/載る/撮る/採る/捕る、建てる/立てる、書く/描く、造る/創る/作る、飲む/打つ/受ける/通す/取る、炊く/炒める/焼く/煮る/揚げる、開く/開ける/閉める/消す/点ける/敷く、送る/贈る/残す/返す/進める、確認する/変更する/修正する/削除する/追加する、備える/払う/張る等、日常・ビジネス・法律・医療・料理・IT・農業・教育・音楽・スポーツ・自然など幅広いドメイン）をカバー。
 
 ### ⑤ 送りあり見出し（動詞・形容詞・複合語）の活用形復元・語幹抽出と即時ロールバックスイッチ
@@ -61,9 +61,9 @@
      元の見出し語による Fallback (yaskkserv2) 照会は末尾にマージされるため、辞書固有語も漏れなく提供。
 - **即時ロールバック（安全機能）**:
   - 何か問題があった場合、再ビルドなしで即座に元の動作へ戻せます。
-  - **CLI**: `ruskk --okuri-expansion=false`
-  - **環境変数**: `RUSKK_OKURI_EXPANSION=0`
-  - **LaunchAgent**: `launchd/config.env` で `RUSKK_OKURI_EXPANSION=0` を指定し `./scripts/install-launchd.sh install`。
+  - **CLI**: `ruskkserv --okuri-expansion=false`
+  - **環境変数**: `RUSKKSERV_OKURI_EXPANSION=0`
+  - **LaunchAgent**: `launchd/config.env` で `RUSKKSERV_OKURI_EXPANSION=0` を指定し `./scripts/install-launchd.sh install`。
 
 ### ⑥ 直前確定単語に基づく文脈連動候補昇格と即時ロールバックスイッチ
 - **背景**: 「肉」を入力した直後に「きr」を打った場合は「切る（切）」、「服」の直後なら「着る（着）」、「木」の直後なら「伐る（伐）」を第1候補に昇格させたいという自然な日本語入力の要求に応える機能。
@@ -73,14 +73,14 @@
   3. `rank_candidates(&session_context, ...)` を呼び出し、`context_frequencies` に基づき候補スコアを加算して並び替え。
   4. 補完（opcode 4）は常に `4\n` を返すため、勝手な自動確定（`addFixedText`）は一切起きず、確定は常にユーザーの手動 Space キーによって行われます。
 - **即時ロールバック（安全機能）**:
-  - **CLI**: `ruskk --context-ranking=false`
-  - **環境変数**: `RUSKK_CONTEXT_RANKING=0`
-  - **LaunchAgent**: `launchd/config.env` で `RUSKK_CONTEXT_RANKING=0` を指定し `./scripts/install-launchd.sh install`。
+  - **CLI**: `ruskkserv --context-ranking=false`
+  - **環境変数**: `RUSKKSERV_CONTEXT_RANKING=0`
+  - **LaunchAgent**: `launchd/config.env` で `RUSKKSERV_CONTEXT_RANKING=0` を指定し `./scripts/install-launchd.sh install`。
 ### ⑦ macSKK ローカル辞書の yaskkserv2 統合（Fallback 巨大辞書化）
-- **背景**: macSKK はローカルの「ユーザー辞書」および「追加辞書（`dictionaries`）」を skkserv よりも最優先で上位に表示する仕様があり、ローカル辞書が有効だと RuSKK / azooKey の賢い文脈予測や活用形復元がローカル辞書の候補によって上書きされてしまう問題がありました。
+- **背景**: macSKK はローカルの「ユーザー辞書」および「追加辞書（`dictionaries`）」を skkserv よりも最優先で上位に表示する仕様があり、ローカル辞書が有効だと RuSKKserv / azooKey の賢い文脈予測や活用形復元がローカル辞書の候補によって上書きされてしまう問題がありました。
 - **解決構成**:
   - macSKK 側で有効化されていた静的辞書群（`SKK-JISYO.all`, `neologd`, `hatena`, `jawiki`, `emoji-ja`, `itaiji`）およびユーザーの過去登録辞書（`skk-jisyo.utf8`）を `yaskkserv2_make_dictionary` で 1 つの 52MB バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に一括統合。
-  - macSKK の `dictionaries` 設定はすべて `enabled = 0` に無効化。macSKK はすべての照会を RuSKK (`127.0.0.1:1178`) 経由でのみ行う。
+  - macSKK の `dictionaries` 設定はすべて `enabled = 0` に無効化。macSKK はすべての照会を RuSKKserv (`127.0.0.1:1178`) 経由でのみ行う。
   - 日常語・動詞・文脈共起は Primary（azooKey）が最優先で返却し、azooKey にない固有名詞・専門用語・ユーザー登録語は Fallback（yaskkserv2）から自動的に補完される。
 
 ### ⑧ ゼロコピー・O(1)・SIMD 最適化と徹底的な低遅延設計
@@ -112,24 +112,24 @@
 
 - **設定ファイル**: `launchd/config.env`
 - **Plist**:
-  - `launchd/com.ruskk.skkserv.plist`（サービス名: `com.ruskk.skkserv`）
-  - `launchd/com.ruskk.yaskkserv2.plist`（サービス名: `com.ruskk.yaskkserv2`）
-  - `launchd/com.ruskk.import-user-dict.plist`（サービス名: `com.ruskk.import-user-dict`）
+  - `launchd/com.ruskkserv.skkserv.plist`（サービス名: `com.ruskkserv.skkserv`）
+  - `launchd/com.ruskkserv.yaskkserv2.plist`（サービス名: `com.ruskkserv.yaskkserv2`）
+  - `launchd/com.ruskkserv.import-user-dict.plist`（サービス名: `com.ruskkserv.import-user-dict`）
 - **管理スクリプト**:
   - `scripts/install-launchd.sh [install|uninstall|status]`
-  - `scripts/build-importer-app.sh`: macOS TCC（フルディスクアクセス）を恒久化するため、Bundle ID（`com.ruskk.importer`）を持つ `~/Applications/RuSKKImporter.app` を生成・署名。
+  - `scripts/build-importer-app.sh`: macOS TCC（フルディスクアクセス）を恒久化するため、Bundle ID（`com.ruskkserv.importer`）を持つ `~/Applications/RuSKKservImporter.app` を生成・署名。
 - **起動スクリプト**:
-  - `scripts/wait-and-run-ruskk.sh`: azooKey (:1180) と yaskkserv2 (:1179) の起動待機後に `ruskk` を起動。
+  - `scripts/wait-and-run-ruskkserv.sh`: azooKey (:1180) と yaskkserv2 (:1179) の起動待機後に `ruskkserv` を起動。
 - **ログ**:
-  - `~/Library/Logs/ruskk/ruskk.log`: RuSKK プロキシ本体ログ
-  - `~/Library/Logs/ruskk/import.log`: macSKK 辞書定期インポートログ
+  - `~/Library/Logs/ruskkserv/ruskkserv.log`: RuSKKserv プロキシ本体ログ
+  - `~/Library/Logs/ruskkserv/import.log`: macSKK 辞書定期インポートログ
 
 ---
 
 ## 4. 開発・検証コマンド
 
 ```sh
-cargo build --release  # ./target/release/ruskk
+cargo build --release  # ./target/release/ruskkserv
 cargo test             # ユニットテスト & 結合テスト（全41件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認

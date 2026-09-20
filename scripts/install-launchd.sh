@@ -4,7 +4,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONFIG="${ROOT}/launchd/config.env"
 LAUNCH_AGENTS="${HOME}/Library/LaunchAgents"
-LOG_DIR="${HOME}/Library/Logs/ruskk"
+LOG_DIR="${HOME}/Library/Logs/ruskkserv"
 DOMAIN="gui/$(id -u)"
 
 usage() {
@@ -39,20 +39,20 @@ load_config() {
   # shellcheck disable=SC1090
   . "$CONFIG"
 
-  RUSKK_BIN="${RUSKK_BIN:-${SKK_PROXY_BIN:-}}"
-  : "${RUSKK_BIN:?RUSKK_BIN (or SKK_PROXY_BIN) is required}"
+  RUSKKSERV_BIN="${RUSKKSERV_BIN:-${SKK_PROXY_BIN:-}}"
+  : "${RUSKKSERV_BIN:?RUSKKSERV_BIN (or SKK_PROXY_BIN) is required}"
   : "${YASKKSERV2_BIN:?YASKKSERV2_BIN is required}"
   : "${YASKKSERV2_DICTIONARY:?YASKKSERV2_DICTIONARY is required}"
 
-  RUSKK_BIN="$(expand_path "$RUSKK_BIN")"
+  RUSKKSERV_BIN="$(expand_path "$RUSKKSERV_BIN")"
   YASKKSERV2_BIN="$(expand_path "$YASKKSERV2_BIN")"
   YASKKSERV2_DICTIONARY="$(expand_path "$YASKKSERV2_DICTIONARY")"
-  LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskk}")"
-  WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskk.sh"
-  IMPORTER_APP="${HOME}/Applications/RuSKKImporter.app"
-  IMPORTER_APP_BIN="${IMPORTER_APP}/Contents/MacOS/RuSKKImporter"
-  RUSKK_OKURI_EXPANSION="${RUSKK_OKURI_EXPANSION:-1}"
-  RUSKK_CONTEXT_RANKING="${RUSKK_CONTEXT_RANKING:-1}"
+  LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskkserv}")"
+  WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskkserv.sh"
+  IMPORTER_APP="${HOME}/Applications/RuSKKservImporter.app"
+  IMPORTER_APP_BIN="${IMPORTER_APP}/Contents/MacOS/RuSKKservImporter"
+  RUSKKSERV_OKURI_EXPANSION="${RUSKKSERV_OKURI_EXPANSION:-1}"
+  RUSKKSERV_CONTEXT_RANKING="${RUSKKSERV_CONTEXT_RANKING:-1}"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
@@ -60,7 +60,7 @@ load_config() {
 }
 
 check_binaries() {
-  for bin in "$RUSKK_BIN" "$YASKKSERV2_BIN"; do
+  for bin in "$RUSKKSERV_BIN" "$YASKKSERV2_BIN"; do
     if [ ! -x "$bin" ]; then
       echo "error: 実行ファイルが見つかりません: $bin" >&2
       exit 1
@@ -76,15 +76,15 @@ render_plist() {
   template="$1"
   dest="$2"
   sed \
-    -e "s|@RUSKK_BIN@|${RUSKK_BIN}|g" \
-    -e "s|@SKK_PROXY_BIN@|${RUSKK_BIN}|g" \
+    -e "s|@RUSKKSERV_BIN@|${RUSKKSERV_BIN}|g" \
+    -e "s|@SKK_PROXY_BIN@|${RUSKKSERV_BIN}|g" \
     -e "s|@YASKKSERV2_BIN@|${YASKKSERV2_BIN}|g" \
     -e "s|@YASKKSERV2_DICTIONARY@|${YASKKSERV2_DICTIONARY}|g" \
     -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
     -e "s|@IMPORTER_APP_BIN@|${IMPORTER_APP_BIN}|g" \
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
-    -e "s|@RUSKK_OKURI_EXPANSION@|${RUSKK_OKURI_EXPANSION}|g" \
-    -e "s|@RUSKK_CONTEXT_RANKING@|${RUSKK_CONTEXT_RANKING}|g" \
+    -e "s|@RUSKKSERV_OKURI_EXPANSION@|${RUSKKSERV_OKURI_EXPANSION}|g" \
+    -e "s|@RUSKKSERV_CONTEXT_RANKING@|${RUSKKSERV_CONTEXT_RANKING}|g" \
     -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
     "$template" >"$dest"
 }
@@ -110,31 +110,31 @@ do_install() {
     rm -f "${LAUNCH_AGENTS}/${old_label}.plist"
   done
 
-  render_plist "${ROOT}/launchd/com.ruskk.yaskkserv2.plist" \
-    "${LAUNCH_AGENTS}/com.ruskk.yaskkserv2.plist"
-  render_plist "${ROOT}/launchd/com.ruskk.skkserv.plist" \
-    "${LAUNCH_AGENTS}/com.ruskk.skkserv.plist"
+  render_plist "${ROOT}/launchd/com.ruskkserv.yaskkserv2.plist" \
+    "${LAUNCH_AGENTS}/com.ruskkserv.yaskkserv2.plist"
+  render_plist "${ROOT}/launchd/com.ruskkserv.skkserv.plist" \
+    "${LAUNCH_AGENTS}/com.ruskkserv.skkserv.plist"
 
-  bootout_if_loaded "com.ruskk.yaskkserv2"
-  bootout_if_loaded "com.ruskk.skkserv"
+  bootout_if_loaded "com.ruskkserv.yaskkserv2"
+  bootout_if_loaded "com.ruskkserv.skkserv"
 
-  launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.yaskkserv2.plist"
-  launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.skkserv.plist"
+  launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.yaskkserv2.plist"
+  launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.skkserv.plist"
 
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     "${ROOT}/scripts/build-importer-app.sh"
-    render_plist "${ROOT}/launchd/com.ruskk.import-user-dict.plist" \
-      "${LAUNCH_AGENTS}/com.ruskk.import-user-dict.plist"
-    bootout_if_loaded "com.ruskk.import-user-dict"
-    launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskk.import-user-dict.plist"
+    render_plist "${ROOT}/launchd/com.ruskkserv.import-user-dict.plist" \
+      "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
+    bootout_if_loaded "com.ruskkserv.import-user-dict"
+    launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
   fi
 
   echo "installed. logs: ${LOG_DIR}"
-  echo "  tail -f ${LOG_DIR}/ruskk.log"
+  echo "  tail -f ${LOG_DIR}/ruskkserv.log"
 }
 
 do_uninstall() {
-  for label in com.ruskk.skkserv com.ruskk.yaskkserv2 com.ruskk.import-user-dict com.skkproxy.skkserv com.skkproxy.yaskkserv2 com.skkproxy.azookey; do
+  for label in com.ruskkserv.skkserv com.ruskkserv.yaskkserv2 com.ruskkserv.import-user-dict com.skkproxy.skkserv com.skkproxy.yaskkserv2 com.skkproxy.azookey; do
     bootout_if_loaded "$label"
     rm -f "${LAUNCH_AGENTS}/${label}.plist"
   done
@@ -143,7 +143,7 @@ do_uninstall() {
 }
 
 do_status() {
-  for label in com.ruskk.yaskkserv2 com.ruskk.skkserv com.ruskk.import-user-dict; do
+  for label in com.ruskkserv.yaskkserv2 com.ruskkserv.skkserv com.ruskkserv.import-user-dict; do
     if launchctl print "${DOMAIN}/${label}" >/dev/null 2>&1; then
       echo "${label}: loaded"
     else
