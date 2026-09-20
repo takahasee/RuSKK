@@ -5,6 +5,4 @@
 *.log
 .vscode/
 .idea/
-AGENTS.md
 .Cargo.lock
-CONTEXT.md
