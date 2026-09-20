@@ -10,6 +10,7 @@
         <string>@IMPORTER_APP_BIN@</string>
         <string>import-user-dict</string>
         <string>@MACSKK_USER_DICT_PATH@</string>
+        <string>--send-reload</string>
     </array>
 
     <key>StartInterval</key>

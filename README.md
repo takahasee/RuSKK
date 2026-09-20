@@ -42,7 +42,8 @@ macSKK  →  RuSKK (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
   - 入力途中の推測補完リストを Primary / Fallback からシームレスに macSKK へ提供（Tab キーでの先読み補完）
 - **seed ファイル（`~/.ruskk-frequency.json`）による安全な並び替え**:
   - 手動編集可能な単語頻度（`frequencies`）と文脈共起（`context_frequencies`）に基づき候補を整列
-  - 組み込みプリセット（`ruskk init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent）を完備
+  - 420 エントリ以上の充実した文脈プリセット（`ruskk init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent）を完備
+  - **SIGHUP ホットリロード対応**: 設定ファイル更新や辞書インポート後も、サーバー再起動なしで即座にメモリ上の頻度・文脈共起データを最新化
 - **ゼロコピー・徹底的な超低遅延設計**:
   - 並び替え不要な単語は不要なパース・ヒープ割り当てを完全スキップ（0.01ms 未満のゼロコピー直結転送）
   - seed ロード時エイリアス展開による $O(1)$ 柔軟照合、EUC-JP レスポンスの一括 SIMD デコード、候補整列のゼロアロケーション（PDQsort）を徹底
@@ -177,7 +178,9 @@ RuSKK は自動学習を行わず、ユーザーが手動で編集・確認で�
 ```
 
 ### 文脈共起プリセットの導入 (`init-seed`)
-日本語で頻出する代表的な同音異義語・送りあり動詞のコロケーション（共起ペア）を組み込んだプリセットを、ワンコマンドで安全に導入・マージできます。
+日本語で頻出する代表的な同音異義語・送りあり動詞のコロケーション（共起ペア）を組み込んだプリセット（約420エントリ）を、ワンコマンドで安全に導入・マージできます。
+
+プリセットは日常会話・ビジネス・IT・法律・医療・料理・農業・教育・音楽・スポーツ・自然など幅広い分野を網羅しています（例: 着る/切る/伐る/斬る、計る/測る/量る/図る/謀る/諮る、観る/診る/看る、乗る/載る/撮る/採る/捕る、建てる/立てる、書く/描く、造る/創る/作る、炊く/炒める/焼く/煮る/揚げる、開く/開ける/閉める/消す/点ける/敷く、確認する/変更する/修正する/削除する/追加する、備える/払う/張る等）。
 
 ```sh
 # 既存の個人頻度データを保持したまま、文脈プリセットをマージ
@@ -187,15 +190,31 @@ ruskk init-seed
 ruskk init-seed --force
 ```
 
+### SIGHUP によるホットリロード
+RuSKK プロセスは `SIGHUP` シグナルを受信すると、プロキシ接続やサービスを中断することなく `~/.ruskk-frequency.json` を再読み込みし、最新の頻度・文脈共起データをインメモリへ即座に反映します。
+
+```sh
+# 実行中の RuSKK に SIGHUP を送信して設定を即時再読み込み
+pkill -HUP -x ruskk
+# または
+kill -HUP $(pgrep -x ruskk)
+```
+
+手動で `~/.ruskk-frequency.json` を編集した際も、サーバーを再起動せずに即座に反映させることができます。
+
 ### macSKK ユーザー辞書からの自動インポート
 macSKK のローカル辞書（`skk-jisyo.utf8`）に蓄積されたユーザーの変換履歴を取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます）。
 
 ```sh
+# インポートのみ実行
 ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
+
+# インポート成功後に実行中の ruskk に自動で SIGHUP を送信して即座にホットリロード
+ruskk import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8 --send-reload
 ```
 
 #### 1時間ごとの完全自動定期インポート (LaunchAgent)
-`launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、macOS の TCC 権限を恒久保持する専用アプリ `~/Applications/RuSKKImporter.app` が生成され、1時間ごとに自動インポートが実行されます。
+`launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、macOS の TCC 権限を恒久保持する専用アプリ `~/Applications/RuSKKImporter.app` が生成され、1時間ごとに自動インポートが実行されます（`--send-reload` 付きで実行されるため、インポート完了と同時に RuSKK へ自動反映されます）。
 
 初回のみ、「システム設定」→「プライバシーとセキュリティ」→「フルディスクアクセス」で `~/Applications/RuSKKImporter.app` を追加・許可してください。
 
@@ -239,7 +258,7 @@ killall macSKK
 ### ビルド
 ```sh
 cargo build --release  # ./target/release/ruskk
-cargo test             # 全 41 件のテスト合格を確認（ユニット・結合テスト）
+cargo test             # 全 43 件のテスト合格を確認（ユニット・結合テスト）
 ```
 
 ### LaunchAgent による常駐運用
@@ -281,10 +300,19 @@ Options:
   --yaskkserv2 <YASKKSERV2>              yaskkserv2 のアドレス [default: 127.0.0.1:1179]
   --azookey-timeout-ms <MS>              azooKey 照会のタイムアウト (ms) [default: 1500]
   --yaskkserv2-timeout-ms <MS>           yaskkserv2 照会のタイムアウト (ms) [default: 700]
-  --okuri-expansion <BOOL>               送りあり見出し活用形復元 [default: true] [env: RUSKK_OKURI_EXPANSION]
-  --context-ranking <BOOL>               直前単語に基づく文脈連動候補昇格 [default: true] [env: RUSKK_CONTEXT_RANKING]
+  --okuri-expansion                      送りあり見出し活用形復元 [default: true] [env: RUSKK_OKURI_EXPANSION]
+  --context-ranking                      直前確定単語に基づく文脈共起並び替え [default: true] [env: RUSKK_CONTEXT_RANKING]
   -h, --help                             ヘルプ表示
   -V, --version                          バージョン表示
+
+Subcommand: import-user-dict
+Usage: ruskk import-user-dict [OPTIONS] <PATH>
+  <PATH>                                 macSKK ユーザー辞書パス (skk-jisyo.utf8)
+  --send-reload                          インポート成功後に実行中の ruskk プロセスへ SIGHUP を送信しホットリロード
+
+Subcommand: init-seed
+Usage: ruskk init-seed [OPTIONS]
+  -f, --force                            既存データをマージせずプリセットで完全上書き
 ```
 
 ---

@@ -50,6 +50,9 @@ pub enum Command {
     ImportUserDict {
         /// Path to macSKK user dictionary (e.g., skk-jisyo.utf8)
         path: std::path::PathBuf,
+        /// インポート成功後に実行中の ruskk プロセスに SIGHUP を送りホットリロードを行う
+        #[arg(long, default_value_t = false)]
+        send_reload: bool,
     },
     /// Initialize or merge default context co-occurrence presets into ~/.ruskk-frequency.json
     InitSeed {
