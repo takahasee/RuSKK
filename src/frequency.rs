@@ -7,10 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use tracing::debug;
 
-const LEGACY_HISTORY_FILES: &[&str] = &[
-    ".skk-proxy-frequency.json",
-    ".skk-proxy-bayesian.json",
-];
 
 /// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
 /// skkserv プロトコルではユーザーの選択を知る手段がないため、自動学習は行わない。
@@ -34,7 +30,7 @@ impl FrequencyPredictor {
             storage_path: None,
         };
         if let Some(ref path) = storage_path
-            && let Err(err) = predictor.load_with_legacy_fallback(path)
+            && let Err(err) = predictor.load(path)
         {
             debug!(error = %err, "no existing frequency data loaded, starting fresh");
         }
@@ -42,21 +38,7 @@ impl FrequencyPredictor {
         predictor
     }
 
-    fn load_with_legacy_fallback(&mut self, path: &Path) -> anyhow::Result<()> {
-        if path.exists() {
-            return self.load(path);
-        }
-        if let Some(home) = path.parent() {
-            for legacy_name in LEGACY_HISTORY_FILES {
-                let legacy = home.join(legacy_name);
-                if legacy.exists() {
-                    debug!(from = %legacy.display(), to = %path.display(), "migrating legacy history file");
-                    return self.load(&legacy);
-                }
-            }
-        }
-        Ok(())
-    }
+
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         if !path.as_ref().exists() {

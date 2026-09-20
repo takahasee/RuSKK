@@ -69,31 +69,20 @@ async fn main() -> anyhow::Result<()> {
         context_ranking: args.is_context_ranking_enabled(),
     };
 
-    // SIGTERM / Ctrl-C を受け取ったらプロキシを停止する。
+    // SIGTERM / SIGINT を受け取ったらプロキシを停止する。
     let shutdown = async {
-        #[cfg(unix)]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-            let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
-            tokio::select! {
-                _ = sigterm.recv() => info!("received SIGTERM"),
-                _ = sigint.recv()  => info!("received SIGINT"),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.expect("ctrl-c handler");
-            info!("received Ctrl-C");
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+        let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        tokio::select! {
+            _ = sigterm.recv() => info!("received SIGTERM"),
+            _ = sigint.recv()  => info!("received SIGINT"),
         }
     };
 
     // SIGHUP を受け取ったら ~/.ruskk-frequency.json をホットリロードする。
     // import-user-dict --send-reload 実行後に predictor を再起動なしで更新するために使用する。
-    #[cfg(unix)]
     let reload = reload_on_sighup(Arc::clone(&predictor), history_path);
-    #[cfg(not(unix))]
-    let reload = std::future::pending::<()>();
 
     tokio::select! {
         result = proxy.run() => { result? }
@@ -107,7 +96,6 @@ async fn main() -> anyhow::Result<()> {
 
 /// SIGHUP を受け取るたびに predictor を ~/.ruskk-frequency.json から再ロードする。
 /// このタスクは永久に実行され続け、プロセスが終了するまでシグナルを待ち受ける。
-#[cfg(unix)]
 async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
     use tokio::signal::unix::{signal, SignalKind};
     let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP handler");
