@@ -34,12 +34,14 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
 }
 
 /// レスポンスバイト列から第1候補（最初の / と / の間）をゼロアロケーションで抽出
+/// NEON 128-bit SIMD (`memchr2`) により高速にデリミタを検出する。
+#[inline]
 pub fn extract_first_candidate(response: &[u8]) -> Option<&str> {
     if !response.starts_with(b"1/") {
         return None;
     }
     let rest = &response[2..];
-    let end = rest.iter().position(|&b| b == b'/' || b == b'\n')?;
+    let end = memchr::memchr2(b'/', b'\n', rest)?;
     let first = &rest[..end];
     if first.is_empty() {
         return None;
@@ -48,16 +50,31 @@ pub fn extract_first_candidate(response: &[u8]) -> Option<&str> {
 }
 
 /// レスポンスバイト列から借用スライスの候補リスト（ゼロコピー）を抽出
+/// NEON 128-bit SIMD (`memchr_iter`) によりスラッシュ区切りを一括高速走査する。
+#[inline]
 pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     if !response.starts_with(b"1") {
         return Vec::new();
     }
     let body = response[1..].strip_suffix(b"\n").unwrap_or(&response[1..]);
-    body.split(|&b| b == b'/')
-        .skip(1)
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| std::str::from_utf8(part).ok())
-        .collect()
+    let mut cands = Vec::new();
+    let mut prev = 0;
+    for slash_idx in memchr::memchr_iter(b'/', body) {
+        if slash_idx > prev {
+            let part = &body[prev..slash_idx];
+            if !part.is_empty() && let Ok(s) = std::str::from_utf8(part) {
+                cands.push(s);
+            }
+        }
+        prev = slash_idx + 1;
+    }
+    if prev < body.len() {
+        let part = &body[prev..];
+        if !part.is_empty() && let Ok(s) = std::str::from_utf8(part) {
+            cands.push(s);
+        }
+    }
+    cands
 }
 
 /// レスポンスバイト列から候補リストをパースする。

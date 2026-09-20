@@ -25,7 +25,10 @@ pub struct Proxy {
     pub context_ranking: bool,
 }
 
+/// Apple Silicon (M1〜M4 / A18 Pro) の 128 バイトキャッシュラインに整合させ、
+/// マルチコア並行アクセス時の偽共有（False Sharing）によるキャッシュバウンスをハードウェアレベルでゼロ化
 #[derive(Debug, Default)]
+#[repr(align(128))]
 struct SharedContextState {
     session_context: Option<Arc<str>>,
     pending_context: Option<(String, Arc<str>, Instant)>,

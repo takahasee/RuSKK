@@ -90,14 +90,17 @@ pub fn encode_request_for_encoding(request: &Request<'_>) -> Vec<u8> {
     encode_request_inner(request, true)
 }
 
+#[inline]
 pub fn is_found(response: &[u8]) -> bool {
     response.first() == Some(&b'1')
 }
 
+#[inline]
 fn normalize_midashi(operand: &[u8]) -> &[u8] {
     trim_ascii_whitespace_end(operand)
 }
 
+#[inline]
 fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
     let end = bytes
         .iter()
