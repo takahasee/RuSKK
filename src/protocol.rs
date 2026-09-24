@@ -43,10 +43,10 @@ pub fn parse_request(line: &[u8]) -> Result<Request<'_>, ProtocolError> {
 
     match opcode {
         b'0' => Ok(Request::End),
-        b'1' => Ok(Request::Lookup(normalize_midashi(operand))),
+        b'1' => Ok(Request::Lookup(operand)),
         b'2' => Ok(Request::Version),
         b'3' => Ok(Request::Host),
-        b'4' => Ok(Request::Completion(normalize_midashi(operand))),
+        b'4' => Ok(Request::Completion(operand)),
         other => Err(ProtocolError::UnknownOpcode(other)),
     }
 }
@@ -95,10 +95,6 @@ pub fn is_found(response: &[u8]) -> bool {
     response.first() == Some(&b'1')
 }
 
-#[inline]
-fn normalize_midashi(operand: &[u8]) -> &[u8] {
-    trim_ascii_whitespace_end(operand)
-}
 
 #[inline]
 fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
