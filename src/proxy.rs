@@ -55,14 +55,13 @@ impl Proxy {
             let warmup_primary = proxy.primary.clone();
             tokio::spawn(async move {
                 // 1. 通常変換（Lookup）モデルのウォームアップ
-                let req_lookup = Request::Lookup(b"\xca\xa1"); // EUC-JP "あ"
+                let req_lookup = Request::Lookup("あ".as_bytes());
                 let _ = warmup_primary.query_with_timeout(&req_lookup, Duration::from_secs(3)).await;
 
                 // 2. 補完（Completion）エンジンのウォームアップ（五十音の代表文字を照会してトライ木等をメモリ展開）
-                // EUC-JP: あ(\xca\xa1), か(\xab\xa1), さ(\xbb\xa1), た(\xc2\xa1), な(\xc7\xa1), は(\xce\xa1), ま(\xd1\xa1), や(\xd4\xa1), ら(\xd7\xa1), わ(\xda\xa1)
                 const WARMUP_CHARS: &[&[u8]] = &[
-                    b"\xca\xa1", b"\xab\xa1", b"\xbb\xa1", b"\xc2\xa1", b"\xc7\xa1",
-                    b"\xce\xa1", b"\xd1\xa1", b"\xd4\xa1", b"\xd7\xa1", b"\xda\xa1",
+                    "あ".as_bytes(), "か".as_bytes(), "さ".as_bytes(), "た".as_bytes(), "な".as_bytes(),
+                    "は".as_bytes(), "ま".as_bytes(), "や".as_bytes(), "ら".as_bytes(), "わ".as_bytes(),
                 ];
                 for &kana in WARMUP_CHARS {
                     let req_comp = Request::Completion(kana);
@@ -374,7 +373,7 @@ enum BackendHit {
 }
 
 /// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
-/// 全体デッドライン（950ms）から動的タイムアウトを計算し、macSKK の 1.0秒制限を超えないようにする。
+/// 全体デッドライン（850ms）から動的タイムアウトを計算し、macSKK の 1.0秒制限を超えないようにする。
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
 async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>, BackendHit) {
     let start = Instant::now();

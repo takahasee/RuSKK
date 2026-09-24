@@ -45,9 +45,9 @@ impl FrequencyPredictor {
             return Ok(());
         }
         let data = fs::read_to_string(path)?;
-        let loaded: FrequencyPredictorData = serde_json::from_str(&data)?;
+        let loaded: FrequencyPredictor = serde_json::from_str(&data)?;
         self.frequencies = loaded.frequencies;
-        self.context_frequencies = loaded.context_frequencies.unwrap_or_default();
+        self.context_frequencies = loaded.context_frequencies;
         self.expand_aliases();
         Ok(())
     }
@@ -66,8 +66,8 @@ impl FrequencyPredictor {
     pub const DEFAULT_SEED_JSON: &'static str = include_str!("../data/default-seed.json");
 
     /// 組み込みのデフォルト文脈プリセットをパースして返す。
-    pub fn default_preset_data() -> anyhow::Result<FrequencyPredictorData> {
-        let data: FrequencyPredictorData = serde_json::from_str(Self::DEFAULT_SEED_JSON)?;
+    pub fn default_preset_data() -> anyhow::Result<FrequencyPredictor> {
+        let data: FrequencyPredictor = serde_json::from_str(Self::DEFAULT_SEED_JSON)?;
         Ok(data)
     }
 
@@ -75,13 +75,11 @@ impl FrequencyPredictor {
     /// 既存の frequencies や context_frequencies は維持され、プリセット側の値が追加・更新（最大値）される。
     pub fn merge_default_presets(&mut self) -> anyhow::Result<()> {
         let preset = Self::default_preset_data()?;
-        if let Some(ctx_map) = preset.context_frequencies {
-            for (ctx, cands) in ctx_map {
-                let entry = self.context_frequencies.entry(ctx).or_default();
-                for (cand, count) in cands {
-                    let current = entry.entry(cand).or_insert(0);
-                    *current = (*current).max(count);
-                }
+        for (ctx, cands) in preset.context_frequencies {
+            let entry = self.context_frequencies.entry(ctx).or_default();
+            for (cand, count) in cands {
+                let current = entry.entry(cand).or_insert(0);
+                *current = (*current).max(count);
             }
         }
         self.expand_aliases();
@@ -94,7 +92,7 @@ impl FrequencyPredictor {
         if force {
             let preset = Self::default_preset_data()?;
             self.frequencies = preset.frequencies;
-            self.context_frequencies = preset.context_frequencies.unwrap_or_default();
+            self.context_frequencies = preset.context_frequencies;
             self.expand_aliases();
         } else {
             // merge_default_presets 内で expand_aliases が呼ばれる
@@ -387,12 +385,6 @@ pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
     candidates
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct FrequencyPredictorData {
-    pub frequencies: HashMap<String, HashMap<String, u64>>,
-    #[serde(default)]
-    pub context_frequencies: Option<HashMap<String, HashMap<String, u64>>>,
-}
 
 
 pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
