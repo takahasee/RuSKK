@@ -257,16 +257,18 @@ pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
     }
 }
 
+use std::borrow::Cow;
+
 /// 見出し語（例: "てだR", "てだ*れ", "かk"）を正規化された小文字の送りあり見出し（例: "てだr", "かk"）に変換する。
 /// 送りありでない場合は元の文字列のスライス借用またはクローンを返す。
-pub fn normalize_okuri_midashi_key(midashi: &str) -> String {
+pub fn normalize_okuri_midashi_key(midashi: &str) -> Cow<'_, str> {
     if let Some((stem, key)) = parse_okuri_midashi(midashi) {
         let mut s = String::with_capacity(stem.len() + 1);
         s.push_str(stem);
         s.push(key.to_ascii_lowercase());
-        s
+        Cow::Owned(s)
     } else {
-        midashi.to_string()
+        Cow::Borrowed(midashi)
     }
 }
 

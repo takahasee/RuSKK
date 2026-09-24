@@ -85,11 +85,11 @@ pub fn parse_candidates_unpacked(response: &[u8]) -> Vec<String> {
         return Vec::new();
     }
     let body = response[1..].strip_suffix(b"\n").unwrap_or(&response[1..]);
-    let Ok(body_str) = std::str::from_utf8(body) else {
-        let (cow, _, _) = encoding_rs::EUC_JP.decode(body);
-        return parse_candidates_from_str(&cow);
-    };
-    parse_candidates_from_str(body_str)
+    if let Ok(body_str) = std::str::from_utf8(body) {
+        parse_candidates_from_str(body_str)
+    } else {
+        Vec::new()
+    }
 }
 
 fn parse_candidates_from_str(body_str: &str) -> Vec<String> {
