@@ -176,8 +176,10 @@ macSKK の変換履歴（`skk-jisyo.utf8`）を取り込み、頻度スコアと
 ruskkserv import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8 --send-reload
 ```
 
-#### LaunchAgent による 1 時間ごとの自動定期インポート
+#### LaunchAgent による 1 時間ごとの自動定期インポート（任意）
 `launchd/config.env` に `MACSKK_USER_DICT_PATH` を指定して `./scripts/install-launchd.sh install` を実行すると、macOS の TCC（フルディスクアクセス）を恒久保持する専用アプリ `~/Applications/RuSKKservImporter.app` が生成され、1時間ごとに自動インポート（`--send-reload` 付き）が常駐実行されます。
+
+> **Note**: 「変換履歴の保存を OFF」にする推奨構成では、ユーザー辞書（`skk-jisyo.utf8`）に新たな履歴が蓄積されないため、毎時の定期インポートは不要です（空のままにしておけば常駐タスクは登録されません。手動で単語登録した語彙を取り込みたい場合や、従来の履歴保存運用を続けたい場合のみ設定してください）。
 
 ---
 
