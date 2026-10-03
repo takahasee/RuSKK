@@ -5,5 +5,4 @@
 *.log
 .vscode/
 .idea/
-.Cargo.lock
 backup/
