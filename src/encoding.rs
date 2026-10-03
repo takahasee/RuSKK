@@ -1,5 +1,5 @@
-use std::borrow::Cow;
 use encoding_rs::EUC_JP;
+use std::borrow::Cow;
 
 /// Decode bytes that may be EUC-JP or already UTF-8 into a UTF-8 String or slice.
 /// Returns Cow::Borrowed for UTF-8 bytes to avoid unnecessary heap allocation.
@@ -62,7 +62,9 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     for slash_idx in memchr::memchr_iter(b'/', body) {
         if slash_idx > prev {
             let part = &body[prev..slash_idx];
-            if !part.is_empty() && let Ok(s) = std::str::from_utf8(part) {
+            if !part.is_empty()
+                && let Ok(s) = std::str::from_utf8(part)
+            {
                 cands.push(s);
             }
         }
@@ -70,7 +72,9 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     }
     if prev < body.len() {
         let part = &body[prev..];
-        if !part.is_empty() && let Ok(s) = std::str::from_utf8(part) {
+        if !part.is_empty()
+            && let Ok(s) = std::str::from_utf8(part)
+        {
             cands.push(s);
         }
     }
@@ -142,7 +146,6 @@ pub fn format_candidates_response_str(candidates: &[&str]) -> Vec<u8> {
     out
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,10 +203,7 @@ mod tests {
             extract_first_candidate("1/東京/Tokyo/tokyo/\n".as_bytes()),
             Some("東京")
         );
-        assert_eq!(
-            extract_first_candidate("1/服/\n".as_bytes()),
-            Some("服")
-        );
+        assert_eq!(extract_first_candidate("1/服/\n".as_bytes()), Some("服"));
         assert_eq!(extract_first_candidate(b"4\n"), None);
         assert_eq!(extract_first_candidate(b"1/\n"), None);
     }
@@ -232,4 +232,3 @@ mod tests {
         assert_eq!(unpacked3, vec!["来", "切", "着"]);
     }
 }
-

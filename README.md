@@ -35,14 +35,17 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
   - 「肉」確定後の `きr` → 「切る（切）」が第1候補
   - 「服」確定後の `きr` → 「着る（着）」が第1候補
   - 「木」確定後の `きr` → 「伐る（伐）」が第1候補
-  - 同一接続単位での補完連射ガード（50ms）により、タイピング途中の過渡的照会による文脈汚染を確実に防止
+  - 「時間」確定後の `はかr` → 「計る（計）」、「体重」なら「量る（量）」、「距離」なら「測る（測）」が第1候補
+  - **macSKK 機械的 1 文字 Lookup 自動破棄**: macSKK が ▽ 入力開始時に自動送信する先頭 1 文字の過渡的照会（`き`→`きr`、`に`→`にく`）を入力伸長として検出し、文脈汚染を確実に防止
+  - **組み込みプリセット自動フォールバック**: seed ファイル未作成・データ不在時でも、組み込みの文脈共起データ（800件以上）をメモリ上で自動適用
+  - 同一接続単位での補完連射ガード（50ms）により、タイピング途中の過渡的照会による文脈汚染を二重に防止
 - **高速な順次フォールバック（azooKey → yaskkserv2）**:
   - azooKey（AI推論・日常語・送りあり）にない固有名詞・専門用語・Wikipedia 語は yaskkserv2 巨大辞書から自動補完
 - **見出し語リアルタイム補完（opcode 4）フォワード対応**:
   - 入力途中の推測補完リストを Primary / Fallback からシームレスに macSKK へ提供（Tab キーでの先読み補完）
 - **seed ファイル（`~/.ruskkserv-frequency.json`）による安全な並び替え**:
   - 手動編集可能な単語頻度（`frequencies`）と文脈共起（`context_frequencies`）に基づき候補を整列
-  - 420 エントリ以上の充実した文脈プリセット（`ruskkserv init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent）を完備
+  - 800 件以上の充実した文脈プリセット（`ruskkserv init-seed`）や macSKK ユーザー辞書自動インポート機能（LaunchAgent、冪等スコア更新）を完備
   - **SIGHUP ホットリロード対応**: 設定ファイル更新や辞書インポート後も、サーバー再起動なしで即座にメモリ上の頻度・文脈共起データを最新化
 - **ゼロコピー・徹底的な超低遅延設計**:
   - 並び替え不要な単語は不要なパース・ヒープ割り当てを完全スキップ（0.01ms 未満のゼロコピー直結転送）
@@ -101,11 +104,17 @@ RuSKKserv は DDSKK 仕様および日本語の動詞・形容詞活用体系に
 ## 直前確定単語に基づく文脈連動候補昇格
 
 「肉」を入力した直後に「きr」を打った場合は「切る（切）」、「服」の直後なら「着る（着）」、「木」の直後なら「伐る（伐）」を第1候補に自動昇格させます。
+また、「時間」の直後なら「計る（計）」、「体重」の直後なら「量る（量）」、「距離」の直後なら「測る（測）」など、800組以上の文脈共起ペアを標準サポートしています。
 
 ### 仕組みと安全性
 - クライアント接続ごとに前回の確定単語（漢字を含む単語のみ）を文脈（`session_context`、有効期限60秒）として記憶します。
 - 同一見出し語での次候補送り（Space キー連打）中は保留を維持します。
-- **補完連射ガード**: macSKK がキー入力中に送信する超短時間（50ms未満）の自動補完連射 Lookup は、同一 TCP 接続判定によって文脈登録から自動除外されます。これにより、タイピング過渡状態の文字で確定文脈が誤って上書きされることはありません。
+- **macSKK の機械的 1 文字 Lookup 対策**:
+  - macSKK は ▽ 入力開始時に先頭 1 文字（例: `き`）を機械的に Lookup します。単純に「見出し語が変わった = 直前の単語が確定した」と判定すると、直前の真の確定単語（例:「肉」）がこの過渡的文字（例:「木」「化」）で上書きされてしまいます。
+  - RuSKKserv は新しい見出し語が保留中の見出し語の前方一致伸長（`き`→`きr`、`に`→`にく`）であり、かつ保留見出しの受信回数が 2 未満（未変換）の場合、入力途中の伸長とみなして**文脈昇格せずに安全に破棄**します。これにより、真の確定文脈のみが確実に次の変換に引き継がれます。
+- **補完連射ガード**: macSKK がキー入力中に送信する超短時間（50ms未満）の自動補完連射 Lookup は、同一 TCP 接続判定によって文脈登録から自動除外されます。
+- **組み込みプリセットへの自動フォールバック**:
+  - `~/.ruskkserv-frequency.json` が未作成、または `context_frequencies` が空の場合でも、サーバー起動時および SIGHUP リロード時にバイナリ組み込みのデフォルト文脈プリセットをメモリ上で自動適用します。特別な初期設定なしでも文脈予測が直ちに機能します。
 
 ### 文脈連動機能の無効化（ロールバック）
 - **CLI / 一時実行**:
@@ -205,6 +214,8 @@ kill -HUP $(pgrep -x ruskkserv)
 ### macSKK ユーザー辞書からの自動インポート
 macSKK のローカル辞書（`skk-jisyo.utf8`）に蓄積されたユーザーの変換履歴を取り込むことができます（`context_frequencies` は維持されたまま、`frequencies` のみが更新されます）。
 
+スコアは候補の並び順（上位ほど高得点）に基づき付与されます。定期実行（毎時）でスコアが際限なく膨らんで文脈スコア（$\times 10$）を上回らないよう、**加算ではなく最大値（`max`）で更新する冪等処理**を採用しています。
+
 ```sh
 # インポートのみ実行
 ruskkserv import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Data/Documents/Dictionaries/skk-jisyo.utf8
@@ -222,12 +233,39 @@ ruskkserv import-user-dict ~/Library/Containers/net.mtgto.inputmethod.macSKK/Dat
 
 ## macSKK の推奨設定
 
-### ① 辞書設定（Fallback 巨大辞書化の推奨）
-macSKK はローカルの「ユーザー辞書」および「追加辞書」を skkserv よりも最優先で表示する仕様があります。ローカル辞書が大量に有効化されていると、RuSKKserv や azooKey の高精度な文脈予測がローカル辞書の固定順で上書きされてしまいます。
+### ① 辞書設定と「変換履歴の保存」無効化（最重要）
+
+macSKK は内部仕様（`UserDict+Snapshot.swift`）により、候補の優先順位が以下のように固定されています：
+
+```text
+ユーザー辞書  →  日付変換  →  ファイル辞書  →  skkserv (RuSKKserv)
+```
+同じ単語が重複した場合は先に出てきた位置が優先される（`mergeCandidates`）ため、**ユーザー辞書に存在する見出し語は RuSKKserv の文脈連動昇格が一切反映されなくなります。**
+
+さらに、macSKK の初期設定では **「変換履歴をユーザー辞書に保存（`saveToUserDict = 1`）」が有効** になっています。この状態だと、RuSKKserv の候補を選ぶたびにユーザー辞書へその順序で書き込まれ、次回以降は直前単語にかかわらず過去の選択順が最優先で固定化されてしまいます。
 
 **推奨構成**:
-- macSKK 側で追加していた静的辞書（`SKK-JISYO.L`, `neologd`, `jawiki`, `hatena` 等）は、`yaskkserv2_make_dictionary` で 1 つの統合バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に集約し、yaskkserv2（:1179）に持たせます。
-- macSKK の「辞書」設定画面では、追加辞書をすべて OFF（無効化）にし、SKKServ（`127.0.0.1:1178`、UTF-8）のみを有効にします。
+1. **追加辞書の集約**:
+   - 静的辞書（`SKK-JISYO.L`, `neologd`, `jawiki`, `hatena` 等）は、`yaskkserv2_make_dictionary` で 1 つの統合バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に集約し、yaskkserv2（:1179）に持たせます。
+   - macSKK の「辞書」設定画面では、追加辞書をすべて OFF（無効化）にします。
+2. **変換履歴の保存を OFF に設定**:
+   - **GUI**: macSKK 設定 →「辞書」→「skkserv」を開き、**「Save conversion history to User Dictionary（変換履歴をユーザー辞書に保存）」を OFF** にします。
+   - **CLI**:
+     ```sh
+     python3 -c "
+     import subprocess, plistlib
+     out = subprocess.check_output(['defaults', 'export', 'net.mtgto.inputmethod.macSKK', '-'])
+     d = plistlib.loads(out)
+     d.setdefault('skkserv', {})['saveToUserDict'] = False
+     p = subprocess.Popen(['defaults', 'import', 'net.mtgto.inputmethod.macSKK', '-'], stdin=subprocess.PIPE)
+     p.communicate(plistlib.dumps(d))
+     "
+     pkill -x macSKK
+     ```
+   - ※ オフにした後も、ユーザーが明示的に単語登録した語句は引き続きユーザー辞書に保存され、最優先で表示されます。
+3. **既存ユーザー辞書の整理**:
+   - 蓄積された過去の並び順は `ruskkserv import-user-dict` で `~/.ruskkserv-frequency.json` に取り込みます。
+   - 個別の登録語彙は yaskkserv2 辞書に統合し、`skk-jisyo.utf8` を空ヘッダーにしておくことで、RuSKKserv のインテリジェントな文脈予測が常に 100% 発揮されます。
 
 ### ② 補完・予測変換の全体最適設定（プラン A: 誤爆ゼロ・ストレスフリー構成）
 macSKK 内部には、補完候補表示後にホームポジションキー（`ASDFGHJKL`）で候補確定するタイマー機能がありますが、AZIK やローマ字入力の打鍵キーとキー空間が 100% 衝突するため、タイピング途中に「勝手に確定される」「末尾に文字が漏れて誤確定される（例: すずきせいじゅんあ）」といった誤爆が原理的に発生します。また、ピリオド（`.`）確定も AZIK の句点打鍵と衝突します。
@@ -258,7 +296,7 @@ killall macSKK
 ### ビルド
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # 全 43 件のテスト合格を確認（ユニット・結合テスト）
+cargo test             # 全 46 件のテスト合格を確認（ユニット・結合テスト）
 ```
 
 ### LaunchAgent による常駐運用
@@ -290,29 +328,46 @@ cp launchd/config.env.example launchd/config.env
 Usage: ruskkserv [OPTIONS] [COMMAND]
 
 Commands:
-  import-user-dict  macSKK ユーザー辞書から頻度データをインポート
-  init-seed         ~/.ruskkserv-frequency.json に文脈共起プリセットを初期化/マージ
-  help              ヘルプ表示
+  import-user-dict  Import frequency data from a macSKK user dictionary
+  init-seed         Initialize or merge default context co-occurrence presets into ~/.ruskkserv-frequency.json
+  help              Print this message or the help of the given subcommand(s)
 
 Options:
-  --listen <LISTEN>                      macSKK が接続するアドレス [default: 127.0.0.1:1178]
-  --azookey <AZOOKEY>                    azooKey SKKServ のアドレス [default: 127.0.0.1:1180]
-  --yaskkserv2 <YASKKSERV2>              yaskkserv2 のアドレス [default: 127.0.0.1:1179]
-  --azookey-timeout-ms <MS>              azooKey 照会のタイムアウト (ms) [default: 1500]
-  --yaskkserv2-timeout-ms <MS>           yaskkserv2 照会のタイムアウト (ms) [default: 700]
-  --okuri-expansion                      送りあり見出し活用形復元 [default: true] [env: RUSKKSERV_OKURI_EXPANSION]
-  --context-ranking                      直前確定単語に基づく文脈共起並び替え [default: true] [env: RUSKKSERV_CONTEXT_RANKING]
-  -h, --help                             ヘルプ表示
-  -V, --version                          バージョン表示
+      --listen <LISTEN>
+          Address to listen on (macSKK connects here) [default: 127.0.0.1:1178]
+      --azookey <AZOOKEY>
+          azoo-key-skkserv address (primary) [default: 127.0.0.1:1180]
+      --yaskkserv2 <YASKKSERV2>
+          yaskkserv2 address (fallback) [default: 127.0.0.1:1179]
+      --azookey-timeout-ms <AZOOKEY_TIMEOUT_MS>
+          Timeout for azoo-key-skkserv queries (milliseconds) [default: 1500]
+      --yaskkserv2-timeout-ms <YASKKSERV2_TIMEOUT_MS>
+          Timeout for yaskkserv2 queries (milliseconds) [default: 700]
+      --okuri-expansion
+          送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能）
+      --context-ranking
+          直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能）
+  -h, --help
+          Print help
+  -V, --version
+          Print version
 
 Subcommand: import-user-dict
 Usage: ruskkserv import-user-dict [OPTIONS] <PATH>
-  <PATH>                                 macSKK ユーザー辞書パス (skk-jisyo.utf8)
-  --send-reload                          インポート成功後に実行中の ruskkserv プロセスへ SIGHUP を送信しホットリロード
+
+Arguments:
+  <PATH>  Path to macSKK user dictionary (e.g., skk-jisyo.utf8)
+
+Options:
+      --send-reload  インポート成功後に実行中の ruskkserv プロセスに SIGHUP を送りホットリロードを行う
+  -h, --help         Print help
 
 Subcommand: init-seed
 Usage: ruskkserv init-seed [OPTIONS]
-  -f, --force                            既存データをマージせずプリセットで完全上書き
+
+Options:
+  -f, --force  Overwrite completely with presets instead of merging with existing data
+  -h, --help   Print help
 ```
 
 ---

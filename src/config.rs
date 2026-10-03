@@ -102,4 +102,3 @@ fn parse_bool_env(var: &str, default: bool) -> bool {
     }
     default
 }
-

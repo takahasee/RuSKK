@@ -95,7 +95,6 @@ pub fn is_found(response: &[u8]) -> bool {
     response.first() == Some(&b'1')
 }
 
-
 #[inline]
 fn trim_ascii_whitespace_end(bytes: &[u8]) -> &[u8] {
     let end = bytes
@@ -112,14 +111,8 @@ mod tests {
 
     #[test]
     fn parse_lookup() {
-        assert_eq!(
-            parse_request(b"1ai ").unwrap(),
-            Request::Lookup(b"ai")
-        );
-        assert_eq!(
-            parse_request(b"1ai").unwrap(),
-            Request::Lookup(b"ai")
-        );
+        assert_eq!(parse_request(b"1ai ").unwrap(), Request::Lookup(b"ai"));
+        assert_eq!(parse_request(b"1ai").unwrap(), Request::Lookup(b"ai"));
     }
 
     #[test]

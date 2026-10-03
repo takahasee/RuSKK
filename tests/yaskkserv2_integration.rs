@@ -49,18 +49,27 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
                         if req.starts_with(b"1") {
                             let operand = &req[1..req.len().saturating_sub(1)]; // Strip 1 and trailing LF/space
                             let operand_trimmed = operand.iter().as_slice();
-                            
-                            if operand_trimmed.windows(euc_kiru.len()).any(|w| w == euc_kiru.as_slice())
-                                || operand_trimmed.windows(euc_kiru_full.len()).any(|w| w == euc_kiru_full.as_slice())
-                                || req.starts_with(b"1kiru") || req.starts_with(b"1KiRu")
+
+                            if operand_trimmed
+                                .windows(euc_kiru.len())
+                                .any(|w| w == euc_kiru.as_slice())
+                                || operand_trimmed
+                                    .windows(euc_kiru_full.len())
+                                    .any(|w| w == euc_kiru_full.as_slice())
+                                || req.starts_with(b"1kiru")
+                                || req.starts_with(b"1KiRu")
                             {
                                 // yaskkserv2 ALWAYS returns "切る" first!
                                 let _ = stream.write_all(&euc_resp_kiru).await;
-                            } else if operand_trimmed.windows(euc_fuku.len()).any(|w| w == euc_fuku.as_slice())
+                            } else if operand_trimmed
+                                .windows(euc_fuku.len())
+                                .any(|w| w == euc_fuku.as_slice())
                                 || req.starts_with(b"1fuku")
                             {
                                 let _ = stream.write_all(&euc_resp_fuku).await;
-                            } else if operand_trimmed.windows(euc_niku.len()).any(|w| w == euc_niku.as_slice())
+                            } else if operand_trimmed
+                                .windows(euc_niku.len())
+                                .any(|w| w == euc_niku.as_slice())
                                 || req.starts_with(b"1niku")
                             {
                                 let _ = stream.write_all(&euc_resp_niku).await;

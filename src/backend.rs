@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use tracing::{debug, warn};
 
 use crate::encoding::response_euc_to_utf8;
-use crate::protocol::{encode_request, encode_request_for_encoding, Request};
+use crate::protocol::{Request, encode_request, encode_request_for_encoding};
 
 const MAX_BACKEND_RESPONSE_BYTES: usize = 65536; // 64KB
 
@@ -98,9 +98,7 @@ impl Backend {
                     UpstreamEncoding::Utf8 | UpstreamEncoding::EucJpRequestUtf8Response => {
                         ensure_trailing_newline(raw)
                     }
-                    UpstreamEncoding::EucJp => {
-                        ensure_trailing_newline(response_euc_to_utf8(&raw))
-                    }
+                    UpstreamEncoding::EucJp => ensure_trailing_newline(response_euc_to_utf8(&raw)),
                 };
                 debug!(
                     backend = %self.name,

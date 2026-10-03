@@ -10,7 +10,17 @@ pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
         'k' => &["く", "き", "け", "かった", "くて", "きゃ"], // カ行五段/下一段/形容詞過去 (書く/書き, 受付け, 高かった/高くて, 行かなきゃ)
         's' => &["す", "し", "せ", "した", "して", "しゃ"], // サ行五段/下一段 (話す/話し/話した/話して, 問い合わせ/問合せ, 話しゃ)
         't' => &["った", "って", "て", "つ", "ち"], // タ行五段促音便/下一段 (思った/思って, 待つ/待ち, 割当て/言立て)
-        'n' => &["ない", "なきゃ", "なくちゃ", "ぬ", "ね", "に", "にゃ", "んだ", "んで"], // ナ行五段/下一段/否定 (少ない/行かない/行かなきゃ, 死ぬ/死に/死んだ, 兼ね)
+        'n' => &[
+            "ない",
+            "なきゃ",
+            "なくちゃ",
+            "ぬ",
+            "ね",
+            "に",
+            "にゃ",
+            "んだ",
+            "んで",
+        ], // ナ行五段/下一段/否定 (少ない/行かない/行かなきゃ, 死ぬ/死に/死んだ, 兼ね)
         'm' => &["む", "み", "め", "んだ", "んで", "みゃ", "もう"], // マ行五段/下一段/撥音便 (読む/読み/読んだ/読んで, 読もう, 読みゃ)
         'r' => &["る", "り", "れ", "りゃ", "ろう"], // ラ行五段/一段 (切る/切り/切ろう, 入れ/垂れ, 切りゃ)
         'g' => &["ぐ", "ぎ", "げ", "いだ", "いで", "ぎゃ", "ごう"], // ガ行五段/下一段/イ音便 (泳ぐ/泳ぎ/泳いだ/泳いで, 売上げ, 泳ごう, 泳ぎゃ)
@@ -19,10 +29,28 @@ pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
         'e' => &["え", "える", "う", "えた", "えて", "えば", "えれば"], // 下一段/仮定・命令形/ワ行五段 (使え/教え/考え/答え, 使える/教える, 使う, 使えた, 使えて, 使えば, 考えれば)
         'o' => &["おう", "お", "う", "よう"], // 意志形/オ段 (使おう/思おう/買おう, 使う, 見よう)
         'a' => &["わない", "わ", "う", "ない", "わせる", "われる", "わず"], // 未然形/使役/受身 (使わない/思わない, 使う, 教えない, 使わせる, 使われる, 使わず)
-        'i' => &["い", "う", "く", "け", "かった", "くて", "ければ", "った", "って"], // 形容詞/連用形/促音便 (美しい/美しく/美しかった/美しくて/美しければ, 使い/使う/使った/使って)
+        'i' => &[
+            "い",
+            "う",
+            "く",
+            "け",
+            "かった",
+            "くて",
+            "ければ",
+            "った",
+            "って",
+        ], // 形容詞/連用形/促音便 (美しい/美しく/美しかった/美しくて/美しければ, 使い/使う/使った/使って)
         'd' => &["だ", "で", "んだ", "んで"], // 形容動詞/撥音便 (読んだ/遊んだ)
-        'c' => &["っちゃう", "っちゃった", "ちゃう", "ちゃった", "ちまう", "ちまった", "ち"], // 拗音・促音縮約 (笑っちゃう/思っちゃう/書いちゃう/ちまう)
-        'y' => &["よう", "や", "ゆ"], // 拗音・意志・推量 (食べよう/見よう/始めよう, 言や)
+        'c' => &[
+            "っちゃう",
+            "っちゃった",
+            "ちゃう",
+            "ちゃった",
+            "ちまう",
+            "ちまった",
+            "ち",
+        ], // 拗音・促音縮約 (笑っちゃう/思っちゃう/書いちゃう/ちまう)
+        'y' => &["よう", "や", "ゆ"],         // 拗音・意志・推量 (食べよう/見よう/始めよう, 言や)
         'j' => &["じる", "じ", "じゃう", "じゃった", "じゃ"], // ザ行・拗音 (論じる/信じる/読んじゃう)
         'p' => &["っぽい", "ぽい"], // 半濁音・促音接尾辞 (安っぽい/無理っぽい/理屈っぽい)
         _ => &[],
@@ -134,17 +162,39 @@ pub fn romaji_to_hiragana(romaji: &str) -> Option<&'static str> {
         "nn" => Some("ん"),
 
         // 代表的な拗音
-        "kya" => Some("きゃ"), "kyu" => Some("きゅ"), "kyo" => Some("きょ"),
-        "gya" => Some("ぎゃ"), "gyu" => Some("ぎゅ"), "gyo" => Some("ぎょ"),
-        "sya" | "sha" => Some("しゃ"), "syu" | "shu" => Some("しゅ"), "syo" | "sho" => Some("しょ"),
-        "zya" | "ja" | "jya" => Some("じゃ"), "zyu" | "ju" | "jyu" => Some("じゅ"), "zyo" | "jo" | "jyo" => Some("じょ"),
-        "tya" | "cha" => Some("ちゃ"), "tyu" | "chu" => Some("ちゅ"), "tyo" | "cho" => Some("ちょ"),
-        "nya" => Some("にゃ"), "nyu" => Some("にゅ"), "nyo" => Some("にょ"),
-        "hya" => Some("ひゃ"), "hyu" => Some("ひゅ"), "hyo" => Some("ひょ"),
-        "bya" => Some("びゃ"), "byu" => Some("びゅ"), "byo" => Some("びょ"),
-        "pya" => Some("ぴゃ"), "pyu" => Some("ぴゅ"), "pyo" => Some("ぴょ"),
-        "mya" => Some("みゃ"), "myu" => Some("みゅ"), "myo" => Some("みょ"),
-        "rya" => Some("りゃ"), "ryu" => Some("りゅ"), "ryo" => Some("りょ"),
+        "kya" => Some("きゃ"),
+        "kyu" => Some("きゅ"),
+        "kyo" => Some("きょ"),
+        "gya" => Some("ぎゃ"),
+        "gyu" => Some("ぎゅ"),
+        "gyo" => Some("ぎょ"),
+        "sya" | "sha" => Some("しゃ"),
+        "syu" | "shu" => Some("しゅ"),
+        "syo" | "sho" => Some("しょ"),
+        "zya" | "ja" | "jya" => Some("じゃ"),
+        "zyu" | "ju" | "jyu" => Some("じゅ"),
+        "zyo" | "jo" | "jyo" => Some("じょ"),
+        "tya" | "cha" => Some("ちゃ"),
+        "tyu" | "chu" => Some("ちゅ"),
+        "tyo" | "cho" => Some("ちょ"),
+        "nya" => Some("にゃ"),
+        "nyu" => Some("にゅ"),
+        "nyo" => Some("にょ"),
+        "hya" => Some("ひゃ"),
+        "hyu" => Some("ひゅ"),
+        "hyo" => Some("ひょ"),
+        "bya" => Some("びゃ"),
+        "byu" => Some("びゅ"),
+        "byo" => Some("びょ"),
+        "pya" => Some("ぴゃ"),
+        "pyu" => Some("ぴゅ"),
+        "pyo" => Some("ぴょ"),
+        "mya" => Some("みゃ"),
+        "myu" => Some("みゅ"),
+        "myo" => Some("みょ"),
+        "rya" => Some("りゃ"),
+        "ryu" => Some("りゅ"),
+        "ryo" => Some("りょ"),
 
         // 連濁・複合語頻出（gaki -> がき 等）
         "gaki" => Some("がき"),
@@ -183,10 +233,7 @@ pub enum OkuriMidashi<'a> {
         okuri_key: char,
     },
     /// アスタリスク明示送り仮名（例: "ねあ*げ", "まぜ*がき", "ねあ*g"）
-    Explicit {
-        prefix: &'a str,
-        suffix: &'a str,
-    },
+    Explicit { prefix: &'a str, suffix: &'a str },
 }
 
 /// 送りあり見出し（通常・大文字複合語・アスタリスク明示）を拡張パースする。
@@ -207,7 +254,11 @@ pub fn parse_okuri_midashi_extended(midashi: &str) -> Option<OkuriMidashi<'_>> {
         }
     }
 
-    let alpha_len = midashi.bytes().rev().take_while(|b| b.is_ascii_alphabetic()).count();
+    let alpha_len = midashi
+        .bytes()
+        .rev()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
     if alpha_len == 0 {
         return None;
     }
@@ -249,7 +300,9 @@ pub fn parse_okuri_midashi_extended(midashi: &str) -> Option<OkuriMidashi<'_>> {
 pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
     match parse_okuri_midashi_extended(midashi)? {
         OkuriMidashi::Simple { stem, key } => Some((stem, key)),
-        OkuriMidashi::Compound { prefix, okuri_key, .. } => Some((prefix, okuri_key)),
+        OkuriMidashi::Compound {
+            prefix, okuri_key, ..
+        } => Some((prefix, okuri_key)),
         OkuriMidashi::Explicit { prefix, suffix } => {
             let key = suffix.chars().next()?.to_ascii_lowercase();
             Some((prefix, key))
@@ -286,7 +339,11 @@ pub struct OkuriVariation {
 /// - 複合語・多音節語（語幹 2文字以上、例: "といあわs", "わりあt", "うけつk", "まぜがk", "ねあg", "みおk", "もうしこm", "しらb", "うりきr", "とりあつかw"）:
 ///   全子音（k, s, t, n, m, r, g, b, u/w, d, c, y, j, p）において、下一段・連用形名詞形（"せ", "て", "け", "げ", "れ", "み", "り", "ぎ", "び", "い", "ね", "べ" 等）と
 ///   終止形・促音便・音便をバランスよく均質に照会し、一発で「問合せ」「割当て」「値上げ」「見送り」「受入れ」「申込み」「取扱い」「調べ」等を抽出する。
-fn order_suffixes_for_stem(stem: &str, key: char, default_suffixes: &'static [&'static str]) -> &'static [&'static str] {
+fn order_suffixes_for_stem(
+    stem: &str,
+    key: char,
+    default_suffixes: &'static [&'static str],
+) -> &'static [&'static str] {
     let char_count = stem.chars().count();
     let is_compound = char_count >= 2;
     if !is_compound {
@@ -310,14 +367,14 @@ fn order_suffixes_for_stem(stem: &str, key: char, default_suffixes: &'static [&'
         'b' => &["び", "ぶ", "べ", "んだ", "んで"], // 遊び/飛び (連用形), 遊ぶ/飛ぶ (終止形), 調べ/並べ (下一段), 遊んだ (撥音便)
         'u' | 'w' => &["い", "う", "え", "った", "って"], // 取扱い/思い (連用形), 扱う/思う (終止形), 迎え/訴え (下一段), 思った (促音便)
         'e' => &["え", "える", "う", "えた", "えて", "えれば"], // 使え/教え/考え (下一段名詞/命令), 使える/教える (下一段終止), 使う (五段終止), 考えれば
-        'o' => &["おう", "お", "う", "よう"], // 使おう/思おう
+        'o' => &["おう", "お", "う", "よう"],                   // 使おう/思おう
         'a' => &["わない", "わ", "う", "ない", "わせる", "われる", "わず"], // 使わない/思わない/使わせる
         'i' => &["い", "う", "く", "け", "かった", "くて", "ければ"], // 美しい/美しく/使い/使う
-        'd' => &["で", "だ", "んだ", "んで"], // 読んだ/遊んだ
-        'c' => &["っちゃう", "ちゃう", "ちまう", "ち"], // 笑っちゃう/追っ払っちゃう
-        'y' => &["よう", "や", "ゆ"], // 繰り広げよう/食べよう
-        'j' => &["じ", "じる", "じゃう"], // やり損じ/信じる
-        'p' => &["っぽい", "ぽい"], // 安っぽい/無理っぽい
+        'd' => &["で", "だ", "んだ", "んで"],                         // 読んだ/遊んだ
+        'c' => &["っちゃう", "ちゃう", "ちまう", "ち"],               // 笑っちゃう/追っ払っちゃう
+        'y' => &["よう", "や", "ゆ"],                                 // 繰り広げよう/食べよう
+        'j' => &["じ", "じる", "じゃう"],                             // やり損じ/信じる
+        'p' => &["っぽい", "ぽい"],                                   // 安っぽい/無理っぽい
         _ => default_suffixes,
     }
 }
@@ -347,7 +404,11 @@ pub fn expand_okuri_variations(midashi: &str) -> Vec<OkuriVariation> {
                 okuri_suffix: suffix.to_string(),
             });
         }
-        OkuriMidashi::Compound { prefix, romaji, okuri_key } => {
+        OkuriMidashi::Compound {
+            prefix,
+            romaji,
+            okuri_key,
+        } => {
             if let Some(upper_kana) = romaji_to_hiragana(romaji) {
                 let suffixes = okuri_key_to_suffixes(okuri_key);
                 let mut full_stem = String::with_capacity(prefix.len() + upper_kana.len());
@@ -419,8 +480,30 @@ pub fn is_valid_stem(stem: &str, stem_char_count: usize) -> bool {
             // い段・え段のみ用言語幹（上一段・下一段・形容詞）として許容
             return matches!(
                 last,
-                'い' | 'き' | 'し' | 'ち' | 'に' | 'ひ' | 'み' | 'り' | 'ぎ' | 'じ' | 'び' | 'ぴ'
-                | 'え' | 'け' | 'せ' | 'て' | 'ね' | 'へ' | 'め' | 'れ' | 'げ' | 'ぜ' | 'で' | 'べ' | 'ぺ'
+                'い' | 'き'
+                    | 'し'
+                    | 'ち'
+                    | 'に'
+                    | 'ひ'
+                    | 'み'
+                    | 'り'
+                    | 'ぎ'
+                    | 'じ'
+                    | 'び'
+                    | 'ぴ'
+                    | 'え'
+                    | 'け'
+                    | 'せ'
+                    | 'て'
+                    | 'ね'
+                    | 'へ'
+                    | 'め'
+                    | 'れ'
+                    | 'げ'
+                    | 'ぜ'
+                    | 'で'
+                    | 'べ'
+                    | 'ぺ'
             );
         }
     }
@@ -602,7 +685,11 @@ mod tests {
         // 形容詞過去 "たかk" (TakaK ->atta) -> 終止形 "たかく" に加え "たかかった" も展開
         let vars_takak = expand_okuri_variations("たかk");
         assert!(vars_takak.iter().any(|v| v.query_midashi == "たかく"));
-        assert!(vars_takak.iter().any(|v| v.query_midashi == "たかかった" && v.okuri_suffix == "かった"));
+        assert!(
+            vars_takak
+                .iter()
+                .any(|v| v.query_midashi == "たかかった" && v.okuri_suffix == "かった")
+        );
 
         // 複合語 "ねあg" (NeaG ->e) -> 下一段 "ねあげ" ("げ") が最優先
         let vars_neag = expand_okuri_variations("ねあg");
@@ -631,8 +718,16 @@ mod tests {
 
         // m: "もうしこm" (申込み/申し込む)
         let vars_moushikom = expand_okuri_variations("もうしこm");
-        assert!(vars_moushikom.iter().any(|v| v.query_midashi == "もうしこみ"));
-        assert!(vars_moushikom.iter().any(|v| v.query_midashi == "もうしこむ"));
+        assert!(
+            vars_moushikom
+                .iter()
+                .any(|v| v.query_midashi == "もうしこみ")
+        );
+        assert!(
+            vars_moushikom
+                .iter()
+                .any(|v| v.query_midashi == "もうしこむ")
+        );
 
         // b: "しらb" (調べ/調べる)
         let vars_shirab = expand_okuri_variations("しらb");
@@ -640,8 +735,16 @@ mod tests {
 
         // w: "とりあつかw" (取扱い/取り扱う)
         let vars_toriatsukaw = expand_okuri_variations("とりあつかw");
-        assert!(vars_toriatsukaw.iter().any(|v| v.query_midashi == "とりあつかい"));
-        assert!(vars_toriatsukaw.iter().any(|v| v.query_midashi == "とりあつかう"));
+        assert!(
+            vars_toriatsukaw
+                .iter()
+                .any(|v| v.query_midashi == "とりあつかい")
+        );
+        assert!(
+            vars_toriatsukaw
+                .iter()
+                .any(|v| v.query_midashi == "とりあつかう")
+        );
 
         // e: "つかe" (使え/使える/使う)
         let vars_tsukae = expand_okuri_variations("つかe");
@@ -692,12 +795,14 @@ mod tests {
 
         // "もうしこみ" に対する候補: "申込み", "申込", "申し込み"
         let moushikomi_cands = ["申込み", "申込", "申し込み"];
-        let moushikomi_stems = extract_stem_candidates_borrowed(&moushikomi_cands, "み", "もうしこみ");
+        let moushikomi_stems =
+            extract_stem_candidates_borrowed(&moushikomi_cands, "み", "もうしこみ");
         assert_eq!(moushikomi_stems, vec!["申込", "申し込"]);
 
         // "とりあつかい" に対する候補: "取扱い", "取扱", "取り扱い"
         let toriatsukai_cands = ["取扱い", "取扱", "取り扱い"];
-        let toriatsukai_stems = extract_stem_candidates_borrowed(&toriatsukai_cands, "い", "とりあつかい");
+        let toriatsukai_stems =
+            extract_stem_candidates_borrowed(&toriatsukai_cands, "い", "とりあつかい");
         assert_eq!(toriatsukai_stems, vec!["取扱", "取り扱"]);
 
         // 促音便動詞 "おもった" / "おもって" からの語幹抽出
@@ -716,7 +821,8 @@ mod tests {
 
         // 拗音動詞 "わらっちゃう" からの語幹抽出
         let warac_cands = ["笑っちゃう", "嗤っちゃう"];
-        let warac_stems = extract_stem_candidates_borrowed(&warac_cands, "っちゃう", "わらっちゃう");
+        let warac_stems =
+            extract_stem_candidates_borrowed(&warac_cands, "っちゃう", "わらっちゃう");
         assert_eq!(warac_stems, vec!["笑", "嗤"]);
 
         // 意志形 "たべよう" からの語幹抽出

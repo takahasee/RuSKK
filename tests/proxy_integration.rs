@@ -23,7 +23,9 @@ async fn test_proxy_ranks_by_seed_frequency() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with(b"1KiRu") || req.starts_with(b"1kiru") {
                             // upstream は常に「切る」が第1候補
@@ -105,7 +107,9 @@ async fn test_proxy_basic_lookup_passthrough() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with(b"1kiru") {
                             let _ = stream.write_all("1/切る/着る/\n".as_bytes()).await;
@@ -190,7 +194,9 @@ async fn test_proxy_forwards_completion() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with(b"4ki") {
                             let _ = stream.write_all("1/kiru/kiku/\n".as_bytes()).await;
@@ -241,7 +247,10 @@ async fn test_proxy_forwards_completion() {
     client.write_all(b"4ki \n").await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert_eq!(resp, "1/kiru/kiku/\n", "upstream からの補完候補が返却されること");
+    assert_eq!(
+        resp, "1/kiru/kiku/\n",
+        "upstream からの補完候補が返却されること"
+    );
 
     drop(client);
     proxy_handle.abort();
@@ -261,7 +270,9 @@ async fn test_proxy_single_char_lookup_works_immediately() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1き ".as_bytes()) {
                             let _ = stream.write_all("1/木/気/\n".as_bytes()).await;
@@ -334,7 +345,9 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         // 復元された平仮名活用形 "かく" を受け取った場合
                         if req.starts_with("1かく ".as_bytes()) {
@@ -409,7 +422,9 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         // 復元された "交ぜがき" または "まぜがき" に対するモックレスポンス
                         if req.starts_with("1交ぜがき ".as_bytes()) {
@@ -470,13 +485,21 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
     client.write_all("1交ぜGak \n".as_bytes()).await.unwrap();
     let n1b = client.read(&mut buf).await.unwrap();
     let resp1b = String::from_utf8_lossy(&buf[..n1b]);
-    assert!(resp1b.starts_with("1/交ぜ書/"), "unexpected resp1b: {}", resp1b);
+    assert!(
+        resp1b.starts_with("1/交ぜ書/"),
+        "unexpected resp1b: {}",
+        resp1b
+    );
 
     // 2. 平仮名送りあり複合語 "1まぜがk " -> 語幹 "混ぜ書", "交ぜ書" が返る
     client.write_all("1まぜがk \n".as_bytes()).await.unwrap();
     let n2 = client.read(&mut buf).await.unwrap();
     let resp2 = String::from_utf8_lossy(&buf[..n2]);
-    assert!(resp2.starts_with("1/混ぜ書/"), "unexpected resp2: {}", resp2);
+    assert!(
+        resp2.starts_with("1/混ぜ書/"),
+        "unexpected resp2: {}",
+        resp2
+    );
 
     drop(client);
     proxy_handle.abort();
@@ -496,13 +519,17 @@ async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         // 複合語として優先展開された "といあわす", "といあわせ" に対する upstream レスポンス
                         if req.starts_with("1といあわす ".as_bytes()) {
                             let _ = stream.write_all("1/問い合わす/\n".as_bytes()).await;
                         } else if req.starts_with("1といあわせ ".as_bytes()) {
-                            let _ = stream.write_all("1/問い合わせ/問合せ/問い合せ/問合わせ/\n".as_bytes()).await;
+                            let _ = stream
+                                .write_all("1/問い合わせ/問合せ/問い合せ/問合わせ/\n".as_bytes())
+                                .await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -553,7 +580,11 @@ async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert!(resp.contains("/問合/"), "expected '問合' in resp: {}", resp);
-    assert!(resp.contains("/問い合わ/"), "expected '問い合わ' in resp: {}", resp);
+    assert!(
+        resp.contains("/問い合わ/"),
+        "expected '問い合わ' in resp: {}",
+        resp
+    );
 
     drop(client);
     proxy_handle.abort();
@@ -573,12 +604,18 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1かきおこす ".as_bytes()) {
-                            let _ = stream.write_all("1/書き起こす/書き起す/書起こす/\n".as_bytes()).await;
+                            let _ = stream
+                                .write_all("1/書き起こす/書き起す/書起こす/\n".as_bytes())
+                                .await;
                         } else if req.starts_with("1かきおこし ".as_bytes()) {
-                            let _ = stream.write_all("1/書き起こし/掻き起し/\n".as_bytes()).await;
+                            let _ = stream
+                                .write_all("1/書き起こし/掻き起し/\n".as_bytes())
+                                .await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -627,9 +664,21 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
     client.write_all("1かきおこs \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.contains("/書き起こ/"), "expected '書き起こ' in resp: {}", resp);
-    assert!(resp.contains("/書起こ/"), "expected '書起こ' in resp: {}", resp);
-    assert!(resp.contains("/掻き起/"), "expected '掻き起' in resp: {}", resp);
+    assert!(
+        resp.contains("/書き起こ/"),
+        "expected '書き起こ' in resp: {}",
+        resp
+    );
+    assert!(
+        resp.contains("/書起こ/"),
+        "expected '書起こ' in resp: {}",
+        resp
+    );
+    assert!(
+        resp.contains("/掻き起/"),
+        "expected '掻き起' in resp: {}",
+        resp
+    );
 
     drop(client);
     proxy_handle.abort();
@@ -649,7 +698,9 @@ async fn test_proxy_okuri_expansion_resolves_compound_neage() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1ねあげ ".as_bytes()) {
                             let _ = stream.write_all("1/値上げ/値上/\n".as_bytes()).await;
@@ -702,7 +753,11 @@ async fn test_proxy_okuri_expansion_resolves_compound_neage() {
     client.write_all("1ねあg \n".as_bytes()).await.unwrap();
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
-    assert!(resp.starts_with("1/値上/"), "expected '値上' as top candidate, got: {}", resp);
+    assert!(
+        resp.starts_with("1/値上/"),
+        "expected '値上' as top candidate, got: {}",
+        resp
+    );
 
     drop(client);
     proxy_handle.abort();
@@ -722,7 +777,9 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         // 復元されず元の "かk" のまま照会される
                         if req.starts_with("1かk ".as_bytes()) {
@@ -795,7 +852,9 @@ async fn test_proxy_context_ranking_promotes_candidates() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1にく ".as_bytes()) {
                             let _ = stream.write_all("1/肉/\n".as_bytes()).await;
@@ -912,14 +971,17 @@ async fn test_proxy_context_ranking_promotes_candidates() {
     tokio::time::sleep(Duration::from_millis(80)).await;
 
     // --- ケース 3: 木 -> 伐る（伐） ---
+    // macSKK は ▽ 開始時に先頭 1 文字を機械的に Lookup し、Space で再度 Lookup する。
+    // 「き」(▽開始) →「き」(Space・確定) →「き」(次の ▽ 開始) →「きr」の順に届く。
     {
         let mut client = TcpStream::connect(proxy_addr).await.unwrap();
         let mut buf = [0u8; 512];
-        client.write_all("1き \n".as_bytes()).await.unwrap();
-        let n = client.read(&mut buf).await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/木/\n");
-
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        for _ in 0..3 {
+            client.write_all("1き \n".as_bytes()).await.unwrap();
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/木/\n");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
 
         client.write_all("1きr \n".as_bytes()).await.unwrap();
         let n = client.read(&mut buf).await.unwrap();
@@ -944,7 +1006,9 @@ async fn test_proxy_context_ranking_disabled() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1にく ".as_bytes()) {
                             let _ = stream.write_all("1/肉/\n".as_bytes()).await;
@@ -1038,7 +1102,9 @@ async fn test_proxy_context_protected_against_completion_burst() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1にく ".as_bytes()) {
                             let _ = stream.write_all("1/肉/\n".as_bytes()).await;
@@ -1154,7 +1220,9 @@ async fn test_proxy_okuri_expansion_resolves_sokuon_omot() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1おもった ".as_bytes()) {
                             let _ = stream.write_all("1/思った/\n".as_bytes()).await;
@@ -1232,10 +1300,14 @@ async fn test_proxy_okuri_expansion_resolves_youon_warac() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1わらっちゃう ".as_bytes()) {
-                            let _ = stream.write_all("1/笑っちゃう/嗤っちゃう/\n".as_bytes()).await;
+                            let _ = stream
+                                .write_all("1/笑っちゃう/嗤っちゃう/\n".as_bytes())
+                                .await;
                         } else {
                             let _ = stream.write_all(b"4\n").await;
                         }
@@ -1304,7 +1376,9 @@ async fn test_proxy_okuri_expansion_resolves_youon_tabey() {
                 tokio::spawn(async move {
                     let mut buf = [0u8; 512];
                     while let Ok(n) = stream.read(&mut buf).await {
-                        if n == 0 { break; }
+                        if n == 0 {
+                            break;
+                        }
                         let req = &buf[..n];
                         if req.starts_with("1たべよう ".as_bytes()) {
                             let _ = stream.write_all("1/食べよう/\n".as_bytes()).await;
@@ -1380,7 +1454,9 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
                         }
                         let req = &buf[..n];
                         if req.starts_with("1つかえ ".as_bytes()) {
-                            let _ = stream.write_all("1/使え/仕え/遣え/支え/\n".as_bytes()).await;
+                            let _ = stream
+                                .write_all("1/使え/仕え/遣え/支え/\n".as_bytes())
+                                .await;
                         } else if req.starts_with("1つかえる ".as_bytes()) {
                             let _ = stream.write_all("1/使える/仕える/\n".as_bytes()).await;
                         } else {
@@ -1437,5 +1513,3 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
-
-

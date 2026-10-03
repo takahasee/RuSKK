@@ -25,7 +25,7 @@ async fn main() -> anyhow::Result<()> {
     let history_path = std::env::var("HOME")
         .ok()
         .map(|h| PathBuf::from(h).join(".ruskkserv-frequency.json"));
-    
+
     // サブコマンドが指定されている場合は、プロキシを起動せずに処理を実行して終了する
     match args.command {
         Some(ruskkserv::config::Command::ImportUserDict { path, send_reload }) => {
@@ -58,7 +58,20 @@ async fn main() -> anyhow::Result<()> {
         None => {}
     }
 
-    let predictor = Arc::new(RwLock::new(FrequencyPredictor::new(history_path.clone())));
+    let mut initial_predictor = FrequencyPredictor::new(history_path.clone());
+    // seed ファイルが無い（インポート失敗を含む）場合でも文脈連動が効くよう、組み込みプリセットを適用する
+    if initial_predictor.ensure_default_context_presets() {
+        tracing::warn!(
+            path = ?history_path,
+            "context_frequencies is empty (seed file missing?) — using built-in default presets"
+        );
+    }
+    info!(
+        frequencies = initial_predictor.frequencies.len(),
+        context_frequencies = initial_predictor.context_frequencies.len(),
+        "predictor loaded"
+    );
+    let predictor = Arc::new(RwLock::new(initial_predictor));
 
     let proxy = Proxy {
         listen: args.listen.clone(),
@@ -71,9 +84,9 @@ async fn main() -> anyhow::Result<()> {
 
     // SIGTERM / SIGINT を受け取ったらプロキシを停止する。
     let shutdown = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut sigint  = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {
             _ = sigterm.recv() => info!("received SIGTERM"),
             _ = sigint.recv()  => info!("received SIGINT"),
@@ -97,7 +110,7 @@ async fn main() -> anyhow::Result<()> {
 /// SIGHUP を受け取るたびに predictor を ~/.ruskkserv-frequency.json から再ロードする。
 /// このタスクは永久に実行され続け、プロセスが終了するまでシグナルを待ち受ける。
 async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
     let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP handler");
     loop {
         sighup.recv().await;
@@ -107,6 +120,11 @@ async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
             match guard.load(p) {
                 Ok(()) => info!(path = ?p, "predictor reloaded successfully"),
                 Err(e) => tracing::warn!(error = %e, "predictor reload failed"),
+            }
+            if guard.ensure_default_context_presets() {
+                tracing::warn!(
+                    "context_frequencies is empty after reload — using built-in default presets"
+                );
             }
         } else {
             tracing::warn!("SIGHUP received but no history_path configured — skipping reload");

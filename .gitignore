@@ -6,3 +6,4 @@
 .vscode/
 .idea/
 .Cargo.lock
+backup/

@@ -12,7 +12,7 @@ use crate::encoding::{
     parse_candidates_borrowed,
 };
 use crate::frequency::SharedPredictor;
-use crate::protocol::{is_found, parse_request, Request};
+use crate::protocol::{Request, is_found, parse_request};
 
 const MAX_LINE_BYTES: u64 = 8192;
 
@@ -25,13 +25,85 @@ pub struct Proxy {
     pub context_ranking: bool,
 }
 
+/// 文脈の有効期限（確定から次の変換開始までの最大間隔）
+const CONTEXT_TTL: Duration = Duration::from_secs(60);
+
+/// 確定待ち（保留中）の直前単語
+#[derive(Debug, Clone)]
+struct PendingContext {
+    midashi: String,
+    word: Arc<str>,
+    time: Instant,
+    /// 同一見出し語の Lookup を受信した回数。
+    /// macSKK は ▽ 入力開始時に先頭 1 文字を機械的に Lookup し、Space 押下時に再度 Lookup するため、
+    /// 2 回以上であれば「ユーザーが実際に変換した」とみなせる。
+    hits: u32,
+}
+
 /// Apple Silicon (M1〜M4 / A18 Pro) の 128 バイトキャッシュラインに整合させ、
 /// マルチコア並行アクセス時の偽共有（False Sharing）によるキャッシュバウンスをハードウェアレベルでゼロ化
 #[derive(Debug, Default)]
 #[repr(align(128))]
 struct SharedContextState {
     session_context: Option<Arc<str>>,
-    pending_context: Option<(String, Arc<str>, Instant)>,
+    pending_context: Option<PendingContext>,
+}
+
+impl SharedContextState {
+    /// 新しい手動 Lookup の開始時に呼び出し、保留中の単語を確定（昇格）するか判定する。
+    /// 戻り値は並び替えに使う文脈のスナップショット。
+    fn on_lookup_start(&mut self, midashi: &str, now: Instant) -> Option<Arc<str>> {
+        if let Some(mut pending) = self.pending_context.take() {
+            if pending.midashi == midashi {
+                // 同一見出し語での再 Lookup（Space による変換開始・次候補送り）なので保留を継続
+                pending.hits = pending.hits.saturating_add(1);
+                self.pending_context = Some(pending);
+            } else if is_input_extension(midashi, &pending.midashi) && pending.hits < 2 {
+                // 「き」→「きr」「に」→「にく」のように入力が伸長しただけの場合は、
+                // macSKK の ▽ 開始時の機械的 Lookup であり未確定のため、昇格せずに破棄する。
+                debug!(
+                    discarded = %pending.word,
+                    prev_midashi = %pending.midashi,
+                    new_midashi = %midashi,
+                    "discarded pending context (input extension)"
+                );
+            } else if now.duration_since(pending.time) <= CONTEXT_TTL {
+                // 見出し語が変わったため、前回の単語が確定したと判定して昇格
+                self.session_context = Some(pending.word);
+                debug!(
+                    context = ?self.session_context,
+                    new_midashi = %midashi,
+                    "promoted pending context"
+                );
+            } else {
+                self.session_context = None;
+            }
+        }
+        self.session_context.clone()
+    }
+
+    /// Lookup の応答後に呼び出し、返却第1候補を次回のための保留単語として記録する。
+    fn on_lookup_result(&mut self, midashi: &str, word: Arc<str>, now: Instant) {
+        match self.pending_context {
+            Some(ref mut pending) if pending.midashi == midashi => {
+                pending.word = word;
+                pending.time = now;
+            }
+            _ => {
+                self.pending_context = Some(PendingContext {
+                    midashi: midashi.to_string(),
+                    word,
+                    time: now,
+                    hits: 1,
+                });
+            }
+        }
+    }
+}
+
+/// `new` が `prev` を前方一致で伸長した入力か（例: "き" → "きr", "に" → "にく"）
+fn is_input_extension(new: &str, prev: &str) -> bool {
+    new.len() > prev.len() && new.starts_with(prev)
 }
 
 impl Proxy {
@@ -56,16 +128,28 @@ impl Proxy {
             tokio::spawn(async move {
                 // 1. 通常変換（Lookup）モデルのウォームアップ
                 let req_lookup = Request::Lookup("あ".as_bytes());
-                let _ = warmup_primary.query_with_timeout(&req_lookup, Duration::from_secs(3)).await;
+                let _ = warmup_primary
+                    .query_with_timeout(&req_lookup, Duration::from_secs(3))
+                    .await;
 
                 // 2. 補完（Completion）エンジンのウォームアップ（五十音の代表文字を照会してトライ木等をメモリ展開）
                 const WARMUP_CHARS: &[&[u8]] = &[
-                    "あ".as_bytes(), "か".as_bytes(), "さ".as_bytes(), "た".as_bytes(), "な".as_bytes(),
-                    "は".as_bytes(), "ま".as_bytes(), "や".as_bytes(), "ら".as_bytes(), "わ".as_bytes(),
+                    "あ".as_bytes(),
+                    "か".as_bytes(),
+                    "さ".as_bytes(),
+                    "た".as_bytes(),
+                    "な".as_bytes(),
+                    "は".as_bytes(),
+                    "ま".as_bytes(),
+                    "や".as_bytes(),
+                    "ら".as_bytes(),
+                    "わ".as_bytes(),
                 ];
                 for &kana in WARMUP_CHARS {
                     let req_comp = Request::Completion(kana);
-                    let _ = warmup_primary.query_with_timeout(&req_comp, Duration::from_millis(500)).await;
+                    let _ = warmup_primary
+                        .query_with_timeout(&req_comp, Duration::from_millis(500))
+                        .await;
                 }
                 tracing::debug!("primary backend lookup and completion warmup complete");
             });
@@ -115,7 +199,11 @@ async fn handle_client(
         }
 
         if line.len() > MAX_LINE_BYTES as usize || !line.ends_with(b"\n") {
-            warn!(?peer, len = line.len(), "request line too long or missing newline");
+            warn!(
+                ?peer,
+                len = line.len(),
+                "request line too long or missing newline"
+            );
             break;
         }
 
@@ -142,7 +230,8 @@ async fn handle_client(
                 break;
             }
             Request::Version => {
-                const VERSION_RESP: &[u8] = concat!("ruskkserv/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
+                const VERSION_RESP: &[u8] =
+                    concat!("ruskkserv/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
                 writer.write_all(VERSION_RESP).await?;
                 conn_last_response_time = Some(Instant::now());
             }
@@ -168,31 +257,11 @@ async fn handle_client(
 
                     // 文脈連動（context_ranking）が有効で、かつ補完連射でない場合、
                     // 手動での通常変換において前回の単語が確定されたかを判定して session_context に昇格する。
-                    if proxy.context_ranking
-                        && !is_completion_burst
-                        && let Some((prev_midashi, prev_word, time)) = ctx.pending_context.take()
-                    {
-                        let is_same_midashi = prev_midashi == midashi_str;
-
-                        if is_same_midashi {
-                            // 同一見出し語での連続Lookup（次候補送り中、Space連打）なので保留を継続
-                            ctx.pending_context = Some((prev_midashi, prev_word, time));
-                        } else {
-                            // 見出し語が変わったため、前回の単語が確定したと判定して昇格
-                            if now.duration_since(time) <= Duration::from_secs(60) {
-                                ctx.session_context = Some(prev_word);
-                                debug!(
-                                    context = ?ctx.session_context,
-                                    new_midashi = %midashi_str,
-                                    "promoted pending context"
-                                );
-                            } else {
-                                ctx.session_context = None;
-                            }
-                        }
+                    if proxy.context_ranking && !is_completion_burst {
+                        ctx.on_lookup_start(&midashi_str, now)
+                    } else {
+                        ctx.session_context.clone()
                     }
-
-                    ctx.session_context.clone()
                 };
 
                 let ctx_ref = if proxy.context_ranking {
@@ -222,9 +291,16 @@ async fn handle_client(
                             break;
                         }
                         let remaining = max_total_okuri.saturating_sub(start_okuri.elapsed());
-                        let okuri_timeout = proxy.primary.timeout.min(Duration::from_millis(300)).min(remaining);
+                        let okuri_timeout = proxy
+                            .primary
+                            .timeout
+                            .min(Duration::from_millis(300))
+                            .min(remaining);
                         let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
-                        if let Ok(okuri_resp) = proxy.primary.query_with_timeout(&okuri_req, okuri_timeout).await
+                        if let Ok(okuri_resp) = proxy
+                            .primary
+                            .query_with_timeout(&okuri_req, okuri_timeout)
+                            .await
                             && is_found(&okuri_resp)
                         {
                             responses.push((okuri_resp, var));
@@ -266,10 +342,14 @@ async fn handle_client(
                         // 辞書の全候補も漏れなく提供され、変換候補数が少なくなる現象を根本的に解消する。
                         let fallback_req = Request::Lookup(midashi_str.as_bytes());
                         let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200));
-                        if let Ok(fallback_resp) = proxy.fallback.query_with_timeout(&fallback_req, fb_timeout).await
+                        if let Ok(fallback_resp) = proxy
+                            .fallback
+                            .query_with_timeout(&fallback_req, fb_timeout)
+                            .await
                             && is_found(&fallback_resp)
                         {
-                            let fb_cands = crate::encoding::parse_candidates_unpacked(&fallback_resp);
+                            let fb_cands =
+                                crate::encoding::parse_candidates_unpacked(&fallback_resp);
                             for cand in fb_cands {
                                 let clean = crate::frequency::clean_candidate(&cand);
                                 if !clean.is_empty()
@@ -282,7 +362,8 @@ async fn handle_client(
                             }
                         }
 
-                        let cands_refs: Vec<&str> = merged_cands.iter().map(|s| s.as_str()).collect();
+                        let cands_refs: Vec<&str> =
+                            merged_cands.iter().map(|s| s.as_str()).collect();
                         let norm_midashi = crate::okuri::normalize_okuri_midashi_key(&midashi_str);
                         let ranked = {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
@@ -313,7 +394,8 @@ async fn handle_client(
                             let cands = parse_candidates_borrowed(&response);
                             if !cands.is_empty() {
                                 let ranked = {
-                                    let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                                    let guard =
+                                        proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                                     guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &cands)
                                 };
                                 if let Some(&top) = ranked.first() {
@@ -343,7 +425,7 @@ async fn handle_client(
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
                         let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
-                        ctx.pending_context = Some((midashi_str.to_string(), Arc::from(clean), now));
+                        ctx.on_lookup_result(&midashi_str, Arc::from(clean), now);
                     }
                 }
 
@@ -381,7 +463,11 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>,
     let overall_deadline = Duration::from_millis(850);
     let primary_timeout = proxy.primary.timeout.min(Duration::from_millis(600));
 
-    match proxy.primary.query_with_timeout(request, primary_timeout).await {
+    match proxy
+        .primary
+        .query_with_timeout(request, primary_timeout)
+        .await
+    {
         Ok(response) if is_found(&response) => {
             debug!(
                 backend = %proxy.primary.name,
@@ -414,7 +500,11 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>,
         return (b"4\n".to_vec(), BackendHit::None);
     }
 
-    match proxy.fallback.query_with_timeout(request, fallback_timeout).await {
+    match proxy
+        .fallback
+        .query_with_timeout(request, fallback_timeout)
+        .await
+    {
         Ok(response) => {
             let hit = if is_found(&response) {
                 debug!(
@@ -449,4 +539,48 @@ async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>,
 /// 文脈候補（session_context / pending_context）には漢字を含む単語のみを積む。
 fn contains_kanji(s: &str) -> bool {
     s.chars().any(crate::okuri::is_kanji)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 1 回の Lookup（変換結果の記録まで）をシミュレートし、並び替えに使われた文脈を返す
+    fn lookup(state: &mut SharedContextState, midashi: &str, top: &str) -> Option<String> {
+        let now = Instant::now();
+        let ctx = state.on_lookup_start(midashi, now);
+        state.on_lookup_result(midashi, Arc::from(top), now);
+        ctx.map(|c| c.to_string())
+    }
+
+    #[test]
+    fn mechanical_first_char_lookup_does_not_override_context() {
+        // 実際の macSKK のシーケンス: 「にく」Space → 確定 → 「KiR」入力
+        // （▽き の時点で「き」が機械的に Lookup され、続いて「きr」が Lookup される）
+        let mut s = SharedContextState::default();
+        lookup(&mut s, "に", "二"); // ▽に 開始時の機械的 Lookup
+        lookup(&mut s, "にく", "肉"); // Space
+        lookup(&mut s, "き", "木"); // ▽き 開始時の機械的 Lookup
+        let ctx = lookup(&mut s, "きr", "着");
+        assert_eq!(ctx.as_deref(), Some("肉"));
+    }
+
+    #[test]
+    fn confirmed_single_kana_word_is_kept_even_if_next_extends_it() {
+        // 「き」Space →「木」確定 →「KiR」入力（き の Lookup が 3 回: 機械的・Space・機械的）
+        let mut s = SharedContextState::default();
+        lookup(&mut s, "き", "木");
+        lookup(&mut s, "き", "木");
+        lookup(&mut s, "き", "木");
+        let ctx = lookup(&mut s, "きr", "着");
+        assert_eq!(ctx.as_deref(), Some("木"));
+    }
+
+    #[test]
+    fn unrelated_midashi_promotes_pending() {
+        let mut s = SharedContextState::default();
+        lookup(&mut s, "ふく", "服");
+        let ctx = lookup(&mut s, "きr", "着");
+        assert_eq!(ctx.as_deref(), Some("服"));
+    }
 }

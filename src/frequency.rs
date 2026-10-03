@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use tracing::debug;
 
-
 /// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
 /// skkserv プロトコルではユーザーの選択を知る手段がないため、自動学習は行わない。
 /// ユーザーが `~/.ruskkserv-frequency.json` を手動で編集し、seed データを投入する。
@@ -37,8 +36,6 @@ impl FrequencyPredictor {
         predictor.storage_path = storage_path;
         predictor
     }
-
-
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         if !path.as_ref().exists() {
@@ -86,6 +83,16 @@ impl FrequencyPredictor {
         Ok(())
     }
 
+    /// context_frequencies が空の場合（seed ファイルが存在しない・文脈データ未登録など）に、
+    /// 組み込みプリセットをメモリ上で適用する（ファイルには書き込まない）。
+    /// 適用した場合は true を返す。
+    pub fn ensure_default_context_presets(&mut self) -> bool {
+        if !self.context_frequencies.is_empty() {
+            return false;
+        }
+        self.merge_default_presets().is_ok()
+    }
+
     /// seed ファイル（~/.ruskkserv-frequency.json）を初期化またはマージして保存する。
     /// force が true の場合はプリセットで完全上書きし、false の場合は既存データを保持したままマージする。
     pub fn init_seed(&mut self, force: bool) -> anyhow::Result<()> {
@@ -109,7 +116,7 @@ impl FrequencyPredictor {
     /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
     pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
         let content = fs::read_to_string(dict_path)?;
-        
+
         for line in content.lines() {
             let line = line.trim();
             // コメント行や空行はスキップ
@@ -123,7 +130,7 @@ impl FrequencyPredictor {
                 Some(m) if !m.is_empty() => m,
                 _ => continue,
             };
-            
+
             let cands_part = match parts.next() {
                 Some(c) if c.starts_with('/') && c.ends_with('/') => c,
                 _ => continue,
@@ -135,16 +142,19 @@ impl FrequencyPredictor {
             }
 
             let entry = self.frequencies.entry(midashi.to_string()).or_default();
-            
+
             // 順番に応じてスコアを付与 (先頭ほど高い)
             // 候補がN個の場合、1番目=N点, 2番目=N-1点, ..., N番目=1点
+            // 定期インポート（毎時）でスコアが際限なく膨らみ文脈スコアを上回らないよう、
+            // 加算ではなく最大値で更新する（冪等）。ユーザー辞書から消えたエントリのスコアは保持される。
             let total_cands = candidates.len() as u64;
             for (idx, cand_text) in candidates.iter().enumerate() {
                 let score = total_cands.saturating_sub(idx as u64);
-                *entry.entry(cand_text.clone()).or_insert(0) += score;
+                let current = entry.entry(cand_text.clone()).or_insert(0);
+                *current = (*current).max(score);
             }
         }
-        
+
         // context_frequencies が空なら、デフォルトプリセットも一緒に初期化
         if self.context_frequencies.is_empty() {
             // merge_default_presets 内で expand_aliases が呼ばれる
@@ -155,7 +165,7 @@ impl FrequencyPredictor {
 
         // インポートした結果を保存する
         self.save()?;
-        
+
         Ok(())
     }
 
@@ -181,7 +191,11 @@ impl FrequencyPredictor {
     /// 見出し語または現在の文脈に対して、並び替えルールが存在するかを超高速判定する。
     /// これが false の場合、候補のパースや並び替え処理を一切行わずに直結バイパス（完全ゼロコピー）できる。
     pub fn should_rank<S: AsRef<str>>(&self, context: &[S], midashi: &str) -> bool {
-        if self.get_freq_map(midashi).map(|m| !m.is_empty()).unwrap_or(false) {
+        if self
+            .get_freq_map(midashi)
+            .map(|m| !m.is_empty())
+            .unwrap_or(false)
+        {
             return true;
         }
         if !context.is_empty() && !self.context_frequencies.is_empty() {
@@ -215,11 +229,15 @@ impl FrequencyPredictor {
         } else {
             None
         };
-        let multi_ctx_maps: Vec<&HashMap<String, u64>> = if context.len() > 1 && !self.context_frequencies.is_empty() {
-            context.iter().filter_map(|ctx| self.get_context_map(ctx.as_ref())).collect()
-        } else {
-            Vec::new()
-        };
+        let multi_ctx_maps: Vec<&HashMap<String, u64>> =
+            if context.len() > 1 && !self.context_frequencies.is_empty() {
+                context
+                    .iter()
+                    .filter_map(|ctx| self.get_context_map(ctx.as_ref()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
         let has_context = single_ctx_map.is_some() || !multi_ctx_maps.is_empty();
         if !has_freq && !has_context {
@@ -251,10 +269,7 @@ impl FrequencyPredictor {
 
         indexed_cands.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-        indexed_cands
-            .into_iter()
-            .map(|(_, cand, _)| cand)
-            .collect()
+        indexed_cands.into_iter().map(|(_, cand, _)| cand).collect()
     }
 
     /// seed ロード時に frequencies / context_frequencies の各マップに対して、
@@ -385,14 +400,17 @@ pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
     candidates
 }
 
-
-
 pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
 
 /// テスト専用: 所有権版の rank_candidates
 #[cfg(test)]
 impl FrequencyPredictor {
-    pub fn rank_candidates<S: AsRef<str>>(&self, context: &[S], midashi: &str, candidates: &[String]) -> Vec<String> {
+    pub fn rank_candidates<S: AsRef<str>>(
+        &self,
+        context: &[S],
+        midashi: &str,
+        candidates: &[String],
+    ) -> Vec<String> {
         let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
         let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
         ranked.into_iter().map(|s| s.to_string()).collect()
@@ -452,19 +470,22 @@ mod tests {
         // 1. 文脈「肉」のとき、「切る」（および語幹「切」）が第1候補
         let ranked_niku = predictor.rank_candidates(&["肉".to_string()], "きる", &candidates);
         assert_eq!(ranked_niku[0], "切る");
-        let ranked_niku_stem = predictor.rank_candidates(&["肉".to_string()], "きr", &stem_candidates);
+        let ranked_niku_stem =
+            predictor.rank_candidates(&["肉".to_string()], "きr", &stem_candidates);
         assert_eq!(ranked_niku_stem[0], "切");
 
         // 2. 文脈「服」のとき、「着る」（および語幹「着」）が第1候補
         let ranked_fuku = predictor.rank_candidates(&["服".to_string()], "きる", &candidates);
         assert_eq!(ranked_fuku[0], "着る");
-        let ranked_fuku_stem = predictor.rank_candidates(&["服".to_string()], "きr", &stem_candidates);
+        let ranked_fuku_stem =
+            predictor.rank_candidates(&["服".to_string()], "きr", &stem_candidates);
         assert_eq!(ranked_fuku_stem[0], "着");
 
         // 3. 文脈「木」のとき、「伐る」（および語幹「伐」）が第1候補
         let ranked_ki = predictor.rank_candidates(&["木".to_string()], "きる", &candidates);
         assert_eq!(ranked_ki[0], "伐る");
-        let ranked_ki_stem = predictor.rank_candidates(&["木".to_string()], "きr", &stem_candidates);
+        let ranked_ki_stem =
+            predictor.rank_candidates(&["木".to_string()], "きr", &stem_candidates);
         assert_eq!(ranked_ki_stem[0], "伐");
 
         // 4. 文脈キー側の柔軟照合: 辞書キーが「切る」でも、文脈が語幹「切」でヒットすること
@@ -475,14 +496,15 @@ mod tests {
         });
         predictor.expand_aliases();
         let nouchi_cands = vec!["包丁".to_string(), "庖丁".to_string()];
-        let ranked_hocho = predictor.rank_candidates(&["切".to_string()], "ほうちょう", &nouchi_cands);
+        let ranked_hocho =
+            predictor.rank_candidates(&["切".to_string()], "ほうちょう", &nouchi_cands);
         assert_eq!(ranked_hocho[0], "包丁");
     }
 
     #[test]
     fn test_import_from_skk_dict() {
-        use tempfile::NamedTempFile;
         use std::io::Write;
+        use tempfile::NamedTempFile;
 
         // ダミーの SKK 辞書ファイルを作成（macSKK の送りありブロック形式を含む）
         let mut dict_file = NamedTempFile::new().unwrap();
@@ -490,7 +512,7 @@ mod tests {
         writeln!(dict_file, "きr /[る/着/切;注釈/伐/]/[り/切/]/").unwrap();
         writeln!(dict_file, ";; okuri-nasi entries.").unwrap();
         writeln!(dict_file, "ふく /服/吹く/副/").unwrap();
-        
+
         // テスト用の JSON 保存先
         let json_file = NamedTempFile::new().unwrap();
 
@@ -516,7 +538,15 @@ mod tests {
         assert_eq!(kir_freqs.get("伐").copied().unwrap_or(0), 1);
 
         // 注釈付き候補（例: "切;注釈あり"）でもスコア照合できていること
-        let ranked = predictor.rank_candidates(&[] as &[String], "きr", &["伐".to_string(), "切;注釈あり".to_string(), "着".to_string()]);
+        let ranked = predictor.rank_candidates(
+            &[] as &[String],
+            "きr",
+            &[
+                "伐".to_string(),
+                "切;注釈あり".to_string(),
+                "着".to_string(),
+            ],
+        );
         assert_eq!(ranked[0], "着");
         assert_eq!(ranked[1], "切;注釈あり");
         assert_eq!(ranked[2], "伐");
@@ -534,7 +564,16 @@ mod tests {
         // ファイルにも保存されているか確認
         let mut loaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
         loaded.load(json_file.path()).unwrap();
-        assert_eq!(loaded.frequencies.get("きr").unwrap().get("着").copied().unwrap_or(0), 3);
+        assert_eq!(
+            loaded
+                .frequencies
+                .get("きr")
+                .unwrap()
+                .get("着")
+                .copied()
+                .unwrap_or(0),
+            3
+        );
     }
 
     #[test]
@@ -552,22 +591,46 @@ mod tests {
 
         // デフォルトプリセットの代表的ペアが読み込まれていること
         assert_eq!(
-            predictor.context_frequencies.get("服").unwrap().get("着る").copied().unwrap_or(0),
+            predictor
+                .context_frequencies
+                .get("服")
+                .unwrap()
+                .get("着る")
+                .copied()
+                .unwrap_or(0),
             10
         );
         assert_eq!(
-            predictor.context_frequencies.get("肉").unwrap().get("切る").copied().unwrap_or(0),
+            predictor
+                .context_frequencies
+                .get("肉")
+                .unwrap()
+                .get("切る")
+                .copied()
+                .unwrap_or(0),
             10
         );
         assert_eq!(
-            predictor.context_frequencies.get("時間").unwrap().get("計る").copied().unwrap_or(0),
+            predictor
+                .context_frequencies
+                .get("時間")
+                .unwrap()
+                .get("計る")
+                .copied()
+                .unwrap_or(0),
             10
         );
 
         // ファイルから再ロードしても正しく永続化されていること
         let reloaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
         assert_eq!(
-            reloaded.context_frequencies.get("服").unwrap().get("着る").copied().unwrap_or(0),
+            reloaded
+                .context_frequencies
+                .get("服")
+                .unwrap()
+                .get("着る")
+                .copied()
+                .unwrap_or(0),
             10
         );
     }

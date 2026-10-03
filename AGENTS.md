@@ -72,6 +72,9 @@
   2. 新しい見出し語の変換（Lookup）が開始された時点で前回の単語が確定されたと判定し、`session_context`（TTL: 60秒）に昇格。同一見出し語での次候補送り（Space 連打）中は保留を維持。
   3. `rank_candidates(&session_context, ...)` を呼び出し、`context_frequencies` に基づき候補スコアを加算して並び替え。
   4. 補完（opcode 4）は常に `4\n` を返すため、勝手な自動確定（`addFixedText`）は一切起きず、確定は常にユーザーの手動 Space キーによって行われます。
+  5. **macSKK の機械的 1 文字 Lookup 対策**: macSKK は ▽ 入力開始時に先頭 1 文字（例: `き`）を自動で Lookup するため、そのままでは「木」「化」等が文脈を上書きしていた。新しい見出し語が保留中の見出し語の前方一致伸長（`き`→`きr`、`に`→`にく`）で、かつ保留中の見出し語の受信回数（`hits`）が 2 未満なら、未確定とみなして昇格せず破棄する（`SharedContextState::on_lookup_start`）。
+  6. **プリセットへのフォールバック**: `~/.ruskkserv-frequency.json` が無い、または `context_frequencies` が空の場合は、起動時・SIGHUP 時に組み込みプリセットをメモリ上で適用する（`ensure_default_context_presets`）。
+  - **制約**: skkserv プロトコルではユーザーが実際に選んだ候補を知る手段がないため、文脈語には「返却した第1候補」を使う。
 - **即時ロールバック（安全機能）**:
   - **CLI**: `ruskkserv --context-ranking=false`
   - **環境変数**: `RUSKKSERV_CONTEXT_RANKING=0`
@@ -82,6 +85,13 @@
   - macSKK 側で有効化されていた静的辞書群（`SKK-JISYO.all`, `neologd`, `hatena`, `jawiki`, `emoji-ja`, `itaiji`）およびユーザーの過去登録辞書（`skk-jisyo.utf8`）を `yaskkserv2_make_dictionary` で 1 つの 52MB バイナリ辞書（`~/Documents/SKK/dictionary.yaskkserv2`）に一括統合。
   - macSKK の `dictionaries` 設定はすべて `enabled = 0` に無効化。macSKK はすべての照会を RuSKKserv (`127.0.0.1:1178`) 経由でのみ行う。
   - 日常語・動詞・文脈共起は Primary（azooKey）が最優先で返却し、azooKey にない固有名詞・専門用語・ユーザー登録語は Fallback（yaskkserv2）から自動的に補完される。
+- **ユーザー辞書の学習による上書き対策（2026-10-04）**:
+  - macSKK の候補順は「ユーザー辞書 → 日付変換 → ファイル辞書 → skkserv」で固定（`UserDict+Snapshot.swift` の `localCandidates` / `referDicts`、重複は先勝ち `mergeCandidates`）。skkserv 設定の `saveToUserDict = 1` だと RuSKKserv の候補を選ぶたびにユーザー辞書へ書き込まれ、以後その順序が文脈予測を常に上書きしていた。
+  - 対処: macSKK の skkserv 設定「変換履歴をユーザー辞書に保存」をオフにし、ユーザー辞書を空にした（単語登録は引き続き保存・最優先表示される）。旧ユーザー辞書の並び順は `import-user-dict` で `frequencies` に取り込み、語彙は yaskkserv2 辞書に統合。バックアップ: `backup/backup-20261004/`。
+  - `import_from_skk_dict` はスコアを `max` で更新する冪等処理（旧実装は毎時 `+=` で際限なく膨らみ、文脈スコア ×10 を上回る恐れがあった）。
+- **yaskkserv2 辞書再構築の注意**:
+  - `yaskkserv2_make_dictionary` は同一見出し語が複数辞書にあると**先に指定した辞書のエントリのみ**を採用する。ユーザー辞書は必ず先頭に指定する。
+  - yaskkserv2 は自身でデーモン化するため `launchctl kickstart -k` では旧プロセスが残り旧辞書を掴み続ける。旧プロセスを `kill` してから kickstart する。
 
 ### ⑧ ゼロコピー・O(1)・SIMD 最適化と徹底的な低遅延設計
 - **背景**: skkserv はキータイプごとにリアルタイムでミリ秒単位の低遅延応答が要求されるため、ランタイムでの不要な線形探索やメモリ割り当て（アロケーション）を徹底的に排除した。

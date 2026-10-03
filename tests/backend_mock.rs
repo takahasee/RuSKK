@@ -5,7 +5,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use ruskkserv::backend::{Backend, UpstreamEncoding};
-use ruskkserv::protocol::{is_found, Request};
+use ruskkserv::protocol::{Request, is_found};
 
 #[tokio::test]
 async fn backend_utf8_passthrough() {
@@ -15,11 +15,13 @@ async fn backend_utf8_passthrough() {
     })
     .await;
 
-    let backend = Backend::new("mock-utf8", addr, UpstreamEncoding::Utf8, Duration::from_secs(1));
-    let resp = backend
-        .query(&Request::Lookup(b"a"))
-        .await
-        .unwrap();
+    let backend = Backend::new(
+        "mock-utf8",
+        addr,
+        UpstreamEncoding::Utf8,
+        Duration::from_secs(1),
+    );
+    let resp = backend.query(&Request::Lookup(b"a")).await.unwrap();
     assert!(is_found(&resp));
     assert_eq!(resp, b"1/\xe3\x81\x82/\n");
 }
@@ -32,22 +34,26 @@ async fn backend_euc_converts_to_utf8() {
     })
     .await;
 
-    let backend = Backend::new("mock-euc", addr, UpstreamEncoding::EucJp, Duration::from_secs(1));
-    let resp = backend
-        .query(&Request::Lookup(b"a"))
-        .await
-        .unwrap();
+    let backend = Backend::new(
+        "mock-euc",
+        addr,
+        UpstreamEncoding::EucJp,
+        Duration::from_secs(1),
+    );
+    let resp = backend.query(&Request::Lookup(b"a")).await.unwrap();
     assert_eq!(resp, b"1/\xe3\x81\x82/\n");
 }
 
 #[tokio::test]
 async fn backend_not_found() {
     let addr = spawn_mock(|_| b"4\n".to_vec()).await;
-    let backend = Backend::new("mock-miss", addr, UpstreamEncoding::Utf8, Duration::from_secs(1));
-    let resp = backend
-        .query(&Request::Lookup(b"zzz"))
-        .await
-        .unwrap();
+    let backend = Backend::new(
+        "mock-miss",
+        addr,
+        UpstreamEncoding::Utf8,
+        Duration::from_secs(1),
+    );
+    let resp = backend.query(&Request::Lookup(b"zzz")).await.unwrap();
     assert!(!is_found(&resp));
     assert_eq!(resp, b"4\n");
 }
