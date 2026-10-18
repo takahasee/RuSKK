@@ -23,6 +23,7 @@ pub struct Proxy {
     pub predictor: SharedPredictor,
     pub okuri_expansion: bool,
     pub context_ranking: bool,
+    pub annotation_priority: bool,
 }
 
 /// 文脈の有効期限（確定から次の変換開始までの最大間隔）
@@ -367,7 +368,12 @@ async fn handle_client(
                         let norm_midashi = crate::okuri::normalize_okuri_midashi_key(&midashi_str);
                         let ranked = {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                            guard.rank_candidates_borrowed(ctx_ref, &norm_midashi, &cands_refs)
+                            guard.rank_candidates_borrowed(
+                                ctx_ref,
+                                &norm_midashi,
+                                &cands_refs,
+                                proxy.annotation_priority,
+                            )
                         };
                         if let Some(&top) = ranked.first() {
                             top_candidate_for_context = Some(top.to_string());
@@ -383,8 +389,8 @@ async fn handle_client(
                 } else {
                     let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
                     if is_found(&response) {
-                        // 【ファストパス】並び替えルールがあるか高速判定
-                        let should_rank = {
+                        // 【ファストパス】並び替えルールまたは注釈・辞書優先があるか高速判定
+                        let should_rank = proxy.annotation_priority || {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                             guard.should_rank(ctx_ref, &midashi_str)
                         };
@@ -396,7 +402,12 @@ async fn handle_client(
                                 let ranked = {
                                     let guard =
                                         proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                    guard.rank_candidates_borrowed(ctx_ref, &midashi_str, &cands)
+                                    guard.rank_candidates_borrowed(
+                                        ctx_ref,
+                                        &midashi_str,
+                                        &cands,
+                                        proxy.annotation_priority,
+                                    )
                                 };
                                 if let Some(&top) = ranked.first() {
                                     top_candidate_for_context = Some(top.to_string());

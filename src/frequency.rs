@@ -209,11 +209,14 @@ impl FrequencyPredictor {
     }
 
     /// 借用スライス (&str) を対象に、アロケーションなしで候補を並び替える。
+    /// annotation_priority が true の場合、macOS システム辞書（大辞林等）の掲載語
+    /// または SKK 注釈付き単語にボーナススコア（100点）を加算し、加点スコア方式で総合順位を決定する。
     pub fn rank_candidates_borrowed<'a, S: AsRef<str>>(
         &self,
         context: &[S],
         midashi: &str,
         candidates: &[&'a str],
+        annotation_priority: bool,
     ) -> Vec<&'a str> {
         if candidates.len() <= 1 {
             return candidates.to_vec();
@@ -240,9 +243,11 @@ impl FrequencyPredictor {
             };
 
         let has_context = single_ctx_map.is_some() || !multi_ctx_maps.is_empty();
-        if !has_freq && !has_context {
+        if !has_freq && !has_context && !annotation_priority {
             return candidates.to_vec();
         }
+
+        const ANNOTATION_BONUS: u64 = 100;
 
         let mut indexed_cands: Vec<(usize, &'a str, u64)> = candidates
             .iter()
@@ -258,7 +263,15 @@ impl FrequencyPredictor {
                     0
                 };
 
-                let total_score = global_count + context_score * 10;
+                let annotation_score: u64 = if annotation_priority
+                    && crate::system_dict::is_annotated_or_in_dict(cand, Some(midashi))
+                {
+                    ANNOTATION_BONUS
+                } else {
+                    0
+                };
+
+                let total_score = annotation_score + global_count + context_score * 10;
                 (idx, cand, total_score)
             })
             .collect();
@@ -411,8 +424,19 @@ impl FrequencyPredictor {
         midashi: &str,
         candidates: &[String],
     ) -> Vec<String> {
+        self.rank_candidates_with_annotation(context, midashi, candidates, false)
+    }
+
+    pub fn rank_candidates_with_annotation<S: AsRef<str>>(
+        &self,
+        context: &[S],
+        midashi: &str,
+        candidates: &[String],
+        annotation_priority: bool,
+    ) -> Vec<String> {
         let borrowed: Vec<&str> = candidates.iter().map(|s| s.as_str()).collect();
-        let ranked = self.rank_candidates_borrowed(context, midashi, &borrowed);
+        let ranked =
+            self.rank_candidates_borrowed(context, midashi, &borrowed, annotation_priority);
         ranked.into_iter().map(|s| s.to_string()).collect()
     }
 }
@@ -677,12 +701,44 @@ mod tests {
 
         // 小文字 "てだr" での並び替え
         assert!(predictor.should_rank(&[] as &[String], "てだr"));
-        let ranked = predictor.rank_candidates_borrowed(&[] as &[&str], "てだr", &candidates);
+        let ranked =
+            predictor.rank_candidates_borrowed(&[] as &[&str], "てだr", &candidates, false);
         assert_eq!(ranked[0], "手練");
 
         // 大文字 "てだR" でも小文字正規化によりヒットすること
         assert!(predictor.should_rank(&[] as &[String], "てだR"));
-        let ranked_upper = predictor.rank_candidates_borrowed(&[] as &[&str], "てだR", &candidates);
+        let ranked_upper =
+            predictor.rank_candidates_borrowed(&[] as &[&str], "てだR", &candidates, false);
         assert_eq!(ranked_upper[0], "手練");
+    }
+
+    #[test]
+    fn test_annotation_priority_scoring() {
+        let predictor = FrequencyPredictor::new(None);
+        // 注釈付き候補、大辞林にある語、辞書にない造語
+        let candidates = vec![
+            "謎造語xyz".to_string(),
+            "時間;time".to_string(), // 注釈付き (+100)
+            "東京".to_string(),      // システム辞書掲載語 (+100)
+        ];
+
+        // annotation_priority = true の場合、注釈・辞書語が優先昇格する
+        let ranked = predictor.rank_candidates_with_annotation(
+            &[] as &[String],
+            "とうきょう",
+            &candidates,
+            true,
+        );
+        assert_ne!(ranked[0], "謎造語xyz");
+        assert_eq!(ranked[2], "謎造語xyz"); // 辞書外の造語が最下位に沈む
+
+        // annotation_priority = false の場合、元の順序が維持される
+        let unranked = predictor.rank_candidates_with_annotation(
+            &[] as &[String],
+            "とうきょう",
+            &candidates,
+            false,
+        );
+        assert_eq!(unranked[0], "謎造語xyz");
     }
 }

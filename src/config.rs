@@ -40,6 +40,10 @@ pub struct Args {
     #[arg(long, default_value_t = true)]
     pub context_ranking: bool,
 
+    /// システム辞書（大辞林等）に項目がある単語および SKK 注釈付き単語を最優先するか（環境変数 RUSKKSERV_ANNOTATION_PRIORITY でも制御可能）
+    #[arg(long, default_value_t = true)]
+    pub annotation_priority: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -87,6 +91,10 @@ impl Args {
 
     pub fn is_context_ranking_enabled(&self) -> bool {
         parse_bool_env("RUSKKSERV_CONTEXT_RANKING", self.context_ranking)
+    }
+
+    pub fn is_annotation_priority_enabled(&self) -> bool {
+        parse_bool_env("RUSKKSERV_ANNOTATION_PRIORITY", self.annotation_priority)
     }
 }
 

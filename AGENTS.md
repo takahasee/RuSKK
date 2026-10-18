@@ -116,6 +116,21 @@
   7. **Full LTO (`lto = "fat"`) と macOS ld64 デッドストリップ (`-Wl,-dead_strip`)**: バイナリ全体にわたるクロスモジュールインライン展開と不要コード完全除去により、実行バイナリを 1.6MB に極小化し I-Cache ヒット率を最大化。
   8. **高スループットアロケータ (`mimalloc`)**: Apple Silicon の 16KB 仮想メモリページおよびスレッドローカルフリーリストを活用し、Tokio 非同期タスクやバッファ確保のマルチスレッドロック競合を抑制。
 
+### ⑩ システム辞書・注釈（annotation）優先機能と即時ロールバックスイッチ
+- **背景**: 変換候補の中に珍奇な当て字、誤変換残骸、辞書外の俗語が上位に出てくるのを防ぎ、国語辞典（大辞林等）に載っている標準的な単語や SKK 注釈付きの確実な単語を優先させたいという要求に対応。
+- **メカニズム (`src/system_dict.rs`, `src/frequency.rs`, `src/proxy.rs`)**:
+  1. **CoreServices / DictionaryServices (`DCSCopyTextDefinition`) 連携**: macOS のシステム国語辞典 API を `unsafe extern "C"` で直接呼び出し、単語の解説・定義の有無を判定。
+  2. **SKK 注釈判定**: 候補テキスト内に `;注釈` が含まれている場合も対象として認識。
+  3. **送りあり終止形合成**: 送りあり見出し（例: `かk`, `すばらしi`）の語幹候補（`書`, `素晴らし`）に対し、送り仮名を補った終止形（`書く`, `素晴らしい`）を合成して辞書照会。
+  4. **インメモリキャッシュ (`SystemDictCache`)**: 照会結果を最大 20,000 件までインメモリ `RwLock<HashMap<String, bool>>` で保持し、2 回目以降の変換遅延をゼロ化。
+  5. **加点スコア方式（ハイブリッド）**:
+     辞書掲載語・注釈付き語にボーナス加点（100点）を付与。`Total Score = (if is_match { 100 } else { 0 }) + global_count + context_score * 10`。
+     これにより、標準的な単語が前方に固まりつつ、強い文脈共起や高頻度な独自単語も自然に共存可能。
+- **即時ロールバック（安全機能）**:
+  - **CLI**: `ruskkserv --annotation-priority=false`
+  - **環境変数**: `RUSKKSERV_ANNOTATION_PRIORITY=0`
+  - **LaunchAgent**: `launchd/config.env` で `RUSKKSERV_ANNOTATION_PRIORITY=0` を指定し `./scripts/install-launchd.sh install`。
+
 ---
 
 ## 3. LaunchAgent 運用仕様
@@ -140,7 +155,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全46件合格）
+cargo test             # ユニットテスト & 結合テスト（全50件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

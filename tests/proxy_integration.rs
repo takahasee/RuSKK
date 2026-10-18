@@ -71,6 +71,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
         predictor: shared_predictor.clone(),
         okuri_expansion: false,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -148,6 +149,7 @@ async fn test_proxy_basic_lookup_passthrough() {
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -233,6 +235,7 @@ async fn test_proxy_forwards_completion() {
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -309,6 +312,7 @@ async fn test_proxy_single_char_lookup_works_immediately() {
         predictor: shared_predictor,
         okuri_expansion: false,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -385,6 +389,7 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
         predictor: shared_predictor,
         okuri_expansion: true, // 送り復元有効
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -464,6 +469,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -563,6 +569,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -649,6 +656,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -739,6 +747,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_neage() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -817,6 +826,7 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
         predictor: shared_predictor,
         okuri_expansion: false, // 送り復元無効（従来動作）
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -924,6 +934,7 @@ async fn test_proxy_context_ranking_promotes_candidates() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: true,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1061,7 +1072,8 @@ async fn test_proxy_context_ranking_disabled() {
         ),
         predictor: shared_predictor,
         okuri_expansion: true,
-        context_ranking: false, // 文脈連動無効
+        context_ranking: false,
+        annotation_priority: false, // 文脈連動無効
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1167,6 +1179,7 @@ async fn test_proxy_context_protected_against_completion_burst() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: true,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1265,6 +1278,7 @@ async fn test_proxy_okuri_expansion_resolves_sokuon_omot() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1341,6 +1355,7 @@ async fn test_proxy_okuri_expansion_resolves_youon_warac() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1415,6 +1430,7 @@ async fn test_proxy_okuri_expansion_resolves_youon_tabey() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1492,6 +1508,7 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
         predictor: shared_predictor,
         okuri_expansion: true,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {
@@ -1508,6 +1525,87 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
     let n = client.read(&mut buf).await.unwrap();
     let resp = String::from_utf8_lossy(&buf[..n]);
     assert_eq!(resp, "1/使/仕/遣/支/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    upstream_handle.abort();
+}
+
+/// annotation_priority が有効な場合、システム辞書掲載語や注釈付き語が優先昇格し、
+/// 無効（false）にした場合は元のバックエンド返却順が維持されることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_annotation_priority() {
+    let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream_addr = upstream_listener.local_addr().unwrap();
+
+    let upstream_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = upstream_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with(b"1\xe3\x81\xa8\xe3\x81\x86\xe3\x81\x8d\xe3\x82\x87\xe3\x81\x86 ") {
+                            // "1とうきょう " -> 辞書外の造語が先頭、2番目が東京、3番目が注釈付き
+                            let _ = stream
+                                .write_all("1/謎造語xyz/東京/時間;時刻/\n".as_bytes())
+                                .await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    // 1. annotation_priority = true のプロキシ
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-primary-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        fallback: Backend::new(
+            "mock-fallback",
+            upstream_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        predictor: shared_predictor.clone(),
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: true, // システム辞書・注釈優先有効
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1とうきょう \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+
+    // 謎造語xyz は最下位（末尾）に沈み、東京および時間;時刻が上位に来ていること
+    assert!(resp.starts_with("1/"));
+    assert!(resp.ends_with("/謎造語xyz/\n"));
 
     drop(client);
     proxy_handle.abort();

@@ -53,6 +53,7 @@ load_config() {
   IMPORTER_APP_BIN="${IMPORTER_APP}/Contents/MacOS/RuSKKservImporter"
   RUSKKSERV_OKURI_EXPANSION="${RUSKKSERV_OKURI_EXPANSION:-1}"
   RUSKKSERV_CONTEXT_RANKING="${RUSKKSERV_CONTEXT_RANKING:-1}"
+  RUSKKSERV_ANNOTATION_PRIORITY="${RUSKKSERV_ANNOTATION_PRIORITY:-1}"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
@@ -85,6 +86,7 @@ render_plist() {
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
     -e "s|@RUSKKSERV_OKURI_EXPANSION@|${RUSKKSERV_OKURI_EXPANSION}|g" \
     -e "s|@RUSKKSERV_CONTEXT_RANKING@|${RUSKKSERV_CONTEXT_RANKING}|g" \
+    -e "s|@RUSKKSERV_ANNOTATION_PRIORITY@|${RUSKKSERV_ANNOTATION_PRIORITY}|g" \
     -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
     "$template" >"$dest"
 }
@@ -118,7 +120,9 @@ do_install() {
   bootout_if_loaded "com.ruskkserv.yaskkserv2"
   bootout_if_loaded "com.ruskkserv.skkserv"
 
+  launchctl enable "$DOMAIN/com.ruskkserv.yaskkserv2" 2>/dev/null || true
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.yaskkserv2.plist"
+  launchctl enable "$DOMAIN/com.ruskkserv.skkserv" 2>/dev/null || true
   launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.skkserv.plist"
 
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
@@ -126,6 +130,7 @@ do_install() {
     render_plist "${ROOT}/launchd/com.ruskkserv.import-user-dict.plist" \
       "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
     bootout_if_loaded "com.ruskkserv.import-user-dict"
+    launchctl enable "$DOMAIN/com.ruskkserv.import-user-dict" 2>/dev/null || true
     launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
   fi
 

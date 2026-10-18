@@ -117,6 +117,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
         predictor: shared_predictor.clone(),
         okuri_expansion: false,
         context_ranking: false,
+        annotation_priority: false,
     };
 
     let proxy_handle = tokio::spawn(async move {

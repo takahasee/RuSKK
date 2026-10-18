@@ -26,6 +26,8 @@
         <string>@RUSKKSERV_OKURI_EXPANSION@</string>
         <key>RUSKKSERV_CONTEXT_RANKING</key>
         <string>@RUSKKSERV_CONTEXT_RANKING@</string>
+        <key>RUSKKSERV_ANNOTATION_PRIORITY</key>
+        <string>@RUSKKSERV_ANNOTATION_PRIORITY@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

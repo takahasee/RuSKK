@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         predictor: Arc::clone(&predictor),
         okuri_expansion: args.is_okuri_expansion_enabled(),
         context_ranking: args.is_context_ranking_enabled(),
+        annotation_priority: args.is_annotation_priority_enabled(),
     };
 
     // SIGTERM / SIGINT を受け取ったらプロキシを停止する。
