@@ -49,6 +49,19 @@ impl FrequencyPredictor {
         Ok(())
     }
 
+    /// 永続化ファイルが存在し非空の場合、エイリアス展開前の生データを再読み込みする。
+    /// ファイル保存時（init-seed / import-user-dict）にランタイム用のエイリアスが書き出されるのを防ぐ。
+    fn reload_raw_if_exists(&mut self) {
+        if let Some(ref path) = self.storage_path
+            && let Ok(data) = fs::read_to_string(path)
+            && !data.trim().is_empty()
+            && let Ok(loaded) = serde_json::from_str::<FrequencyPredictor>(&data)
+        {
+            self.frequencies = loaded.frequencies;
+            self.context_frequencies = loaded.context_frequencies;
+        }
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(ref path) = self.storage_path {
             if let Some(parent) = path.parent() {
@@ -68,9 +81,8 @@ impl FrequencyPredictor {
         Ok(data)
     }
 
-    /// 組み込みのデフォルト文脈プリセット（context_frequencies）をマージする。
-    /// 既存の frequencies や context_frequencies は維持され、プリセット側の値が追加・更新（最大値）される。
-    pub fn merge_default_presets(&mut self) -> anyhow::Result<()> {
+    /// エイリアス展開を行わずにデフォルト文脈プリセットの生データのみをマージする。
+    fn merge_default_presets_raw(&mut self) -> anyhow::Result<()> {
         let preset = Self::default_preset_data()?;
         for (ctx, cands) in preset.context_frequencies {
             let entry = self.context_frequencies.entry(ctx).or_default();
@@ -79,6 +91,13 @@ impl FrequencyPredictor {
                 *current = (*current).max(count);
             }
         }
+        Ok(())
+    }
+
+    /// 組み込みのデフォルト文脈プリセット（context_frequencies）をマージする。
+    /// 既存の frequencies や context_frequencies は維持され、プリセット側の値が追加・更新（最大値）される。
+    pub fn merge_default_presets(&mut self) -> anyhow::Result<()> {
+        self.merge_default_presets_raw()?;
         self.expand_aliases();
         Ok(())
     }
@@ -100,12 +119,12 @@ impl FrequencyPredictor {
             let preset = Self::default_preset_data()?;
             self.frequencies = preset.frequencies;
             self.context_frequencies = preset.context_frequencies;
-            self.expand_aliases();
         } else {
-            // merge_default_presets 内で expand_aliases が呼ばれる
-            self.merge_default_presets()?;
+            self.reload_raw_if_exists();
+            self.merge_default_presets_raw()?;
         }
         self.save()?;
+        self.expand_aliases();
         Ok(())
     }
 
@@ -116,6 +135,7 @@ impl FrequencyPredictor {
     /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
     pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
         let content = fs::read_to_string(dict_path)?;
+        self.reload_raw_if_exists();
 
         for line in content.lines() {
             let line = line.trim();
@@ -157,14 +177,12 @@ impl FrequencyPredictor {
 
         // context_frequencies が空なら、デフォルトプリセットも一緒に初期化
         if self.context_frequencies.is_empty() {
-            // merge_default_presets 内で expand_aliases が呼ばれる
-            let _ = self.merge_default_presets();
-        } else {
-            self.expand_aliases();
+            let _ = self.merge_default_presets_raw();
         }
 
-        // インポートした結果を保存する
+        // エイリアス展開前のクリーンなデータを保存し、その後メモリ上でエイリアスを展開する
         self.save()?;
+        self.expand_aliases();
 
         Ok(())
     }
@@ -645,7 +663,12 @@ mod tests {
             10
         );
 
-        // ファイルから再ロードしても正しく永続化されていること
+        // 保存された JSON ファイルには中間プレフィックス（"プ" 等）が混入していないこと
+        let raw_saved: FrequencyPredictor =
+            serde_json::from_str(&fs::read_to_string(json_file.path()).unwrap()).unwrap();
+        assert!(!raw_saved.context_frequencies.contains_key("プ"));
+
+        // ファイルから再ロードしても正しく永続化・メモリ上エイリアス展開されていること
         let reloaded = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
         assert_eq!(
             reloaded
@@ -653,6 +676,16 @@ mod tests {
                 .get("服")
                 .unwrap()
                 .get("着る")
+                .copied()
+                .unwrap_or(0),
+            10
+        );
+        assert_eq!(
+            reloaded
+                .context_frequencies
+                .get("服")
+                .unwrap()
+                .get("着")
                 .copied()
                 .unwrap_or(0),
             10

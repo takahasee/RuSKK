@@ -36,7 +36,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
 ### 1. ビルド & テスト
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # 全 46 件のユニット・結合テスト合格を確認
+cargo test             # 全 52 件のユニット・結合テスト合格を確認
 ```
 
 ### 2. LaunchAgent による常駐運用
@@ -107,7 +107,7 @@ RuSKKserv は日本語の動詞・形容詞活用体系に準拠し、特定子�
 
 ### ② 直前確定単語に基づく文脈連動候補昇格（Context Ranking）
 
-直前に確定した単語（漢字を含む単語のみ）を接続セッションごとに記憶（有効期限 60 秒）し、共起辞書に基づいて候補スコアを加算（$\text{Context Score} \times 10$）して第1候補へ昇格させます。
+直前に確定した単語（漢字を含む単語のみ）を記憶（複数 TCP セッション間で共有・有効期限 60 秒）し、共起辞書に基づいて候補スコアを加算（$\text{Context Score} \times 10$）して第1候補へ昇格させます。
 
 * **macSKK の機械的 1 文字 Lookup 対策**:
   macSKK は ▽ 入力開始時に先頭 1 文字（例: `き`）を自動照会します。RuSKKserv は新しい見出し語が保留中見出しの前方一致伸長（`き`→`きr`、`に`→`にく`）かつ未確定（受信回数 2 未満）の場合、入力途中の伸長とみなして**文脈昇格せずに安全に破棄**し、真の確定文脈のみを保持します。
@@ -137,7 +137,7 @@ macOS のシステム国語辞典（大辞林等）に項目が存在する単�
 
 ### ⑤ パフォーマンス・ハードウェア最適化
 
-- **ゼロコピー・ファストパス**: 並び替えルールが存在しない通常単語は、パースやヒープ確保を完全スキップして直結転送（**0.01ms 未満**）。
+- **ゼロコピー・ファストパス**: 単一候補の単語や並び替え対象外の単語は、パースやヒープ確保を完全スキップして直結転送（**0.01ms 未満**）。
 - **$O(1)$ 柔軟照合**: seed ロード時に前方一致エイリアス（「切る」↔「切」等）を双方向展開し、ランタイムの線形探索を完全排除。
 - **EUC-JP 一括 SIMD デコード**: スラッシュ区切りごとの逐次デコードを全廃し、SIMD 最適化一括デコードを適用。
 - **PDQsort**: 候補整列に `sort_unstable_by` を採用し、定常時アロケーションをゼロ化。
@@ -240,10 +240,12 @@ Options:
           Timeout for azoo-key-skkserv queries (milliseconds) [default: 1500]
       --yaskkserv2-timeout-ms <YASKKSERV2_TIMEOUT_MS>
           Timeout for yaskkserv2 queries (milliseconds) [default: 700]
-      --okuri-expansion
-          送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能）
-      --context-ranking
-          直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能）
+      --okuri-expansion [<OKURI_EXPANSION>]
+          送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能） [default: true] [possible values: true, false]
+      --context-ranking [<CONTEXT_RANKING>]
+          直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能） [default: true] [possible values: true, false]
+      --annotation-priority [<ANNOTATION_PRIORITY>]
+          システム辞書（大辞林等）に項目がある単語および SKK 注釈付き単語を最優先するか（環境変数 RUSKKSERV_ANNOTATION_PRIORITY でも制御可能） [default: true] [possible values: true, false]
   -h, --help
           Print help
   -V, --version
@@ -274,7 +276,7 @@ Options:
 | opcode | 動作 | 処理内容 |
 | :---: | :--- | :--- |
 | `0` | 切断 | セッション終了 |
-| `1` | 変換照会 | 送りあり復元 → azooKey 照会 → yaskkserv2 フォールバック → 文脈・頻度整列 |
+| `1` | 変換照会 | 送りあり復元 → azooKey 照会 → yaskkserv2 フォールバック → 文脈・頻度・システム辞書整列 |
 | `2` | バージョン | `ruskkserv/<VERSION> ` を返却 |
 | `3` | ホスト情報 | ホスト情報を返却 |
 | `4` | 補完照会 | azooKey / yaskkserv2 に照会して見出し補完リストを返却（文脈保留には影響しない） |

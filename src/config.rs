@@ -33,15 +33,33 @@ pub struct Args {
     pub yaskkserv2_timeout_ms: u64,
 
     /// 送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能）
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub okuri_expansion: bool,
 
     /// 直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能）
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub context_ranking: bool,
 
     /// システム辞書（大辞林等）に項目がある単語および SKK 注釈付き単語を最優先するか（環境変数 RUSKKSERV_ANNOTATION_PRIORITY でも制御可能）
-    #[arg(long, default_value_t = true)]
+    #[arg(
+        long,
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
     pub annotation_priority: bool,
 
     #[command(subcommand)]
@@ -109,4 +127,42 @@ fn parse_bool_env(var: &str, default: bool) -> bool {
         }
     }
     default
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_bool_flags_rollback() {
+        // デフォルトではすべて true
+        let default_args = Args::try_parse_from(["ruskkserv"]).unwrap();
+        assert!(default_args.okuri_expansion);
+        assert!(default_args.context_ranking);
+        assert!(default_args.annotation_priority);
+
+        // =false 指定で個別にロールバックできること
+        let disabled_args = Args::try_parse_from([
+            "ruskkserv",
+            "--okuri-expansion=false",
+            "--context-ranking=false",
+            "--annotation-priority=false",
+        ])
+        .unwrap();
+        assert!(!disabled_args.okuri_expansion);
+        assert!(!disabled_args.context_ranking);
+        assert!(!disabled_args.annotation_priority);
+
+        // 値なしフラグ単体指定でも true として解釈されること
+        let bare_flags = Args::try_parse_from([
+            "ruskkserv",
+            "--okuri-expansion",
+            "--context-ranking",
+            "--annotation-priority",
+        ])
+        .unwrap();
+        assert!(bare_flags.okuri_expansion);
+        assert!(bare_flags.context_ranking);
+        assert!(bare_flags.annotation_priority);
+    }
 }

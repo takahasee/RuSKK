@@ -9,7 +9,7 @@ use tracing::{debug, error, info, warn};
 use crate::backend::Backend;
 use crate::encoding::{
     decode_euc_or_utf8, extract_first_candidate, format_candidates_response_str,
-    parse_candidates_borrowed,
+    has_multiple_candidates, parse_candidates_borrowed,
 };
 use crate::frequency::SharedPredictor;
 use crate::protocol::{Request, is_found, parse_request};
@@ -46,11 +46,21 @@ struct PendingContext {
 #[derive(Debug, Default)]
 #[repr(align(128))]
 struct SharedContextState {
-    session_context: Option<Arc<str>>,
+    session_context: Option<(Arc<str>, Instant)>,
     pending_context: Option<PendingContext>,
 }
 
 impl SharedContextState {
+    /// 有効期限（CONTEXT_TTL）内の確定文脈を取得する。期限切れの場合はクリアする。
+    fn current_context(&mut self, now: Instant) -> Option<Arc<str>> {
+        if let Some((_, time)) = self.session_context
+            && now.duration_since(time) > CONTEXT_TTL
+        {
+            self.session_context = None;
+        }
+        self.session_context.as_ref().map(|(w, _)| Arc::clone(w))
+    }
+
     /// 新しい手動 Lookup の開始時に呼び出し、保留中の単語を確定（昇格）するか判定する。
     /// 戻り値は並び替えに使う文脈のスナップショット。
     fn on_lookup_start(&mut self, midashi: &str, now: Instant) -> Option<Arc<str>> {
@@ -70,7 +80,7 @@ impl SharedContextState {
                 );
             } else if now.duration_since(pending.time) <= CONTEXT_TTL {
                 // 見出し語が変わったため、前回の単語が確定したと判定して昇格
-                self.session_context = Some(pending.word);
+                self.session_context = Some((pending.word, pending.time));
                 debug!(
                     context = ?self.session_context,
                     new_midashi = %midashi,
@@ -80,7 +90,7 @@ impl SharedContextState {
                 self.session_context = None;
             }
         }
-        self.session_context.clone()
+        self.current_context(now)
     }
 
     /// Lookup の応答後に呼び出し、返却第1候補を次回のための保留単語として記録する。
@@ -261,7 +271,7 @@ async fn handle_client(
                     if proxy.context_ranking && !is_completion_burst {
                         ctx.on_lookup_start(&midashi_str, now)
                     } else {
-                        ctx.session_context.clone()
+                        ctx.current_context(now)
                     }
                 };
 
@@ -389,11 +399,14 @@ async fn handle_client(
                 } else {
                     let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
                     if is_found(&response) {
-                        // 【ファストパス】並び替えルールまたは注釈・辞書優先があるか高速判定
-                        let should_rank = proxy.annotation_priority || {
-                            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                            guard.should_rank(ctx_ref, &midashi_str)
-                        };
+                        // 【ファストパス】単一候補（候補数 <= 1）の場合は並び替えの余地がないため完全ゼロコピー直結。
+                        // 複数候補がある場合のみ、注釈・辞書優先または並び替えルールの有無を高速判定する。
+                        let should_rank = has_multiple_candidates(&response)
+                            && (proxy.annotation_priority || {
+                                let guard =
+                                    proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                                guard.should_rank(ctx_ref, &midashi_str)
+                            });
 
                         if should_rank {
                             // 並び替えルールがある場合のみ、ゼロコピーで借用パースして並び替え
@@ -593,5 +606,24 @@ mod tests {
         lookup(&mut s, "ふく", "服");
         let ctx = lookup(&mut s, "きr", "着");
         assert_eq!(ctx.as_deref(), Some("服"));
+    }
+
+    #[test]
+    fn expired_session_context_is_cleared_even_after_input_extension() {
+        let mut s = SharedContextState::default();
+        let t0 = Instant::now();
+        // 1. 「にく」を変換
+        s.on_lookup_start("にく", t0);
+        s.on_lookup_result("にく", Arc::from("肉"), t0);
+
+        // 2. 10秒後に ▽き（先頭1文字の機械的 Lookup）-> 「肉」が session_context に昇格
+        let t1 = t0 + Duration::from_secs(10);
+        assert_eq!(s.on_lookup_start("き", t1).as_deref(), Some("肉"));
+        s.on_lookup_result("き", Arc::from("木"), t1);
+
+        // 3. 最初の確定から61秒後（TTL 60秒超過）に「きr」を入力
+        // 「き」->「きr」は入力伸長として破棄され、かつ「肉」もTTL超過で消去されること
+        let t2 = t0 + Duration::from_secs(61);
+        assert_eq!(s.on_lookup_start("きr", t2), None);
     }
 }

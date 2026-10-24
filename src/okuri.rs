@@ -57,6 +57,59 @@ pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
     }
 }
 
+/// システム国語辞典（大辞林等）の見出し語照会に適した終止形・連用形・下一段サフィックスを返す。
+/// 口語音便（なきゃ・なくちゃ・った等）を省き、辞書見出し語となる五段終止形・連用形・一段終止形を優先する。
+pub fn okuri_key_to_dict_suffixes(key: char) -> &'static [&'static str] {
+    match key.to_ascii_lowercase() {
+        'k' => &["く", "き", "け", "ける"],
+        's' => &["す", "し", "せ", "せる"],
+        't' => &["つ", "ち", "て", "てる"],
+        'n' => &["ぬ", "に", "ね", "ねる", "ない"],
+        'm' => &["む", "み", "め", "める"],
+        'r' => &["る", "り", "れ", "れる"],
+        'g' => &["ぐ", "ぎ", "げ", "げる"],
+        'b' => &["ぶ", "び", "べ", "べる"],
+        'u' | 'w' => &["う", "い", "え", "える"],
+        'e' => &["える", "え", "う"],
+        'o' => &["う", "おう", "よう"],
+        'a' => &["う", "わない", "ない"],
+        'i' => &["い", "う", "く"],
+        'd' => &["だ", "で", "む", "ぶ", "ぬ"],
+        'c' => &["う", "つ", "ち"],
+        'y' => &["る", "よう"],
+        'j' => &["じる", "じ", "ずる"],
+        'p' => &["っぽい", "ぽい"],
+        _ => &[],
+    }
+}
+
+/// 平仮名1文字から対応する SKK 送りローマ字子音（小文字）を返す。
+pub fn kana_to_okuri_key(c: char) -> Option<char> {
+    match c {
+        'あ' => Some('a'),
+        'い' => Some('i'),
+        'う' => Some('u'),
+        'え' => Some('e'),
+        'お' => Some('o'),
+        'か' | 'き' | 'く' | 'け' | 'こ' => Some('k'),
+        'が' | 'ぎ' | 'ぐ' | 'げ' | 'ご' => Some('g'),
+        'さ' | 'し' | 'す' | 'せ' | 'そ' => Some('s'),
+        'ざ' | 'じ' | 'ず' | 'ぜ' | 'ぞ' => Some('z'),
+        'た' | 'ち' | 'つ' | 'て' | 'と' | 'っ' => Some('t'),
+        'だ' | 'ぢ' | 'づ' | 'で' | 'ど' => Some('d'),
+        'な' | 'に' | 'ぬ' | 'ね' | 'の' | 'ん' => Some('n'),
+        'は' | 'ひ' | 'ふ' | 'へ' | 'ほ' => Some('h'),
+        'ば' | 'び' | 'ぶ' | 'べ' | 'ぼ' => Some('b'),
+        'ぱ' | 'ぴ' | 'ぷ' | 'ぺ' | 'ぽ' => Some('p'),
+        'ま' | 'み' | 'む' | 'め' | 'も' => Some('m'),
+        'や' | 'ゆ' | 'よ' => Some('y'),
+        'ら' | 'り' | 'る' | 'れ' | 'ろ' => Some('r'),
+        'わ' | 'ゐ' | 'ゑ' | 'を' => Some('w'),
+        _ if c.is_ascii_alphabetic() => Some(c.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
 /// 大文字で始まるローマ字（例: "Ga", "G", "Ka", "To", "Shi" など）を平仮名に変換する。
 /// 複合語の送りあり接尾辞（例: "交ぜGak" -> "交ぜがk", "交ぜGk" -> "交ぜがk"）の復元に使用。
 pub fn romaji_to_hiragana(romaji: &str) -> Option<&'static str> {
@@ -312,16 +365,48 @@ pub fn parse_okuri_midashi(midashi: &str) -> Option<(&str, char)> {
 
 use std::borrow::Cow;
 
-/// 見出し語（例: "てだR", "てだ*れ", "かk"）を正規化された小文字の送りあり見出し（例: "てだr", "かk"）に変換する。
-/// 送りありでない場合は元の文字列のスライス借用またはクローンを返す。
+/// 見出し語（例: "てだR", "てだ*れ", "交ぜGak", "かk"）を正規化された小文字の送りあり見出し（例: "てだr", "交ぜがk", "かk"）に変換する。
+/// 送りありでない場合は元の文字列のスライス借用を返す。
 pub fn normalize_okuri_midashi_key(midashi: &str) -> Cow<'_, str> {
-    if let Some((stem, key)) = parse_okuri_midashi(midashi) {
-        let mut s = String::with_capacity(stem.len() + 1);
-        s.push_str(stem);
-        s.push(key.to_ascii_lowercase());
-        Cow::Owned(s)
-    } else {
-        Cow::Borrowed(midashi)
+    match parse_okuri_midashi_extended(midashi) {
+        Some(OkuriMidashi::Simple { stem, key }) => {
+            if key.is_ascii_lowercase() && !midashi.contains('*') {
+                Cow::Borrowed(midashi)
+            } else {
+                let mut s = String::with_capacity(stem.len() + 1);
+                s.push_str(stem);
+                s.push(key.to_ascii_lowercase());
+                Cow::Owned(s)
+            }
+        }
+        Some(OkuriMidashi::Compound {
+            prefix,
+            romaji,
+            okuri_key,
+        }) => {
+            if let Some(upper_kana) = romaji_to_hiragana(romaji) {
+                let mut s = String::with_capacity(prefix.len() + upper_kana.len() + 1);
+                s.push_str(prefix);
+                s.push_str(upper_kana);
+                s.push(okuri_key.to_ascii_lowercase());
+                Cow::Owned(s)
+            } else {
+                Cow::Borrowed(midashi)
+            }
+        }
+        Some(OkuriMidashi::Explicit { prefix, suffix }) => {
+            if let Some(first) = suffix.chars().next()
+                && let Some(key) = kana_to_okuri_key(first)
+            {
+                let mut s = String::with_capacity(prefix.len() + 1);
+                s.push_str(prefix);
+                s.push(key);
+                Cow::Owned(s)
+            } else {
+                Cow::Borrowed(midashi)
+            }
+        }
+        None => Cow::Borrowed(midashi),
     }
 }
 
@@ -618,6 +703,14 @@ mod tests {
         assert_eq!(parse_okuri_midashi("SKK"), None);
         assert_eq!(parse_okuri_midashi("k"), None);
         assert_eq!(parse_okuri_midashi("Gak"), None);
+
+        // 正規化キー変換
+        assert_eq!(normalize_okuri_midashi_key("かk"), "かk");
+        assert_eq!(normalize_okuri_midashi_key("てだR"), "てだr");
+        assert_eq!(normalize_okuri_midashi_key("てだ*れ"), "てだr");
+        assert_eq!(normalize_okuri_midashi_key("ねあ*げ"), "ねあg");
+        assert_eq!(normalize_okuri_midashi_key("交ぜGak"), "交ぜがk");
+        assert_eq!(normalize_okuri_midashi_key("交ぜGk"), "交ぜがk");
     }
 
     #[test]

@@ -155,7 +155,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全50件合格）
+cargo test             # ユニットテスト & 結合テスト（全52件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

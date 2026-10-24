@@ -49,6 +49,22 @@ pub fn extract_first_candidate(response: &[u8]) -> Option<&str> {
     std::str::from_utf8(first).ok()
 }
 
+/// レスポンスバイト列に2つ以上の候補が含まれているかをゼロアロケーションで高速判定する。
+/// 単一候補（例: `1/東京/\n`）の場合は false を返し、パース・並び替えを完全スキップできる。
+#[inline]
+pub fn has_multiple_candidates(response: &[u8]) -> bool {
+    if !response.starts_with(b"1/") {
+        return false;
+    }
+    let rest = &response[2..];
+    if let Some(first_end) = memchr::memchr(b'/', rest) {
+        let after_first = &rest[first_end + 1..];
+        memchr::memchr(b'/', after_first).is_some()
+    } else {
+        false
+    }
+}
+
 /// レスポンスバイト列から借用スライスの候補リスト（ゼロコピー）を抽出
 /// NEON 128-bit SIMD (`memchr_iter`) によりスラッシュ区切りを一括高速走査する。
 #[inline]
@@ -206,6 +222,10 @@ mod tests {
         assert_eq!(extract_first_candidate("1/服/\n".as_bytes()), Some("服"));
         assert_eq!(extract_first_candidate(b"4\n"), None);
         assert_eq!(extract_first_candidate(b"1/\n"), None);
+
+        assert!(has_multiple_candidates("1/東京/Tokyo/\n".as_bytes()));
+        assert!(!has_multiple_candidates("1/服/\n".as_bytes()));
+        assert!(!has_multiple_candidates(b"4\n"));
     }
 
     #[test]

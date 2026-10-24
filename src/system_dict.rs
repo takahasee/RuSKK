@@ -156,18 +156,33 @@ pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
         return true;
     }
 
-    // 3. 送りあり見出しの場合、語幹＋終止形送り仮名でも判定する
+    // 3. 送りあり見出しの場合、語幹＋終止形・名詞形送り仮名でも判定する
     if let Some(mid) = midashi
-        && let Some((_stem, key)) = crate::okuri::parse_okuri_midashi(mid)
+        && let Some(parsed) = crate::okuri::parse_okuri_midashi_extended(mid)
     {
-        let suffixes = crate::okuri::okuri_key_to_suffixes(key);
-        // 代表的な終止形・名詞形サフィックスを試行
-        for &suffix in suffixes.iter().take(4) {
-            let mut full_word = String::with_capacity(clean.len() + suffix.len());
-            full_word.push_str(clean);
-            full_word.push_str(suffix);
-            if cache.has_definition(&full_word) {
-                return true;
+        let key_opt = match parsed {
+            crate::okuri::OkuriMidashi::Simple { key, .. } => Some(key),
+            crate::okuri::OkuriMidashi::Compound { okuri_key, .. } => Some(okuri_key),
+            crate::okuri::OkuriMidashi::Explicit { suffix, .. } => {
+                let mut full_word = String::with_capacity(clean.len() + suffix.len());
+                full_word.push_str(clean);
+                full_word.push_str(suffix);
+                if cache.has_definition(&full_word) {
+                    return true;
+                }
+                suffix.chars().next().and_then(crate::okuri::kana_to_okuri_key)
+            }
+        };
+
+        if let Some(key) = key_opt {
+            let suffixes = crate::okuri::okuri_key_to_dict_suffixes(key);
+            for &suffix in suffixes {
+                let mut full_word = String::with_capacity(clean.len() + suffix.len());
+                full_word.push_str(clean);
+                full_word.push_str(suffix);
+                if cache.has_definition(&full_word) {
+                    return true;
+                }
             }
         }
     }
@@ -198,6 +213,10 @@ mod tests {
         assert!(is_annotated_or_in_dict("書", Some("かk")));
         // 語幹「素晴らし」+ 見出し「すばらしi」-> 「素晴らしい」が大辞林にヒット
         assert!(is_annotated_or_in_dict("素晴らし", Some("すばらしi")));
+        // タ行連用形名詞・ナ行下一段・アスタリスク明示送り仮名も大辞林にヒット
+        assert!(is_annotated_or_in_dict("手持", Some("てもt")));
+        assert!(is_annotated_or_in_dict("兼", Some("かn")));
+        assert!(is_annotated_or_in_dict("値上", Some("ねあ*げ")));
 
         // 辞書に存在しない造語や記号
         assert!(!is_annotated_or_in_dict("すバラス", None));
