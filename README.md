@@ -8,7 +8,8 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
                                     →  yaskkserv2 (:1179, Fallback)
 
 ※ 通常の単語は見つからない場合のみ Fallback に照会しますが、
-   送りあり見出しの場合は Primary の活用形復元結果と Fallback の全候補を自動的にマージして返却します。
+   送りあり見出し、および送りなし見出しで Primary の第1候補が辞書未掲載の活用・助詞断片だった場合や
+   frequencies の最上位登録語が Primary にない場合は、Fallback の候補を自動的に補完マージして返却します。
 ```
 
 ---
@@ -23,10 +24,12 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
    - 「肉」確定後の `きr` → 「切る（切）」、「服」確定後なら「着る（着）」、「木」確定後なら「伐る（伐）」を第1候補に自動昇格。
    - 「時間」→「計る」、「体重」→「量る」、「距離」→「測る」など、470組以上の文脈共起ペア（前方一致展開後800キー以上）を標準サポート。
    - **macSKK 特有の挙動対策**: ▽ モード開始時の過渡的 1 文字 Lookup やキー連射による文脈汚染を自動防御。
-3. **macSKK の辞書競合を解消するシームレス統合**:
+3. **macOS システム辞書（大辞林等）・SKK 注釈優先と送りなし断片降格（Annotation Priority）**:
+   - 国語辞典の見出し語と一致する標準的な単語や注釈付き単語を優先し、動詞活用断片や助詞混じり断片（`がそ`→`貸そ`、`みぎや`→`右や`、`げそ`→`解そ` 等）を後方に降格。
+4. **macSKK の辞書競合を解消するシームレス統合**:
    - 巨大辞書群（NEologd, Wikipedia 等）を yaskkserv2 に集約し、macSKK は RuSKKserv 一本に一本化。
    - ユーザー辞書の学習順序を冪等に取り込むインポートコマンド（`import-user-dict`）と SIGHUP ホットリロードを完備。
-4. **ゼロコピー・Apple Silicon 最適化による極小レイテンシ**:
+5. **ゼロコピー・Apple Silicon 最適化による極小レイテンシ**:
    - パースの借用スライス化、EUC-JP 一括 SIMD デコード、Apple Silicon 128バイト キャッシュライン整合（`#[repr(align(128))]`）、`memchr` NEON ベクトル走査、Full LTO、`mimalloc` により 100〜200ms 台の高速応答を維持。
 
 ---
@@ -36,7 +39,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
 ### 1. ビルド & テスト
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # 全 55 件のユニット・結合テスト合格を確認
+cargo test             # 全 58 件のユニット・結合テスト合格を確認
 ```
 
 ### 2. LaunchAgent による常駐運用
@@ -87,7 +90,8 @@ RuSKKserv は、以下の独立したレイヤーが役割分担して連携す�
 macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ Primary/Fallback 透過照会 ──→ Tab 先読み補完
                │
                └─ [opcode 1 (変換)] ─┬─ 送りあり活用復元 & 全子音マージ (azooKey 活用)
-                                     └─ 直前確定単語 (session_context) ──→ 共起スコア昇格
+                                     ├─ 直前確定単語 (session_context) ──→ 共起スコア昇格
+                                     └─ システム辞書・注釈照合 & 送りなし断片降格 / Fallback 補完
 ```
 
 ### ① 送りあり見出しの活用形復元・語幹抽出（Okuri Expansion）
@@ -280,3 +284,9 @@ Options:
 | `2` | バージョン | `ruskkserv/<VERSION> ` を返却 |
 | `3` | ホスト情報 | ホスト情報を返却 |
 | `4` | 補完照会 | azooKey / yaskkserv2 に照会して見出し補完リストを返却（文脈保留には影響しない） |
+
+---
+
+## ライセンス
+
+[MIT License](LICENSE)
