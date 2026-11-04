@@ -1611,3 +1611,215 @@ async fn test_proxy_annotation_priority() {
     proxy_handle.abort();
     upstream_handle.abort();
 }
+
+/// Fallback (yaskkserv2) の個別タイムアウト設定が overall_deadline (850ms) より短い場合、
+/// 850ms まで待たずに指定した fallback.timeout で速やかにタイムアウトすることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_respects_fallback_timeout() {
+    // Primary は即座に 4\n (miss) を返すモック
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+    let primary_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = primary_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                });
+            }
+        }
+    });
+
+    // Fallback は接続を受け付けるが応答しない（ハング状態をシミュレート）
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_addr = fallback_listener.local_addr().unwrap();
+    let fallback_handle = tokio::spawn(async move {
+        let mut held_streams = Vec::new();
+        while let Ok((stream, _)) = fallback_listener.accept().await {
+            held_streams.push(stream);
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-primary-miss",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        fallback: Backend::new(
+            "mock-fallback-hang",
+            fallback_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(120), // 850ms より十分短い 120ms を指定
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    let start = tokio::time::Instant::now();
+    client.write_all("1みとうろく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(&buf[..n], b"4\n");
+    assert!(
+        elapsed < Duration::from_millis(450),
+        "fallback timeout (120ms) should trigger well before 850ms overall deadline, took {:?}",
+        elapsed
+    );
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+    fallback_handle.abort();
+}
+
+/// 送りなし見出し（「がそ」「みぎや」「げそ」等）で Primary (azooKey) が送り仮名・助詞混じり断片（貸そ/右や/解そ）を
+/// 先頭に返したり、frequencies の登録候補（→）を欠いている場合、
+/// Fallback (yaskkserv2) とマージ・再整列して「画素」「→」「下足」が第1候補になることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_okuri_nashi_demotes_fragments_and_merges_fallback() {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+    let primary_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = primary_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with("1がそ ".as_bytes()) {
+                            let _ = stream.write_all("1/貸そ/画素/\n".as_bytes()).await;
+                        } else if req.starts_with("1みぎや ".as_bytes()) {
+                            let _ = stream.write_all("1/右矢/右や/\n".as_bytes()).await;
+                        } else if req.starts_with("1げそ ".as_bytes()) {
+                            let _ = stream.write_all("1/解そ/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_addr = fallback_listener.local_addr().unwrap();
+    let fallback_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = fallback_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with("1がそ ".as_bytes()) {
+                            let _ = stream.write_all("1/画素/\n".as_bytes()).await;
+                        } else if req.starts_with("1みぎや ".as_bytes()) {
+                            let _ = stream.write_all("1/→/⇒/右矢/右谷/\n".as_bytes()).await;
+                        } else if req.starts_with("1げそ ".as_bytes()) {
+                            let _ = stream.write_all("1/下足/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.frequencies.insert("みぎや".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("→".to_string(), 1);
+        m
+    });
+    predictor.expand_aliases();
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        fallback: Backend::new(
+            "mock-fallback",
+            fallback_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: true,
+        annotation_priority: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 「がそ」: 「貸そ」ではなく「画素」が第1候補になること
+    client.write_all("1がそ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp_gaso = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp_gaso, "1/画素/貸そ/\n");
+
+    // 2. 「みぎや」: Fallback の「→」がマージされて第1候補になり、「右や」が最下位に沈むこと
+    client.write_all("1みぎや \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp_migiya = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp_migiya, "1/→/右矢/⇒/右谷/右や/\n");
+
+    // 3. 「げそ」: Primary が単一断片「解そ」しか返さなくても、Fallback の「下足」がマージされ第1候補になること
+    client.write_all("1げそ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp_geso = String::from_utf8_lossy(&buf[..n]);
+    assert_eq!(resp_geso, "1/下足/解そ/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+    fallback_handle.abort();
+}

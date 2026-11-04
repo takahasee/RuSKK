@@ -132,6 +132,9 @@ do_install() {
     bootout_if_loaded "com.ruskkserv.import-user-dict"
     launchctl enable "$DOMAIN/com.ruskkserv.import-user-dict" 2>/dev/null || true
     launchctl bootstrap "$DOMAIN" "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
+  else
+    bootout_if_loaded "com.ruskkserv.import-user-dict"
+    rm -f "${LAUNCH_AGENTS}/com.ruskkserv.import-user-dict.plist"
   fi
 
   echo "installed. logs: ${LOG_DIR}"

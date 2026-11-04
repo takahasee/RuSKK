@@ -65,6 +65,14 @@ pub fn has_multiple_candidates(response: &[u8]) -> bool {
     }
 }
 
+/// レスポンスバイト列に角括弧ブロック（例: `/[っ/思/]/`）が含まれているかを判定する。
+/// 角括弧ブロックを含むレスポンスに対して単純なスラッシュ分割ソートを行うとブロック構造が破壊されるため、
+/// この判定を用いて並び替えを安全にスキップする。
+#[inline]
+pub fn contains_bracket_block(response: &[u8]) -> bool {
+    memchr::memchr2(b'[', b']', response).is_some()
+}
+
 /// レスポンスバイト列から借用スライスの候補リスト（ゼロコピー）を抽出
 /// NEON 128-bit SIMD (`memchr_iter`) によりスラッシュ区切りを一括高速走査する。
 #[inline]
@@ -226,6 +234,9 @@ mod tests {
         assert!(has_multiple_candidates("1/東京/Tokyo/\n".as_bytes()));
         assert!(!has_multiple_candidates("1/服/\n".as_bytes()));
         assert!(!has_multiple_candidates(b"4\n"));
+
+        assert!(contains_bracket_block("1/[っ/思/]/重/\n".as_bytes()));
+        assert!(!contains_bracket_block("1/東京/Tokyo/\n".as_bytes()));
     }
 
     #[test]

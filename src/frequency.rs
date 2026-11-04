@@ -31,7 +31,11 @@ impl FrequencyPredictor {
         if let Some(ref path) = storage_path
             && let Err(err) = predictor.load(path)
         {
-            debug!(error = %err, "no existing frequency data loaded, starting fresh");
+            if path.exists() {
+                tracing::warn!(error = %err, path = ?path, "existing frequency data file failed to load (syntax error?) — starting fresh without modifying file");
+            } else {
+                debug!(error = %err, "no existing frequency data loaded, starting fresh");
+            }
         }
         predictor.storage_path = storage_path;
         predictor
@@ -51,15 +55,19 @@ impl FrequencyPredictor {
 
     /// 永続化ファイルが存在し非空の場合、エイリアス展開前の生データを再読み込みする。
     /// ファイル保存時（init-seed / import-user-dict）にランタイム用のエイリアスが書き出されるのを防ぐ。
-    fn reload_raw_if_exists(&mut self) {
+    /// ファイルが存在するのに構文エラーがある場合は、誤上書きを防ぐためエラーを返す。
+    fn reload_raw_if_exists(&mut self) -> anyhow::Result<()> {
         if let Some(ref path) = self.storage_path
-            && let Ok(data) = fs::read_to_string(path)
-            && !data.trim().is_empty()
-            && let Ok(loaded) = serde_json::from_str::<FrequencyPredictor>(&data)
+            && path.exists()
         {
-            self.frequencies = loaded.frequencies;
-            self.context_frequencies = loaded.context_frequencies;
+            let data = fs::read_to_string(path)?;
+            if !data.trim().is_empty() {
+                let loaded: FrequencyPredictor = serde_json::from_str(&data)?;
+                self.frequencies = loaded.frequencies;
+                self.context_frequencies = loaded.context_frequencies;
+            }
         }
+        Ok(())
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -120,7 +128,7 @@ impl FrequencyPredictor {
             self.frequencies = preset.frequencies;
             self.context_frequencies = preset.context_frequencies;
         } else {
-            self.reload_raw_if_exists();
+            self.reload_raw_if_exists()?;
             self.merge_default_presets_raw()?;
         }
         self.save()?;
@@ -135,7 +143,7 @@ impl FrequencyPredictor {
     /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
     pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
         let content = fs::read_to_string(dict_path)?;
-        self.reload_raw_if_exists();
+        self.reload_raw_if_exists()?;
 
         for line in content.lines() {
             let line = line.trim();
@@ -226,9 +234,31 @@ impl FrequencyPredictor {
         false
     }
 
+    /// 見出し語に対する frequencies の最高スコア候補が、現在の候補群に含まれていないか判定する。
+    /// Primary (azooKey) に存在せず Fallback (yaskkserv2) 側にのみ存在するユーザー辞書語（例: "みぎや" -> "→"）を
+    /// 補完マージすべきかどうかの判定に使用する。
+    pub fn is_top_freq_candidate_missing(&self, midashi: &str, candidates: &[&str]) -> bool {
+        let Some(freq_map) = self.get_freq_map(midashi) else {
+            return false;
+        };
+        let Some(&max_score) = freq_map.values().max() else {
+            return false;
+        };
+        if max_score == 0 {
+            return false;
+        }
+        let best_in_cands = candidates
+            .iter()
+            .map(|&c| get_score(freq_map, clean_candidate(c)))
+            .max()
+            .unwrap_or(0);
+        best_in_cands < max_score
+    }
+
     /// 借用スライス (&str) を対象に、アロケーションなしで候補を並び替える。
     /// annotation_priority が true の場合、macOS システム辞書（大辞林等）の掲載語
-    /// または SKK 注釈付き単語にボーナススコア（100点）を加算し、加点スコア方式で総合順位を決定する。
+    /// または SKK 注釈付き単語にボーナススコア（100点）を加算し、さらに送りなし見出しでは
+    /// 送り仮名・助詞が混入していない純粋な送りなし候補に形状ボーナス（20点）を加算して総合順位を決定する。
     pub fn rank_candidates_borrowed<'a, S: AsRef<str>>(
         &self,
         context: &[S],
@@ -266,6 +296,10 @@ impl FrequencyPredictor {
         }
 
         const ANNOTATION_BONUS: u64 = 100;
+        const OKURI_NASHI_CLEAN_BONUS: u64 = 20;
+
+        let is_okuri = annotation_priority
+            && crate::okuri::parse_okuri_midashi_extended(midashi).is_some();
 
         let mut indexed_cands: Vec<(usize, &'a str, u64)> = candidates
             .iter()
@@ -281,10 +315,18 @@ impl FrequencyPredictor {
                     0
                 };
 
-                let annotation_score: u64 = if annotation_priority
-                    && crate::system_dict::is_annotated_or_in_dict(cand, Some(midashi))
-                {
-                    ANNOTATION_BONUS
+                let annotation_score: u64 = if annotation_priority {
+                    let in_dict =
+                        crate::system_dict::is_annotated_or_in_dict(cand, Some(midashi));
+                    let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
+                    let shape_bonus = if !is_okuri
+                        && (in_dict || !is_unverified_okuri_fragment(clean))
+                    {
+                        OKURI_NASHI_CLEAN_BONUS
+                    } else {
+                        0
+                    };
+                    dict_bonus + shape_bonus
                 } else {
                     0
                 };
@@ -386,6 +428,41 @@ pub fn clean_candidate(cand: &str) -> &str {
         Some((word, _)) => word.trim(),
         None => cand.trim(),
     }
+}
+
+/// 送りなし見出しに対する候補として、辞書未掲載時に「漢字/カタカナ＋平仮名（送り仮名・助詞漏れ・交ぜ書き断片）」とみなすか判定する。
+/// 例: "貸そ", "右や", "左や", "上や", "解そ", "したヤ", "書こ", "点けん" などは true。
+/// 純粋な漢字・カタカナ・記号（"画素", "右矢", "下谷", "→"）や、敬語接頭辞＋漢字（"お肉"）は false。
+pub fn is_unverified_okuri_fragment(cand_clean: &str) -> bool {
+    let s = if let Some(rest) = cand_clean
+        .strip_prefix('お')
+        .or_else(|| cand_clean.strip_prefix('ご'))
+    {
+        if rest.chars().next().is_some_and(crate::okuri::is_kanji) {
+            rest
+        } else {
+            cand_clean
+        }
+    } else {
+        cand_clean
+    };
+
+    let mut has_hiragana = false;
+    let mut has_kanji_or_katakana = false;
+    for c in s.chars() {
+        if ('\u{3041}'..='\u{3096}').contains(&c) {
+            has_hiragana = true;
+        } else if crate::okuri::is_kanji(c)
+            || ('\u{30A1}'..='\u{30F6}').contains(&c)
+            || c == 'ー'
+        {
+            has_kanji_or_katakana = true;
+        }
+        if has_hiragana && has_kanji_or_katakana {
+            return true;
+        }
+    }
+    false
 }
 
 /// SKK 辞書エントリの候補部分（`/[る/着/切/伐/]/[り/切/]/` や `/変換/返還/`）から、
@@ -693,6 +770,33 @@ mod tests {
     }
 
     #[test]
+    fn test_corrupted_json_protects_against_overwrite() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut json_file = NamedTempFile::new().unwrap();
+        // 壊れた JSON（構文エラー）を書き込む
+        json_file
+            .write_all(b"{ \"frequencies\": { broken json ...")
+            .unwrap();
+
+        let mut predictor = FrequencyPredictor::new(Some(json_file.path().to_path_buf()));
+        // 構文エラーのファイルが存在する場合、init_seed(false) はエラーを返し、上書き保存しないこと
+        assert!(predictor.init_seed(false).is_err());
+
+        // ダミーの SKK 辞書
+        let mut dict_file = NamedTempFile::new().unwrap();
+        writeln!(dict_file, "ふく /服/").unwrap();
+
+        // import_from_skk_dict もエラーを返し、上書き保存しないこと
+        assert!(predictor.import_from_skk_dict(dict_file.path()).is_err());
+
+        // 元の壊れたファイル内容が保持されていること（空やデフォルトで上書きされていないこと）
+        let content = fs::read_to_string(json_file.path()).unwrap();
+        assert!(content.contains("broken json"));
+    }
+
+    #[test]
     fn test_should_rank_fast_path() {
         let mut predictor = FrequencyPredictor::new(None);
         // ルールが何もない場合は false
@@ -773,5 +877,44 @@ mod tests {
             false,
         );
         assert_eq!(unranked[0], "謎造語xyz");
+    }
+
+    #[test]
+    fn test_okuri_nashi_prioritizes_clean_candidates_over_fragments() {
+        let mut predictor = FrequencyPredictor::new(None);
+
+        // 1. 「がそ」: azooKey が "貸そ"（動詞未然・意志形断片）を先頭に返しても、"画素" が第1候補に昇格する
+        let gaso_cands = vec!["貸そ".to_string(), "画素".to_string()];
+        let ranked_gaso =
+            predictor.rank_candidates_with_annotation(&[] as &[String], "がそ", &gaso_cands, true);
+        assert_eq!(ranked_gaso, vec!["画素", "貸そ"]);
+
+        // 2. 「みぎや」: 両方とも大辞林未掲載でも、送り仮名・助詞混じり断片 "右や" より純粋な漢字・記号 ("→", "右矢") が優先される
+        predictor.frequencies.insert("みぎや".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("→".to_string(), 1);
+            m
+        });
+        predictor.expand_aliases();
+        assert!(predictor.is_top_freq_candidate_missing("みぎや", &["右矢", "右や"]));
+        assert!(!predictor.is_top_freq_candidate_missing("みぎや", &["右矢", "右や", "→"]));
+
+        let migiya_cands = vec!["右や".to_string(), "右矢".to_string(), "→".to_string()];
+        let ranked_migiya = predictor.rank_candidates_with_annotation(
+            &[] as &[String],
+            "みぎや",
+            &migiya_cands,
+            true,
+        );
+        assert_eq!(ranked_migiya, vec!["→", "右矢", "右や"]);
+
+        // 3. is_unverified_okuri_fragment 単体検証
+        assert!(is_unverified_okuri_fragment("貸そ"));
+        assert!(is_unverified_okuri_fragment("右や"));
+        assert!(is_unverified_okuri_fragment("したヤ"));
+        assert!(!is_unverified_okuri_fragment("画素"));
+        assert!(!is_unverified_okuri_fragment("右矢"));
+        assert!(!is_unverified_okuri_fragment("→"));
+        assert!(!is_unverified_okuri_fragment("お肉"));
     }
 }

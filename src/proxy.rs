@@ -8,8 +8,8 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
 use crate::encoding::{
-    decode_euc_or_utf8, extract_first_candidate, format_candidates_response_str,
-    has_multiple_candidates, parse_candidates_borrowed,
+    contains_bracket_block, decode_euc_or_utf8, extract_first_candidate,
+    format_candidates_response_str, has_multiple_candidates, parse_candidates_borrowed,
 };
 use crate::frequency::SharedPredictor;
 use crate::protocol::{Request, is_found, parse_request};
@@ -225,7 +225,7 @@ async fn handle_client(
             line.truncate(line.len() - 1);
         }
 
-        debug!(?peer, raw_line = ?String::from_utf8_lossy(&line), "received request from client");
+        debug!(?peer, raw_line = %decode_euc_or_utf8(&line), "received request from client");
 
         let request = match parse_request(&line) {
             Ok(req) => req,
@@ -285,6 +285,8 @@ async fn handle_client(
                     &[]
                 };
 
+                let lookup_start = Instant::now();
+                let overall_deadline = Duration::from_millis(850);
                 let mut okuri_handled = false;
                 let mut final_response = None;
                 let mut top_candidate_for_context: Option<String> = None;
@@ -294,14 +296,15 @@ async fn handle_client(
                     let variations = crate::okuri::expand_okuri_variations(&midashi_str);
                     let mut responses = Vec::with_capacity(variations.len());
 
-                    let start_okuri = Instant::now();
-                    let max_total_okuri = Duration::from_millis(600);
+                    let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
+                    let max_total_okuri = Duration::from_millis(600).min(remaining_overall);
 
                     for var in variations {
-                        if start_okuri.elapsed() >= max_total_okuri {
+                        let elapsed_okuri = lookup_start.elapsed();
+                        if elapsed_okuri >= max_total_okuri {
                             break;
                         }
-                        let remaining = max_total_okuri.saturating_sub(start_okuri.elapsed());
+                        let remaining = max_total_okuri.saturating_sub(elapsed_okuri);
                         let okuri_timeout = proxy
                             .primary
                             .timeout
@@ -338,7 +341,7 @@ async fn handle_client(
 
                         for stem in stem_cands {
                             if !all_stem_cands.contains(&stem) {
-                                all_stem_cands.push(stem);
+                                 all_stem_cands.push(stem);
                             }
                         }
                     }
@@ -351,12 +354,13 @@ async fn handle_client(
                         // 辞書が本来持っている全候補（異体字・専門用語・注釈付き）を末尾に重複排除してマージする。
                         // これにより azooKey の賢い促音・活用語幹が最優先となりつつ、
                         // 辞書の全候補も漏れなく提供され、変換候補数が少なくなる現象を根本的に解消する。
-                        let fallback_req = Request::Lookup(midashi_str.as_bytes());
-                        let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200));
-                        if let Ok(fallback_resp) = proxy
-                            .fallback
-                            .query_with_timeout(&fallback_req, fb_timeout)
-                            .await
+                        let remaining_fb = overall_deadline.saturating_sub(lookup_start.elapsed());
+                        let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200)).min(remaining_fb);
+                        if !fb_timeout.is_zero()
+                            && let Ok(fallback_resp) = proxy
+                                .fallback
+                                .query_with_timeout(&Request::Lookup(midashi_str.as_bytes()), fb_timeout)
+                                .await
                             && is_found(&fallback_resp)
                         {
                             let fb_cands =
@@ -397,11 +401,80 @@ async fn handle_client(
                 let resp_to_send = if okuri_handled && let Some(resp) = final_response {
                     resp
                 } else {
-                    let (response, _hit) = lookup_with_fallback(&proxy, &request).await;
+                    let (mut response, hit) =
+                        lookup_with_fallback(&proxy, &request, lookup_start, overall_deadline).await;
                     if is_found(&response) {
+                        // Primary (azooKey) ヒット時でも、以下のいずれかに該当する場合は
+                        // Fallback (yaskkserv2) の候補も照会・マージして欠落を防ぐ:
+                        // 1. frequencies に登録された最高スコア候補が Primary 返却候補に存在しない場合（例: "みぎや" -> "→"）
+                        // 2. 送りなし見出しに対して Primary の第1候補が辞書未掲載の送り仮名・助詞混じり断片だった場合（例: "げそ" -> "解そ", "ひだりや" -> "左や", "がそ" -> "貸そ"）
+                        if hit == BackendHit::Primary && !contains_bracket_block(&response) {
+                            let first_is_unverified_fragment = proxy.annotation_priority
+                                && crate::okuri::parse_okuri_midashi_extended(&midashi_str)
+                                    .is_none()
+                                && extract_first_candidate(&response).is_some_and(|first| {
+                                    crate::frequency::is_unverified_okuri_fragment(
+                                        crate::frequency::clean_candidate(first),
+                                    ) && !crate::system_dict::is_annotated_or_in_dict(
+                                        first,
+                                        Some(&midashi_str),
+                                    )
+                                });
+
+                            let needs_fallback_merge = first_is_unverified_fragment || {
+                                let guard =
+                                    proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                                // frequencies にエントリがある見出し語のみスライス借用で照合
+                                guard.should_rank(&[] as &[&str], &midashi_str) && {
+                                    let cands = parse_candidates_borrowed(&response);
+                                    guard.is_top_freq_candidate_missing(&midashi_str, &cands)
+                                }
+                            };
+
+                            if needs_fallback_merge {
+                                let remaining_fb =
+                                    overall_deadline.saturating_sub(lookup_start.elapsed());
+                                let fb_timeout = proxy
+                                    .fallback
+                                    .timeout
+                                    .min(Duration::from_millis(200))
+                                    .min(remaining_fb);
+                                if !fb_timeout.is_zero()
+                                    && let Ok(fallback_resp) = proxy
+                                        .fallback
+                                        .query_with_timeout(&request, fb_timeout)
+                                        .await
+                                    && is_found(&fallback_resp)
+                                {
+                                    let mut merged_cands: Vec<String> =
+                                        parse_candidates_borrowed(&response)
+                                            .into_iter()
+                                            .map(|s| s.to_string())
+                                            .collect();
+                                    let fb_cands =
+                                        crate::encoding::parse_candidates_unpacked(&fallback_resp);
+                                    for cand in fb_cands {
+                                        let clean = crate::frequency::clean_candidate(&cand);
+                                        if !clean.is_empty()
+                                            && !merged_cands.iter().any(|c| {
+                                                crate::frequency::clean_candidate(c) == clean
+                                            })
+                                        {
+                                            merged_cands.push(cand);
+                                        }
+                                    }
+                                    let merged_refs: Vec<&str> =
+                                        merged_cands.iter().map(|s| s.as_str()).collect();
+                                    response = format_candidates_response_str(&merged_refs);
+                                }
+                            }
+                        }
+
                         // 【ファストパス】単一候補（候補数 <= 1）の場合は並び替えの余地がないため完全ゼロコピー直結。
-                        // 複数候補がある場合のみ、注釈・辞書優先または並び替えルールの有無を高速判定する。
+                        // また、角括弧ブロック（例: `/[っ/思/]/`）を含むレスポンスは単純ソートで構造が破壊されるため並び替えをスキップ。
+                        // 複数候補（角括弧なし）の場合、annotation_priority 有効時または頻度・文脈ルール存在時のみ借用パースして整列する。
                         let should_rank = has_multiple_candidates(&response)
+                            && !contains_bracket_block(&response)
                             && (proxy.annotation_priority || {
                                 let guard =
                                     proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
@@ -409,7 +482,7 @@ async fn handle_client(
                             });
 
                         if should_rank {
-                            // 並び替えルールがある場合のみ、ゼロコピーで借用パースして並び替え
+                            // ゼロコピーで借用スライスパースして並び替え
                             let cands = parse_candidates_borrowed(&response);
                             if !cands.is_empty() {
                                 let ranked = {
@@ -430,7 +503,8 @@ async fn handle_client(
                                 response
                             }
                         } else {
-                            // 並び替えルールがない大部分の単語: パース・アロケーション完全スキップ（ゼロコピー直結！）
+                            // 単一候補・角括弧ブロック含有・並び替え対象外（annotation_priority 無効かつルールなし）:
+                            // パース・アロケーション完全スキップ（ゼロコピー直結）
                             if let Some(top) = extract_first_candidate(&response) {
                                 top_candidate_for_context = Some(top.to_string());
                             }
@@ -458,7 +532,10 @@ async fn handle_client(
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Completion(_) => {
-                let (response, hit) = lookup_with_fallback(&proxy, &request).await;
+                let start = Instant::now();
+                let overall_deadline = Duration::from_millis(850);
+                let (response, hit) =
+                    lookup_with_fallback(&proxy, &request, start, overall_deadline).await;
                 debug!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 writer.write_all(&response).await?;
                 conn_last_response_time = Some(Instant::now());
@@ -481,44 +558,58 @@ enum BackendHit {
 /// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
 /// 全体デッドライン（850ms）から動的タイムアウトを計算し、macSKK の 1.0秒制限を超えないようにする。
 /// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
-async fn lookup_with_fallback(proxy: &Proxy, request: &Request<'_>) -> (Vec<u8>, BackendHit) {
-    let start = Instant::now();
-    // macSKK の 1.0秒 (1000ms) 制限を絶対に超えないよう、全体デッドラインを 850ms に制限
-    let overall_deadline = Duration::from_millis(850);
-    let primary_timeout = proxy.primary.timeout.min(Duration::from_millis(600));
+async fn lookup_with_fallback(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, BackendHit) {
+    let elapsed = start.elapsed();
+    let remaining_overall = overall_deadline.saturating_sub(elapsed);
+    if remaining_overall.is_zero() {
+        debug!("overall deadline reached before lookup, returning not found immediately");
+        return (b"4\n".to_vec(), BackendHit::None);
+    }
 
-    match proxy
-        .primary
-        .query_with_timeout(request, primary_timeout)
-        .await
-    {
-        Ok(response) if is_found(&response) => {
-            debug!(
-                backend = %proxy.primary.name,
-                elapsed_ms = start.elapsed().as_millis(),
-                "hit"
-            );
-            return (response, BackendHit::Primary);
-        }
-        Ok(_) => {
-            debug!(
-                backend = %proxy.primary.name,
-                elapsed_ms = start.elapsed().as_millis(),
-                "miss, trying fallback"
-            );
-        }
-        Err(err) => {
-            warn!(
-                backend = %proxy.primary.name,
-                error = %err,
-                elapsed_ms = start.elapsed().as_millis(),
-                "primary failed, trying fallback"
-            );
+    let primary_timeout = proxy.primary.timeout.min(remaining_overall);
+
+    if !primary_timeout.is_zero() {
+        match proxy
+            .primary
+            .query_with_timeout(request, primary_timeout)
+            .await
+        {
+            Ok(response) if is_found(&response) => {
+                debug!(
+                    backend = %proxy.primary.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "hit"
+                );
+                return (response, BackendHit::Primary);
+            }
+            Ok(_) => {
+                debug!(
+                    backend = %proxy.primary.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "miss, trying fallback"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    backend = %proxy.primary.name,
+                    error = %err,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "primary failed, trying fallback"
+                );
+            }
         }
     }
 
     let elapsed = start.elapsed();
-    let fallback_timeout = overall_deadline.saturating_sub(elapsed);
+    let fallback_timeout = proxy
+        .fallback
+        .timeout
+        .min(overall_deadline.saturating_sub(elapsed));
     if fallback_timeout.is_zero() {
         debug!("overall deadline reached before fallback, returning not found immediately");
         return (b"4\n".to_vec(), BackendHit::None);

@@ -119,9 +119,26 @@ impl Backend {
         wire: &[u8],
         timeout_duration: Duration,
     ) -> Result<Vec<u8>, BackendError> {
-        let mut guard = self.connection.lock().await;
+        let lock_start = tokio::time::Instant::now();
+        let mut guard = match timeout(timeout_duration, self.connection.lock()).await {
+            Ok(g) => g,
+            Err(_) => {
+                return Err(BackendError::Timeout {
+                    backend: self.name.clone(),
+                    timeout: timeout_duration,
+                });
+            }
+        };
 
-        let res = timeout(timeout_duration, async {
+        let remaining = timeout_duration.saturating_sub(lock_start.elapsed());
+        if remaining.is_zero() {
+            return Err(BackendError::Timeout {
+                backend: self.name.clone(),
+                timeout: timeout_duration,
+            });
+        }
+
+        let res = timeout(remaining, async {
             let mut last_err = None;
             for attempt in 0..2 {
                 if guard.is_none() {
