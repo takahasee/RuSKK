@@ -69,9 +69,18 @@ impl SharedContextState {
                 // 同一見出し語での再 Lookup（Space による変換開始・次候補送り）なので保留を継続
                 pending.hits = pending.hits.saturating_add(1);
                 self.pending_context = Some(pending);
-            } else if is_input_extension(midashi, &pending.midashi) && pending.hits < 2 {
-                // 「き」→「きr」「に」→「にく」のように入力が伸長しただけの場合は、
-                // macSKK の ▽ 開始時の機械的 Lookup であり未確定のため、昇格せずに破棄する。
+            } else if is_input_extension(midashi, &pending.midashi)
+                && pending.hits
+                    < if pending.midashi.chars().count() == 1 {
+                        3
+                    } else {
+                        2
+                    }
+            {
+                // 「き」→「きr」「に」→「にく」「さ」→「さい」のように入力が伸長しただけの場合は、
+                // macSKK の ▽ 開始時・再入力時の機械的 Lookup であり未確定のため、昇格せずに破棄する。
+                // 特に 1 文字見出し（「き」「さ」等）は「▽き (1) → Space確定 (2) → 次の▽き (3)」で
+                // 3 回 Lookup されて初めて「1文字単語として確定後に次の同頭文字語を入力した」とみなせる。
                 debug!(
                     discarded = %pending.word,
                     prev_midashi = %pending.midashi,
@@ -253,6 +262,8 @@ async fn handle_client(
             }
             Request::Lookup(midashi) => {
                 let midashi_str = decode_euc_or_utf8(midashi);
+                let midashi_kind = crate::okuri::classify_midashi(&midashi_str);
+                let is_affix = !matches!(midashi_kind, crate::okuri::MidashiKind::Normal(_));
                 let now = Instant::now();
 
                 // 同一 TCP コネクション内での直前レスポンスからの経過時間を判定。
@@ -267,7 +278,7 @@ async fn handle_client(
                     let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
 
                     // 文脈連動（context_ranking）が有効で、かつ補完連射でない場合、
-                    // 手動での通常変換において前回の単語が確定されたかを判定して session_context に昇格する。
+                    // 手動での変換において前回の単語が確定されたかを判定して session_context に昇格する。
                     if proxy.context_ranking && !is_completion_burst {
                         ctx.on_lookup_start(&midashi_str, now)
                     } else {
@@ -275,7 +286,7 @@ async fn handle_client(
                     }
                 };
 
-                let ctx_ref = if proxy.context_ranking {
+                let ctx_ref = if proxy.context_ranking && !is_affix {
                     if let Some(ref c) = session_ctx_snapshot {
                         std::slice::from_ref(c)
                     } else {
@@ -290,6 +301,29 @@ async fn handle_client(
                 let mut okuri_handled = false;
                 let mut final_response = None;
                 let mut top_candidate_for_context: Option<String> = None;
+
+                // 接頭語（例: "さい>", "ちょう>", "ご>"）および接尾語（例: ">せい", ">ひ", ">てき", ">わたs"）の専用処理。
+                // SKK の仕様上、接頭語・接尾語は `>` を含む見出し語として辞書に登録されており、候補文字列には `>` を含めない。
+                // Primary (azooKey) は SKK の `>` 接辞構文を解釈せず文字通りの記号 `>` を候補に付与してしまうため、
+                // 接頭語・接尾語は本来の SKK 辞書サーバーである Fallback (yaskkserv2) を最優先で照会する。
+                if let crate::okuri::MidashiKind::Prefix(inner)
+                | crate::okuri::MidashiKind::Suffix(inner) = midashi_kind
+                {
+                    let resp_to_send = lookup_affix(
+                        &proxy,
+                        &request,
+                        &midashi_str,
+                        inner,
+                        lookup_start,
+                        overall_deadline,
+                    )
+                    .await;
+                    debug!(?peer, kind = ?midashi_kind, resp = ?String::from_utf8_lossy(&resp_to_send), "sending affix response to client");
+                    writer.write_all(&resp_to_send).await?;
+                    conn_last_response_time = Some(Instant::now());
+                    writer.flush().await?;
+                    continue;
+                }
 
                 // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき", "かきおこs" -> "かきおこす"）の活用復元試行
                 if proxy.okuri_expansion {
@@ -407,21 +441,35 @@ async fn handle_client(
                         // Primary (azooKey) ヒット時でも、以下のいずれかに該当する場合は
                         // Fallback (yaskkserv2) の候補も照会・マージして欠落を防ぐ:
                         // 1. frequencies に登録された最高スコア候補が Primary 返却候補に存在しない場合（例: "みぎや" -> "→"）
-                        // 2. 送りなし見出しに対して Primary の第1候補が辞書未掲載の送り仮名・助詞混じり断片だった場合（例: "げそ" -> "解そ", "ひだりや" -> "左や", "がそ" -> "貸そ"）
+                        // 2. 送りなし見出しに対して Primary の第1候補が辞書未掲載の送り仮名断片だった場合（例: "がそ" -> "貸そ", "げそ" -> "解そ"）
+                        // 3. 補完連射でない通常変換で、送りなし見出しに対する Primary の第1候補がシステム国語辞典未掲載の合成語だった場合
+                        //    （例: "せつびご" -> "設備後"［名詞+接尾語の誤結合］）
                         if hit == BackendHit::Primary && !contains_bracket_block(&response) {
-                            let first_is_unverified_fragment = proxy.annotation_priority
+                            let remaining_fb =
+                                overall_deadline.saturating_sub(lookup_start.elapsed());
+                            let mut first_is_unverified_fragment = false;
+                            let mut first_not_in_dict = false;
+                            if proxy.annotation_priority
                                 && crate::okuri::parse_okuri_midashi_extended(&midashi_str)
                                     .is_none()
-                                && extract_first_candidate(&response).is_some_and(|first| {
-                                    crate::frequency::is_unverified_okuri_fragment(
-                                        crate::frequency::clean_candidate(first),
-                                    ) && !crate::system_dict::is_annotated_or_in_dict(
-                                        first,
-                                        Some(&midashi_str),
-                                    )
-                                });
+                                && let Some(first) = extract_first_candidate(&response)
+                            {
+                                let not_in_dict = !crate::system_dict::is_annotated_or_in_dict(
+                                    first,
+                                    Some(&midashi_str),
+                                );
+                                if not_in_dict {
+                                    first_is_unverified_fragment =
+                                        crate::frequency::is_unverified_okuri_fragment(
+                                            crate::frequency::clean_candidate(first),
+                                        );
+                                    if !is_completion_burst {
+                                        first_not_in_dict = true;
+                                    }
+                                }
+                            }
 
-                            let needs_fallback_merge = first_is_unverified_fragment || {
+                            let missing_top_freq = {
                                 let guard =
                                     proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                                 // frequencies にエントリがある見出し語のみスライス借用で照合
@@ -431,14 +479,16 @@ async fn handle_client(
                                 }
                             };
 
-                            if needs_fallback_merge {
-                                let remaining_fb =
-                                    overall_deadline.saturating_sub(lookup_start.elapsed());
-                                let fb_timeout = proxy
-                                    .fallback
-                                    .timeout
-                                    .min(Duration::from_millis(200))
-                                    .min(remaining_fb);
+                            if first_is_unverified_fragment || missing_top_freq || first_not_in_dict
+                            {
+                                let cap_ms = if first_is_unverified_fragment || missing_top_freq {
+                                    Duration::from_millis(200)
+                                } else {
+                                    // ローカルバイナリ辞書（<2ms）のヒット回収を目的とし、Google Suggest タイムアウト待ちを抑制
+                                    Duration::from_millis(40)
+                                };
+                                let fb_timeout =
+                                    proxy.fallback.timeout.min(cap_ms).min(remaining_fb);
                                 if !fb_timeout.is_zero()
                                     && let Ok(fallback_resp) = proxy
                                         .fallback
@@ -531,11 +581,20 @@ async fn handle_client(
                 writer.write_all(&resp_to_send).await?;
                 conn_last_response_time = Some(Instant::now());
             }
-            Request::Completion(_) => {
+            Request::Completion(prefix) => {
                 let start = Instant::now();
                 let overall_deadline = Duration::from_millis(850);
-                let (response, hit) =
-                    lookup_with_fallback(&proxy, &request, start, overall_deadline).await;
+                let prefix_str = decode_euc_or_utf8(prefix);
+                let is_affix_comp = !matches!(
+                    crate::okuri::classify_midashi(&prefix_str),
+                    crate::okuri::MidashiKind::Normal(_)
+                );
+                let (response, hit) = if is_affix_comp {
+                    // 接尾語補完（例: `4>せ `）などは SKK 辞書を持つ Fallback (yaskkserv2) へ直接照会
+                    lookup_fallback_only(&proxy, &request, start, overall_deadline).await
+                } else {
+                    lookup_with_fallback(&proxy, &request, start, overall_deadline).await
+                };
                 debug!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 writer.write_all(&response).await?;
                 conn_last_response_time = Some(Instant::now());
@@ -553,6 +612,119 @@ enum BackendHit {
     Primary,
     Fallback,
     None,
+}
+
+/// 接頭語（`midashi>`）および接尾語（`>midashi`）の変換照会処理。
+/// SKK 辞書を持つ Fallback (`yaskkserv2`) を最優先で照会し、ミス時のみ `>` を除去した内部読みで
+/// Primary (`azooKey`) を照会したうえで候補内の余分な `>` をサニタイズする。
+async fn lookup_affix(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    midashi_str: &str,
+    inner_reading: &str,
+    start: Instant,
+    overall_deadline: Duration,
+) -> Vec<u8> {
+    let (mut response, hit) = lookup_fallback_only(proxy, request, start, overall_deadline).await;
+
+    if hit == BackendHit::Fallback && is_found(&response) {
+        if contains_bracket_block(&response) {
+            let unpacked = crate::encoding::parse_candidates_unpacked(&response);
+            let refs: Vec<&str> = unpacked.iter().map(|s| s.as_str()).collect();
+            response = format_candidates_response_str(&refs);
+        }
+        if has_multiple_candidates(&response) {
+            let should_rank = {
+                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                guard.should_rank(&[] as &[&str], midashi_str)
+            };
+            if should_rank {
+                let cands = parse_candidates_borrowed(&response);
+                if !cands.is_empty() {
+                    let ranked = {
+                        let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                        guard.rank_candidates_borrowed(&[] as &[&str], midashi_str, &cands, false)
+                    };
+                    response = format_candidates_response_str(&ranked);
+                }
+            }
+        }
+        return response;
+    }
+
+    // Fallback (yaskkserv2) に接頭語・接尾語エントリがない場合のみ、`>` を除いた読みで Primary を照会
+    let remaining = overall_deadline.saturating_sub(start.elapsed());
+    let primary_timeout = proxy.primary.timeout.min(remaining);
+    if !primary_timeout.is_zero() {
+        let stripped_req = Request::Lookup(inner_reading.as_bytes());
+        if let Ok(primary_resp) = proxy
+            .primary
+            .query_with_timeout(&stripped_req, primary_timeout)
+            .await
+            && is_found(&primary_resp)
+        {
+            let raw_cands = parse_candidates_borrowed(&primary_resp);
+            let mut sanitized: Vec<String> = Vec::with_capacity(raw_cands.len());
+            for cand in raw_cands {
+                let cleaned = cand.trim_matches(['>', '?']);
+                let word = crate::frequency::clean_candidate(cleaned);
+                if !word.is_empty()
+                    && !sanitized
+                        .iter()
+                        .any(|c| crate::frequency::clean_candidate(c) == word)
+                {
+                    sanitized.push(cleaned.to_string());
+                }
+            }
+            if !sanitized.is_empty() {
+                let refs: Vec<&str> = sanitized.iter().map(|s| s.as_str()).collect();
+                return format_candidates_response_str(&refs);
+            }
+        }
+    }
+
+    response
+}
+
+/// Fallback（yaskkserv2）のみを照会するヘルパー（接頭語・接尾語の変換および補完用）。
+async fn lookup_fallback_only(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, BackendHit) {
+    let elapsed = start.elapsed();
+    let fallback_timeout = proxy
+        .fallback
+        .timeout
+        .min(overall_deadline.saturating_sub(elapsed));
+    if fallback_timeout.is_zero() {
+        return (b"4\n".to_vec(), BackendHit::None);
+    }
+
+    match proxy
+        .fallback
+        .query_with_timeout(request, fallback_timeout)
+        .await
+    {
+        Ok(response) => {
+            let hit = if is_found(&response) {
+                BackendHit::Fallback
+            } else {
+                BackendHit::None
+            };
+            (response, hit)
+        }
+        Err(err) => {
+            warn!(
+                backend = %proxy.fallback.name,
+                error = %err,
+                elapsed_ms = start.elapsed().as_millis(),
+                "fallback failed on affix query"
+            );
+            (b"4\n".to_vec(), BackendHit::None)
+        }
+    }
 }
 
 /// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
@@ -716,5 +888,16 @@ mod tests {
         // 「き」->「きr」は入力伸長として破棄され、かつ「肉」もTTL超過で消去されること
         let t2 = t0 + Duration::from_secs(61);
         assert_eq!(s.on_lookup_start("きr", t2), None);
+    }
+
+    #[test]
+    fn repeated_single_char_mechanical_lookup_does_not_promote_context() {
+        // ▽さ 開始 → キャンセル → 再び ▽さい 入力のように先頭 1 文字「さ」の機械的 Lookup が 2 回届いた後
+        // 「さい」が Lookup された場合でも、「差」が確定文脈として誤昇格しないこと
+        let mut s = SharedContextState::default();
+        lookup(&mut s, "さ", "差");
+        lookup(&mut s, "さ", "差");
+        let ctx = lookup(&mut s, "さい", "際");
+        assert_eq!(ctx, None);
     }
 }

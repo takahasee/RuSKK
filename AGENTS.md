@@ -96,8 +96,8 @@
 ### ⑧ ゼロコピー・O(1)・SIMD 最適化と徹底的な低遅延設計
 - **背景**: skkserv はキータイプごとにリアルタイムでミリ秒単位の低遅延応答が要求されるため、ランタイムでの不要な線形探索やメモリ割り当て（アロケーション）を徹底的に排除した。
 - **設計と実装 (`src/frequency.rs`, `src/encoding.rs`, `src/protocol.rs`, `src/okuri.rs`)**:
-  1. **柔軟照合の O(1) ハッシュ化**: 変換時ごとの線形探索 $O(N)$ を廃止し、seed ロード時に文脈キー・候補の双方へ前方一致プレフィックス（「切る」→「切」等）を HashMap に事前展開（`expand_aliases`）。リクエスト処理時は完全な $O(1)$ ハッシュ参照のみで完結。
-  2. **EUC-JP レスポンスの一括 SIMD デコード**: EUC-JP の規格上、マルチバイトコード（`0xA1`..=`0xFE`）と ASCII 記号（`/`, `1`, `\n`）は絶対にバイト衝突しないため、旧来のスラッシュ分割・逐次デコード（50行）を撤廃し、`EUC_JP.decode(response)` の SIMD 最適化一括デコードに移行。
+  1. **送り仮名語幹の O(1) ハッシュ化**: 変換時ごとの線形探索 $O(N)$ を廃止し、seed ロード時に文脈キー・候補の双方へ送りあり動詞・形容詞の語幹（「切る」→「切」、「確認する」→「確認」等）のみを HashMap に事前展開（`expand_aliases` / `okuri_stem_aliases`）。漢字・カタカナ名詞の接頭断片混入を排除しつつ、リクエスト処理時は完全な $O(1)$ ハッシュ参照のみで完結。
+  2. **EUC-JP レスポンスの一括 SIMD デコード（2バイト UTF-8 衝突回避）**: EUC-JP の規格上、マルチバイトコード（`0xA1`..=`0xFE`）と ASCII 記号（`/`, `1`, `\n`）は絶対にバイト衝突しないため、旧来のスラッシュ分割・逐次デコードを撤廃し、`is_genuine_utf8` で EUC-JP 2バイト漢字（「的」`0xC5 0xAA` 等）と 2バイト UTF-8（`U+0080..=U+07FF`）の衝突を回避したうえで `EUC_JP.decode(response)` の SIMD 最適化一括デコードに移行。
   3. **二重アロケーションの排除**: リクエスト送信時、送信バッファに直接書き込むことで中間 `Vec<u8>` の生成をゼロ化。
   4. **候補ソートのゼロアロケーション化**: 候補整列において安定ソート（`sort_by`, Timsort）から、ヒープ確保ゼロの最速ソート（`sort_unstable_by`, PDQsort）へ移行。
   5. **定常時ヒープ確保ゼロ**: 通常の文脈照会（要素数 0 または 1）において中間 `Vec` の割り当てをインライン分岐で回避。送り仮名サフィックスも静的スライス参照（`&'static [&'static str]`）に統一。
@@ -124,11 +124,17 @@
   3. **送りあり終止形合成**: 送りあり見出し（例: `かk`, `すばらしi`）の語幹候補（`書`, `素晴らし`）に対し、送り仮名を補った終止形（`書く`, `素晴らしい`）を合成して辞書照会。
   4. **インメモリキャッシュ (`SystemDictCache`)**: 照会結果を最大 20,000 件までインメモリ `RwLock<HashMap<String, bool>>` で保持し、2 回目以降の変換遅延をゼロ化。
   5. **加点スコア方式（ハイブリッド）と送りなし断片降格・Fallback 補完**:
-     辞書掲載語・注釈付き語にボーナス加点（100点）、送りなし見出しでの純粋な送りなし候補（または辞書掲載語）に形状ボーナス（20点）を付与し、辞書未掲載の送り仮名・助詞混じり断片（`貸そ`、`右や`、`左や`、`解そ`、`したヤ` 等 = 0点）を後方に沈める。また送りなし照会で Primary の第1候補が未検証断片の場合や `frequencies` の最高スコア候補（`みぎや`→`→` 等）が Primary にない場合は Fallback (`yaskkserv2`) を自動マージする。
+     辞書掲載語・注釈付き語にボーナス加点（100点）、送りなし見出しでの純粋な送りなし候補（または辞書掲載語）に形状ボーナス（20点）を付与し、辞書未掲載の送り仮名・助詞混じり断片（`貸そ`、`右や`、`左や`、`解そ`、`したヤ` 等 = 0点）を後方に沈める。また送りなし照会で Primary の第1候補が未検証断片・辞書未掲載誤結合（`せつびご`→`設備後` 等）の場合や `frequencies` の最高スコア候補（`みぎや`→`→` 等）が Primary にない場合は Fallback (`yaskkserv2`) を自動マージする。
 - **即時ロールバック（安全機能）**:
   - **CLI**: `ruskkserv --annotation-priority=false`
   - **環境変数**: `RUSKKSERV_ANNOTATION_PRIORITY=0`
   - **LaunchAgent**: `launchd/config.env` で `RUSKKSERV_ANNOTATION_PRIORITY=0` を指定し `./scripts/install-launchd.sh install`。
+
+### ⑪ SKK 仕様に基づく通常変換・接頭語（`midashi>`）・接尾語（`>midashi`）の厳密分離
+- **メカニズム (`src/okuri.rs`, `src/proxy.rs`, `src/frequency.rs`)**:
+  1. `classify_midashi` により通常見出し（`MidashiKind::Normal`）、接頭語（`MidashiKind::Prefix`: `さい>`, `ひ>`, `ちょう>` 等）、接尾語（`MidashiKind::Suffix`: `>せい`, `>ひ`, `>てき`, 送りあり接尾語 `>わたs` 等）を厳密に分類（`->`, `<->`, `>=` 等の ASCII 記号は `Normal` 維持）。
+  2. 接頭語・接尾語の変換（`lookup_affix`）および補完（`4>せ` 等）は SKK 辞書を持つ Fallback (`yaskkserv2`) を最優先で直接照会し、送りあり接尾語の角括弧ブロック展開・文脈保留からの除外・疑問符注釈（`;?`）による順位逆転防止を行う。
+  3. **macSKK 側との連携**: macSKK (`2.22.2`) の `SKKServDict` は `option: .prefix` / `.suffix` の `>` を `skkserv` へ送らないため、接頭語・接尾語 1,185 件のみを抽出した `SKK-JISYO.affix.utf8`（通常見出し 0 件）のみを `saveToUserDict = 0` で有効化し、AZIK キーバインドの `japanese` を `⇧[`、`affix` を `⇧.` (`>`) に分離して運用する。
 
 ---
 
@@ -154,7 +160,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全58件合格）
+cargo test             # ユニットテスト & 結合テスト（全64件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

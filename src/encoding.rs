@@ -1,10 +1,22 @@
 use encoding_rs::EUC_JP;
 use std::borrow::Cow;
 
+/// UTF-8 として解釈した文字列が、実際には EUC-JP の 2 バイト漢字（第 1 バイト `0xC2..=0xDF`, 第 2 バイト `0xA1..=0xBF`:
+/// 例: 「的」`0xC5 0xAA`, 「中」`0xC3 0xBE`, 「比」`0xC8 0xBE` 等）が 2 バイト UTF-8（`U+0080..=U+07FF` のラテン拡張文字等）に
+/// 偶然ビット列一致した偽陽性でないかを判定する。
+/// 日本語文字（ひらがな・カタカナ・漢字・全角記号・絵文字）はすべて 3〜4 バイト UTF-8（`>= U+0800`）であるため、
+/// `U+0080..=U+07FF` が含まれない場合のみ正当な UTF-8（または純粋な ASCII）とみなす。
+#[inline]
+fn is_genuine_utf8(s: &str) -> bool {
+    s.is_ascii() || !s.chars().any(|c| ('\u{0080}'..='\u{07FF}').contains(&c))
+}
+
 /// Decode bytes that may be EUC-JP or already UTF-8 into a UTF-8 String or slice.
 /// Returns Cow::Borrowed for UTF-8 bytes to avoid unnecessary heap allocation.
 pub fn decode_euc_or_utf8(bytes: &[u8]) -> Cow<'_, str> {
-    if let Ok(s) = std::str::from_utf8(bytes) {
+    if let Ok(s) = std::str::from_utf8(bytes)
+        && is_genuine_utf8(s)
+    {
         return Cow::Borrowed(s);
     }
     let (cow, _, _) = EUC_JP.decode(bytes);
@@ -23,8 +35,11 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
     if response.is_empty() {
         return Vec::new();
     }
-    // すでに UTF-8（ASCII のみを含む場合など）であれば、そのまま返す
-    if std::str::from_utf8(response).is_ok() {
+    // すでに正当な UTF-8（ASCII のみ、または 3〜4 バイト UTF-8 日本語）であれば、そのまま返す。
+    // ※ EUC-JP の「的」(0xC5 0xAA) 等は 2 バイト UTF-8 (U+016A 'Ū') として from_utf8 を通過するため is_genuine_utf8 で除外する。
+    if let Ok(s) = std::str::from_utf8(response)
+        && is_genuine_utf8(s)
+    {
         return response.to_vec();
     }
     // EUC-JP のマルチバイトコード (0xA1..=0xFE) は ASCII 記号 (0x00..=0x7F: '/', '1', '4', '\n') と
@@ -261,5 +276,27 @@ mod tests {
         let resp3 = "1/来/切/着/\n".as_bytes();
         let unpacked3 = parse_candidates_unpacked(resp3);
         assert_eq!(unpacked3, vec!["来", "切", "着"]);
+    }
+
+    #[test]
+    fn test_euc_jp_kanji_colliding_with_2byte_utf8() {
+        // EUC-JP の「的」(0xC5 0xAA), 「綻」(0xC3 0xBE) 等は
+        // 2 バイト UTF-8 (U+016A 'Ū', U+00FE 'þ') として std::str::from_utf8 を通過してしまうが、
+        // response_euc_to_utf8 / decode_euc_or_utf8 で正しく漢字へデコードされること。
+        let teki_euc = b"1/\xc5\xaa/\n";
+        assert_eq!(
+            String::from_utf8(response_euc_to_utf8(teki_euc)).unwrap(),
+            "1/的/\n"
+        );
+
+        let tan_euc = b"1/\xc3\xbe/\n";
+        assert_eq!(
+            String::from_utf8(response_euc_to_utf8(tan_euc)).unwrap(),
+            "1/綻/\n"
+        );
+
+        assert_eq!(decode_euc_or_utf8(&encode_euc_jp("的")), "的");
+        assert_eq!(decode_euc_or_utf8(&encode_euc_jp("綻")), "綻");
+        assert_eq!(decode_euc_or_utf8(&encode_euc_jp("比")), "比");
     }
 }

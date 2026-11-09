@@ -274,6 +274,38 @@ pub fn romaji_to_hiragana(romaji: &str) -> Option<&'static str> {
     }
 }
 
+/// SKK 見出し語の種別（通常の変換 / 接頭語 / 接尾語）
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum MidashiKind<'a> {
+    /// 通常の変換（送りなし・送りあり、および `->` 等の純粋な ASCII 記号見出し）
+    Normal(&'a str),
+    /// 接頭語（例: `さい>`, `ひ>`, `ちょう>`, `だい>`, `ご>`, `お>`）。内部値は末尾の `>` / `?` を除いた読み。
+    Prefix(&'a str),
+    /// 接尾語（例: `>せい`, `>ひ`, `>てき`, `>しゃ`, `>わたs`）。内部値は先頭の `>` / `?` を除いた読み。
+    Suffix(&'a str),
+}
+
+/// SKK の仕様に基づき、見出し語を「通常の変換 (`Normal`)」「接頭語 (`Prefix`)」「接尾語 (`Suffix`)」に分類する。
+/// `->` や `<->`, `>=`, `>>` 等の純粋な ASCII 記号見出しは `Normal` として扱う。
+pub fn classify_midashi(midashi: &str) -> MidashiKind<'_> {
+    let starts_affix = midashi.starts_with('>') || midashi.starts_with('?');
+    let ends_affix = midashi.ends_with('>') || midashi.ends_with('?');
+
+    if starts_affix && !ends_affix && midashi.len() > 1 {
+        let body = &midashi[1..];
+        if !body.is_empty() && !body.is_ascii() {
+            return MidashiKind::Suffix(body);
+        }
+    } else if ends_affix && !starts_affix && midashi.len() > 1 {
+        let stem = &midashi[..midashi.len() - 1];
+        if !stem.is_empty() && !stem.is_ascii() {
+            return MidashiKind::Prefix(stem);
+        }
+    }
+
+    MidashiKind::Normal(midashi)
+}
+
 /// パースされた送りあり見出しの種別
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum OkuriMidashi<'a> {
@@ -290,7 +322,12 @@ pub enum OkuriMidashi<'a> {
 }
 
 /// 送りあり見出し（通常・大文字複合語・アスタリスク明示）を拡張パースする。
+/// 接頭語（`midashi>`）および接尾語（`>midashi`、例: `>わたs`）は通常の送りあり変換と混同しないよう除外する。
 pub fn parse_okuri_midashi_extended(midashi: &str) -> Option<OkuriMidashi<'_>> {
+    if !matches!(classify_midashi(midashi), MidashiKind::Normal(_)) {
+        return None;
+    }
+
     // パターン 0: アスタリスク明示区切り（例: "ねあ*げ", "まぜ*がき", "ねあ*g"）
     if let Some(star_idx) = midashi.find('*') {
         let prefix = &midashi[..star_idx];
@@ -932,5 +969,36 @@ mod tests {
         let tsukae_cands = ["使え", "仕え", "遣え", "支え", "事え", "痞", "痞え"];
         let tsukae_stems = extract_stem_candidates_borrowed(&tsukae_cands, "え", "つかえ");
         assert_eq!(tsukae_stems, vec!["使", "仕", "遣", "支", "事", "痞"]);
+    }
+
+    #[test]
+    fn test_classify_midashi_and_affix_exclusion() {
+        // 通常見出し（送りなし・送りあり）
+        assert_eq!(classify_midashi("さい"), MidashiKind::Normal("さい"));
+        assert_eq!(classify_midashi("せい"), MidashiKind::Normal("せい"));
+        assert_eq!(classify_midashi("かk"), MidashiKind::Normal("かk"));
+
+        // ASCII 記号見出しは接頭語・接尾語ではなく通常見出しとして扱う
+        assert_eq!(classify_midashi("->"), MidashiKind::Normal("->"));
+        assert_eq!(classify_midashi("<->"), MidashiKind::Normal("<->"));
+        assert_eq!(classify_midashi(">="), MidashiKind::Normal(">="));
+        assert_eq!(classify_midashi(">>"), MidashiKind::Normal(">>"));
+        assert_eq!(classify_midashi(">"), MidashiKind::Normal(">"));
+
+        // 接頭語（midashi>）
+        assert_eq!(classify_midashi("さい>"), MidashiKind::Prefix("さい"));
+        assert_eq!(classify_midashi("ひ>"), MidashiKind::Prefix("ひ"));
+        assert_eq!(classify_midashi("ちょう>"), MidashiKind::Prefix("ちょう"));
+        assert_eq!(classify_midashi("ご>"), MidashiKind::Prefix("ご"));
+
+        // 接尾語（>midashi, 送りあり接尾語 >わたs を含む）
+        assert_eq!(classify_midashi(">せい"), MidashiKind::Suffix("せい"));
+        assert_eq!(classify_midashi(">ひ"), MidashiKind::Suffix("ひ"));
+        assert_eq!(classify_midashi(">てき"), MidashiKind::Suffix("てき"));
+        assert_eq!(classify_midashi(">わたs"), MidashiKind::Suffix("わたs"));
+
+        // 接頭語・接尾語は通常の送りあり動詞展開対象から除外されること
+        assert_eq!(parse_okuri_midashi_extended(">わたs"), None);
+        assert_eq!(parse_okuri_midashi_extended("さい>"), None);
     }
 }

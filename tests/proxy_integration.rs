@@ -1823,3 +1823,146 @@ async fn test_proxy_okuri_nashi_demotes_fragments_and_merges_fallback() {
     primary_handle.abort();
     fallback_handle.abort();
 }
+
+/// 接頭語（`midashi>`）および接尾語（`>midashi`）が通常変換と混同されず、
+/// SKK 辞書を持つ Fallback (yaskkserv2) へ優先ルーティングされること、および
+/// 送りなし複合名詞（`せつびご`）で Primary が辞書外の誤結合（`設備後`）を返した際に Fallback（`接尾語`）がマージされることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_prefix_and_suffix_routing() {
+    // Primary (azooKey 模擬): `>` 付き見出しを送ると `>` が候補に混入する挙動を再現
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+    let primary_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = primary_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with("1さい> ".as_bytes()) {
+                            let _ = stream.write_all("1/際>/\n".as_bytes()).await;
+                        } else if req.starts_with("1>せい ".as_bytes()) {
+                            let _ = stream.write_all("1/>製/\n".as_bytes()).await;
+                        } else if req.starts_with("1みとうろく ".as_bytes()) {
+                            let _ = stream.write_all("1/未登録/\n".as_bytes()).await;
+                        } else if req.starts_with("1せつびご ".as_bytes()) {
+                            let _ = stream.write_all("1/設備後/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    // Fallback (yaskkserv2 模擬): SKK-JISYO の接頭語・接尾語エントリおよび複合語を持つ
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_addr = fallback_listener.local_addr().unwrap();
+    let fallback_handle = tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = fallback_listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 512];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let req = &buf[..n];
+                        if req.starts_with("1さい> ".as_bytes()) {
+                            let _ = stream.write_all("1/再/最/歳;?/\n".as_bytes()).await;
+                        } else if req.starts_with("1>せい ".as_bytes()) {
+                            let _ = stream.write_all("1/性/制/製/生/\n".as_bytes()).await;
+                        } else if req.starts_with("1>わたs ".as_bytes()) {
+                            let _ = stream.write_all("1/渡/[す/渡/]/\n".as_bytes()).await;
+                        } else if req.starts_with("4>せ ".as_bytes()) {
+                            let _ = stream.write_all("1/>せい/>せいけん/\n".as_bytes()).await;
+                        } else if req.starts_with("1せつびご ".as_bytes()) {
+                            let _ = stream.write_all("1/接尾語/\n".as_bytes()).await;
+                        } else {
+                            let _ = stream.write_all(b"4\n").await;
+                        }
+                    }
+                });
+            }
+        }
+    });
+
+    let predictor = FrequencyPredictor::new(None);
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        fallback: Backend::new(
+            "mock-fallback",
+            fallback_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        predictor: shared_predictor,
+        okuri_expansion: true,
+        context_ranking: true,
+        annotation_priority: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 接頭語 `さい>`: Fallback (yaskkserv2) の `再/最/歳;?` が返り、`歳;?` の注釈で `再` が追い越されないこと
+    client.write_all("1さい> \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/再/最/歳;?/\n");
+
+    // 2. 接尾語 `>せい`: Fallback (yaskkserv2) の `性/制/製/生` が返り、`>` が混入しないこと
+    client.write_all("1>せい \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/性/制/製/生/\n");
+
+    // 3. 送りあり接尾語 `>わたs`: 送りあり通常動詞と混同されず、角括弧ブロックが展開されて `1/渡/\n` になること
+    client.write_all("1>わたs \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/渡/\n");
+
+    // 4. Fallback にない接尾語 `>みとうろく`: `>` を除去した内部読み `みとうろく` で Primary にフォールバックすること
+    client
+        .write_all("1>みとうろく \n".as_bytes())
+        .await
+        .unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/未登録/\n");
+
+    // 5. 接尾語補完 `4>せ`: Fallback (yaskkserv2) の見出し補完が返ること
+    client.write_all("4>せ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/>せい/>せいけん/\n");
+
+    // 6. 通常複合名詞 `せつびご`: Primary が大辞林未掲載の `設備後` を返した際、Fallback の `接尾語` がマージされ第1候補になること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1せつびご \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/接尾語/設備後/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+    fallback_handle.abort();
+}

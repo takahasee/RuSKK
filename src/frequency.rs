@@ -291,14 +291,19 @@ impl FrequencyPredictor {
             };
 
         let has_context = single_ctx_map.is_some() || !multi_ctx_maps.is_empty();
-        if !has_freq && !has_context && !annotation_priority {
+        let is_affix = !matches!(
+            crate::okuri::classify_midashi(midashi),
+            crate::okuri::MidashiKind::Normal(_)
+        );
+        let effective_annotation_priority = annotation_priority && !is_affix;
+        if !has_freq && !has_context && !effective_annotation_priority {
             return candidates.to_vec();
         }
 
         const ANNOTATION_BONUS: u64 = 100;
         const OKURI_NASHI_CLEAN_BONUS: u64 = 20;
 
-        let is_okuri = annotation_priority
+        let is_okuri = effective_annotation_priority
             && crate::okuri::parse_okuri_midashi_extended(midashi).is_some();
 
         let mut indexed_cands: Vec<(usize, &'a str, u64)> = candidates
@@ -315,7 +320,7 @@ impl FrequencyPredictor {
                     0
                 };
 
-                let annotation_score: u64 = if annotation_priority {
+                let annotation_score: u64 = if effective_annotation_priority {
                     let in_dict =
                         crate::system_dict::is_annotated_or_in_dict(cand, Some(midashi));
                     let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
@@ -346,9 +351,10 @@ impl FrequencyPredictor {
     }
 
     /// seed ロード時に frequencies / context_frequencies の各マップに対して、
-    /// 前方一致で繋がるエイリアス（「切 → 切る」「切る → 切」等）を展開する。
+    /// 送りあり変換の語幹と終止形を繋ぐエイリアス（「切 ↔ 切る」「確認 ↔ 確認する」等）のみを展開する。
+    /// 漢字熟語やカタカナ語の途中を切るような接頭辞部分文字列（例: 「漁港 → 漁」「時間 → 時」「包丁 → 包」）は
+    /// 通常の変換と接頭語が混同される原因となるため一切生成しない。
     /// これによりランタイムのスコア照合が HashMap::get の O(1) のみで完結する。
-    /// データを直接設定した後にも呼び出し可能。
     pub fn expand_aliases(&mut self) {
         expand_map_aliases(&mut self.frequencies);
         expand_context_map_aliases(&mut self.context_frequencies);
@@ -362,7 +368,41 @@ fn get_score(map: &HashMap<String, u64>, target: &str) -> u64 {
     map.get(target).copied().unwrap_or(0)
 }
 
-/// frequencies マップの内部マップに前方一致エイリアスを展開する。
+/// 文字が平仮名（`ぁ`..=`ん`）か判定する。
+#[inline]
+fn is_hiragana_char(c: char) -> bool {
+    ('\u{3041}'..='\u{3096}').contains(&c)
+}
+
+/// 送り仮名付きの単語（末尾が平仮名で、かつ非平仮名の語幹を含む語、例: "切る", "確認する", "受け入れる"）から、
+/// SKK の送りあり変換で用いられる語幹エイリアス（平仮名の直前で切り出したプレフィックス、例: "切", "確認", "受け入れ", "受"）を抽出する。
+/// 純粋な漢字熟語やカタカナ語（例: "漁港", "時間", "包丁", "ヘリコプター"）からは一切プレフィックスを生成しない。
+fn okuri_stem_aliases(word: &str) -> Vec<&str> {
+    let mut chars = word.chars();
+    let Some(last_char) = chars.next_back() else {
+        return Vec::new();
+    };
+    if !is_hiragana_char(last_char) {
+        return Vec::new();
+    }
+    if !word.chars().any(|c| !is_hiragana_char(c)) {
+        return Vec::new();
+    }
+
+    let mut stems = Vec::new();
+    for (idx, ch) in word.char_indices().skip(1) {
+        // 平仮名が始まる位置でのみ切り出すことで、漢字連続（"確認" → "確" 等）の途中切断を完全に防ぐ
+        if is_hiragana_char(ch) {
+            let prefix = &word[..idx];
+            if prefix.chars().any(|c| !is_hiragana_char(c)) {
+                stems.push(prefix);
+            }
+        }
+    }
+    stems
+}
+
+/// frequencies マップの内部マップに送りあり語幹エイリアスを展開する。
 /// 例: {"切る": 3} に対して "切" をキーとして同スコアを追加（既存値がある場合は大きい方を採用）。
 fn expand_map_aliases(map: &mut HashMap<String, HashMap<String, u64>>) {
     for inner in map.values_mut() {
@@ -370,28 +410,24 @@ fn expand_map_aliases(map: &mut HashMap<String, HashMap<String, u64>>) {
     }
 }
 
-/// context_frequencies マップのキー側とバリュー側の両方にエイリアスを展開する。
-/// キー側: "切る" があれば "切" でも同じマップを参照できるようにエントリを追加。
-/// バリュー側: 各内部マップの値にも前方一致エイリアスを展開。
+/// context_frequencies マップのキー側とバリュー側の両方に送りあり語幹エイリアスを展開する。
+/// キー側: "切る" があれば "切" でも同じマップを参照できるようにエントリを追加（漢字熟語 "時間" → "時" などは展開しない）。
+/// バリュー側: 各内部マップの値にも送りあり語幹エイリアスを展開。
 fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>>) {
     // 1. バリュー側のエイリアス展開
     for inner in ctx_map.values_mut() {
         expand_inner_aliases(inner);
     }
 
-    // 2. キー側のエイリアス展開: "切る" があれば "切" でも参照できるようにする
+    // 2. キー側のエイリアス展開: "切る" があれば語幹 "切" でも参照できるようにする
     let aliases: Vec<(String, HashMap<String, u64>)> = ctx_map
         .iter()
         .flat_map(|(k, v)| {
-            let mut pairs = Vec::new();
-            // k が他のキーの前方一致になる場合のエイリアス（例: "切る" → "切"）
-            for (idx, _) in k.char_indices().skip(1) {
-                let prefix = k[..idx].to_string();
-                if !ctx_map.contains_key(&prefix) {
-                    pairs.push((prefix, v.clone()));
-                }
-            }
-            pairs
+            okuri_stem_aliases(k)
+                .into_iter()
+                .filter(|&stem| !ctx_map.contains_key(stem))
+                .map(|stem| (stem.to_string(), v.clone()))
+                .collect::<Vec<_>>()
         })
         .collect();
 
@@ -404,15 +440,18 @@ fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>
     }
 }
 
-/// 内部マップ（候補 → スコア）に対して前方一致エイリアスを展開する。
-/// 例: {"切る": 3} → {"切る": 3, "切": 3} を追加（既存値がある場合は大きい方を採用）。
-/// 全キーのすべてのプレフィックスを生成してスコアを伝播させるため、
-/// 逆方向（短いキーへの長いキーのスコア伝播）も前半ループで網羅される。
+/// 内部マップ（候補 → スコア）に対して送りあり語幹エイリアスを双方向に展開する。
+/// 例: {"切る": 3} ↔ {"切": 3}（既存値がある場合は大きい方を採用）。
 fn expand_inner_aliases(inner: &mut HashMap<String, u64>) {
     let mut aliases = Vec::new();
     for (k, &score) in inner.iter() {
-        for (idx, _) in k.char_indices().skip(1) {
-            aliases.push((k[..idx].to_string(), score));
+        for stem in okuri_stem_aliases(k) {
+            let stem_score = inner.get(stem).copied().unwrap_or(0);
+            let merged_score = score.max(stem_score);
+            aliases.push((stem.to_string(), merged_score));
+            if merged_score > score {
+                aliases.push((k.clone(), merged_score));
+            }
         }
     }
 
@@ -916,5 +955,83 @@ mod tests {
         assert!(!is_unverified_okuri_fragment("右矢"));
         assert!(!is_unverified_okuri_fragment("→"));
         assert!(!is_unverified_okuri_fragment("お肉"));
+    }
+
+    #[test]
+    fn test_expand_aliases_only_strips_trailing_okurigana_not_noun_prefixes() {
+        let mut predictor = FrequencyPredictor::new(None);
+        predictor.frequencies.insert("ぎょこう".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("漁港".to_string(), 1);
+            m
+        });
+        predictor.frequencies.insert("よみこm".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("読み込".to_string(), 1);
+            m
+        });
+        predictor.context_frequencies.insert("時間".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("割く".to_string(), 10);
+            m
+        });
+        predictor
+            .context_frequencies
+            .insert("ヘリコプター".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("飛ばす".to_string(), 10);
+                m
+            });
+        predictor
+            .context_frequencies
+            .insert("確認する".to_string(), {
+                let mut m = HashMap::new();
+                m.insert("事項".to_string(), 10);
+                m
+            });
+
+        predictor.expand_aliases();
+
+        // 1. 漢字・カタカナ名詞の先頭部分文字列（"漁", "読", "読み", "時", "ヘリコプタ"）が生成されないこと
+        let gyokou_map = predictor.frequencies.get("ぎょこう").unwrap();
+        assert_eq!(gyokou_map.get("漁港"), Some(&1));
+        assert!(!gyokou_map.contains_key("漁"));
+
+        let yomikom_map = predictor.frequencies.get("よみこm").unwrap();
+        assert_eq!(yomikom_map.get("読み込"), Some(&1));
+        assert!(!yomikom_map.contains_key("読"));
+        assert!(!yomikom_map.contains_key("読み"));
+
+        assert!(!predictor.context_frequencies.contains_key("時"));
+        assert!(!predictor.context_frequencies.contains_key("ヘリコプタ"));
+
+        // 2. 送り仮名付きの動詞・サ変動詞（"割く" -> "割", "飛ばす" -> "飛ば"/"飛", "確認する" -> "確認"）は展開されること
+        let jikan_map = predictor.context_frequencies.get("時間").unwrap();
+        assert_eq!(jikan_map.get("割く"), Some(&10));
+        assert_eq!(jikan_map.get("割"), Some(&10));
+
+        let heli_map = predictor.context_frequencies.get("ヘリコプター").unwrap();
+        assert_eq!(heli_map.get("飛ばす"), Some(&10));
+        assert_eq!(heli_map.get("飛ば"), Some(&10));
+        assert_eq!(heli_map.get("飛"), Some(&10));
+
+        let kakunin_stem_map = predictor.context_frequencies.get("確認").unwrap();
+        assert_eq!(kakunin_stem_map.get("事項"), Some(&10));
+    }
+
+    #[test]
+    fn test_affix_midashi_preserves_skk_order_without_annotation_hijack() {
+        let predictor = FrequencyPredictor::new(None);
+        // SKK-JISYO.L の `さい> /再/最/歳;?/` や `ひ> /被/非/乾;.../` で、
+        // 注釈付きの末尾候補（`歳;?`, `乾;...`）が主要接頭語（`再`, `被`）を追い越さないこと
+        let sai_prefix = ["再", "最", "歳;?"];
+        let ranked_sai =
+            predictor.rank_candidates_borrowed(&[] as &[&str], "さい>", &sai_prefix, true);
+        assert_eq!(ranked_sai, vec!["再", "最", "歳;?"]);
+
+        let hi_prefix = ["被", "非", "乾;かわく"];
+        let ranked_hi =
+            predictor.rank_candidates_borrowed(&[] as &[&str], "ひ>", &hi_prefix, true);
+        assert_eq!(ranked_hi, vec!["被", "非", "乾;かわく"]);
     }
 }

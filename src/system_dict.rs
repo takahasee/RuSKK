@@ -3,7 +3,7 @@
 //! 国語辞典に項目が存在する単語、および SKK 注釈付き単語を判定して高速にキャッシュする。
 
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 use crate::frequency::clean_candidate;
 
@@ -68,6 +68,13 @@ fn query_system_dict_definition(word: &str) -> bool {
     if word.is_empty() {
         return false;
     }
+    // DictionaryServices (DCSCopyTextDefinition) の内部インデックス参照はマルチスレッド同時初期化・照会時に
+    // 競合して NULL を返すことがあるため、キャッシュミス時の FFI 呼び出しのみ Mutex で直列化する。
+    static FFI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = FFI_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     unsafe {
         let cf_str = ffi::CFStringCreateWithBytes(
             std::ptr::null(),
