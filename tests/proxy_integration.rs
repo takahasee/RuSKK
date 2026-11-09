@@ -69,6 +69,7 @@ async fn test_proxy_ranks_by_seed_frequency() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor.clone(),
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,
@@ -147,6 +148,7 @@ async fn test_proxy_basic_lookup_passthrough() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,
@@ -233,6 +235,7 @@ async fn test_proxy_forwards_completion() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,
@@ -310,6 +313,7 @@ async fn test_proxy_single_char_lookup_works_immediately() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,
@@ -387,6 +391,7 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true, // 送り復元有効
         context_ranking: false,
         annotation_priority: false,
@@ -467,6 +472,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -567,6 +573,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -654,6 +661,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -745,6 +753,7 @@ async fn test_proxy_okuri_expansion_resolves_compound_neage() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -824,6 +833,7 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: false, // 送り復元無効（従来動作）
         context_ranking: false,
         annotation_priority: false,
@@ -932,6 +942,7 @@ async fn test_proxy_context_ranking_promotes_candidates() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: true,
         annotation_priority: false,
@@ -1071,6 +1082,7 @@ async fn test_proxy_context_ranking_disabled() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false, // 文脈連動無効
@@ -1177,6 +1189,7 @@ async fn test_proxy_context_protected_against_completion_burst() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: true,
         annotation_priority: false,
@@ -1276,6 +1289,7 @@ async fn test_proxy_okuri_expansion_resolves_sokuon_omot() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -1353,6 +1367,7 @@ async fn test_proxy_okuri_expansion_resolves_youon_warac() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -1428,6 +1443,7 @@ async fn test_proxy_okuri_expansion_resolves_youon_tabey() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -1506,6 +1522,7 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
             Duration::from_millis(50),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: false,
         annotation_priority: false,
@@ -1585,6 +1602,7 @@ async fn test_proxy_annotation_priority() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor.clone(),
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: true, // システム辞書・注釈優先有効
@@ -1667,6 +1685,7 @@ async fn test_proxy_respects_fallback_timeout() {
             Duration::from_millis(120), // 850ms より十分短い 120ms を指定
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,
@@ -1786,6 +1805,7 @@ async fn test_proxy_okuri_nashi_demotes_fragments_and_merges_fallback() {
             Duration::from_millis(200),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: true,
         annotation_priority: true,
@@ -1913,6 +1933,7 @@ async fn test_proxy_prefix_and_suffix_routing() {
             Duration::from_millis(200),
         ),
         predictor: shared_predictor,
+        lookup_cache: Default::default(),
         okuri_expansion: true,
         context_ranking: true,
         annotation_priority: true,
@@ -1965,4 +1986,109 @@ async fn test_proxy_prefix_and_suffix_routing() {
     proxy_handle.abort();
     primary_handle.abort();
     fallback_handle.abort();
+}
+
+#[tokio::test]
+async fn test_proxy_lookup_cache_hits_and_avoids_upstream() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let primary_req_count = Arc::new(AtomicUsize::new(0));
+    let count_clone = Arc::clone(&primary_req_count);
+
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+
+    let primary_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary_listener.accept().await {
+            let count = Arc::clone(&count_clone);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 1024];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    count.fetch_add(1, Ordering::SeqCst);
+                    let line = String::from_utf8_lossy(&buf[..n]);
+                    if line.contains("にほん") {
+                        let _ = stream.write_all("1/日本/二本/\n".as_bytes()).await;
+                    } else if line.contains("きr") || line.contains("きる") {
+                        let _ = stream.write_all("1/切/着/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_secs(1),
+        ),
+        fallback: Backend::new(
+            "mock-fallback",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        lookup_cache: Arc::clone(&lookup_cache),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1回目照会: Primary に問い合わせが発生
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/日本/二本/\n");
+    let count_after_first = primary_req_count.load(Ordering::SeqCst);
+    assert!(count_after_first >= 1);
+
+    // 2回目照会: キャッシュヒットにより Primary への追加照会ゼロ！
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/日本/二本/\n");
+    assert_eq!(
+        primary_req_count.load(Ordering::SeqCst),
+        count_after_first,
+        "2回目の照会はキャッシュヒットし、Primary への照会数は増加しないこと"
+    );
+
+    // キャッシュをクリア
+    lookup_cache.clear();
+
+    // 3回目照会: キャッシュクリア後のため、再び Primary へ照会が行われる
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/日本/二本/\n");
+    assert_eq!(
+        primary_req_count.load(Ordering::SeqCst),
+        count_after_first + 1,
+        "キャッシュクリア後の照会は Primary への照会数が増加すること"
+    );
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
 }

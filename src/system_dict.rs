@@ -272,6 +272,15 @@ impl SystemDictCache {
         Self::default()
     }
 
+    /// キャッシュに既に存在するか確認する（FFI照会を行わないゼロレイテンシパス）
+    pub fn has_cached_definition(&self, word: &str) -> Option<bool> {
+        if word.is_empty() {
+            return Some(false);
+        }
+        let guard = self.cache.read().ok()?;
+        guard.get(word).copied()
+    }
+
     /// 単語がシステム辞書に存在するか、キャッシュ付きで高速判定する。
     pub fn has_definition(&self, word: &str) -> bool {
         if word.is_empty() {
@@ -307,7 +316,13 @@ fn global_dict_cache() -> &'static SystemDictCache {
 
 /// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する（annotationが引ける）」か判定する。
 /// 送りあり見出し（例: "かk", "すばらしi"）が渡された場合、語幹＋終止形（例: "書く", "素晴らしい"）でも判定する。
-pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
+/// `allow_cold_ffi` が false の場合、インメモリキャッシュに存在する結果のみを使用し、
+/// 未キャッシュ時の重い FFI 照会をスキップする。
+pub fn is_annotated_or_in_dict_fast(
+    candidate: &str,
+    midashi: Option<&str>,
+    allow_cold_ffi: bool,
+) -> bool {
     // 1. 候補文字列自体に ';' による SKK 注釈が含まれている場合は即座に true
     if candidate.contains(';') {
         return true;
@@ -319,13 +334,17 @@ pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
     }
 
     let cache = global_dict_cache();
+    let check_word = |w: &str| -> bool {
+        if allow_cold_ffi {
+            cache.has_definition(w)
+        } else {
+            cache.has_cached_definition(w).unwrap_or(false)
+        }
+    };
 
-    // 2. 単語本体がシステム辞書に存在するか
-    if cache.has_definition(clean) {
-        return true;
-    }
-
-    // 3. 送りあり見出しの場合、語幹＋終止形・名詞形送り仮名でも判定する
+    // 2. 送りあり見出しの場合、語幹＋終止形・名詞形送り仮名を最優先で照会する。
+    //    動詞・形容詞の語幹単体（例: 「切」）よりも終止形（例: 「切る」）の方が国語辞典の見出し語に
+    //    100%確実にヒットするため、終止形を先に照会して不要なキャッシュミスと FFI 呼び出しを激減させる。
     if let Some(mid) = midashi
         && let Some(parsed) = crate::okuri::parse_okuri_midashi_extended(mid)
     {
@@ -336,7 +355,7 @@ pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
                 let mut full_word = String::with_capacity(clean.len() + suffix.len());
                 full_word.push_str(clean);
                 full_word.push_str(suffix);
-                if cache.has_definition(&full_word) {
+                if check_word(&full_word) {
                     return true;
                 }
                 suffix.chars().next().and_then(crate::okuri::kana_to_okuri_key)
@@ -349,14 +368,21 @@ pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
                 let mut full_word = String::with_capacity(clean.len() + suffix.len());
                 full_word.push_str(clean);
                 full_word.push_str(suffix);
-                if cache.has_definition(&full_word) {
+                if check_word(&full_word) {
                     return true;
                 }
             }
         }
     }
 
-    false
+    // 3. 送りなし見出し、または語幹＋終止形でヒットしなかった場合、単語本体がシステム辞書に存在するか
+    check_word(clean)
+}
+
+/// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する」か判定する（標準判定）。
+#[inline]
+pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
+    is_annotated_or_in_dict_fast(candidate, midashi, true)
 }
 
 #[cfg(test)]

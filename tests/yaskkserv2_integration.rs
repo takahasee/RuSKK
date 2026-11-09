@@ -115,6 +115,7 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
             Duration::from_secs(1),
         ),
         predictor: shared_predictor.clone(),
+        lookup_cache: Default::default(),
         okuri_expansion: false,
         context_ranking: false,
         annotation_priority: false,

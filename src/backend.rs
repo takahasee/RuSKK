@@ -13,6 +13,7 @@ use crate::encoding::response_euc_to_utf8;
 use crate::protocol::{Request, encode_request, encode_request_for_encoding};
 
 const MAX_BACKEND_RESPONSE_BYTES: usize = 65536; // 64KB
+const DEFAULT_MAX_POOL_SIZE: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamEncoding {
@@ -30,7 +31,8 @@ pub struct Backend {
     pub addr: SocketAddr,
     pub encoding: UpstreamEncoding,
     pub timeout: Duration,
-    pub connection: Arc<Mutex<Option<BufReader<TcpStream>>>>,
+    pool: Arc<Mutex<Vec<BufReader<TcpStream>>>>,
+    max_pool_size: usize,
 }
 
 #[derive(Debug, Error)]
@@ -63,8 +65,43 @@ impl Backend {
             addr,
             encoding,
             timeout,
-            connection: Arc::new(Mutex::new(None)),
+            pool: Arc::new(Mutex::new(Vec::with_capacity(DEFAULT_MAX_POOL_SIZE))),
+            max_pool_size: DEFAULT_MAX_POOL_SIZE,
         }
+    }
+
+    /// アイドル状態の接続をプールから取得するか、新規接続を作成する
+    async fn acquire_conn(&self) -> Result<BufReader<TcpStream>, BackendError> {
+        {
+            let mut guard = self.pool.lock().await;
+            if let Some(stream) = guard.pop() {
+                return Ok(stream);
+            }
+        }
+        match TcpStream::connect(self.addr).await {
+            Ok(stream) => {
+                let _ = stream.set_nodelay(true);
+                Ok(BufReader::new(stream))
+            }
+            Err(source) => Err(BackendError::Connect {
+                backend: self.name.clone(),
+                source,
+            }),
+        }
+    }
+
+    /// 正常終了した接続をプールに返却する
+    async fn release_conn(&self, stream: BufReader<TcpStream>) {
+        let mut guard = self.pool.lock().await;
+        if guard.len() < self.max_pool_size {
+            guard.push(stream);
+        }
+    }
+
+    /// 接続プールをクリアする
+    pub async fn clear_pool(&self) {
+        let mut guard = self.pool.lock().await;
+        guard.clear();
     }
 
     pub async fn query(&self, request: &Request<'_>) -> Result<Vec<u8>, BackendError> {
@@ -119,49 +156,14 @@ impl Backend {
         wire: &[u8],
         timeout_duration: Duration,
     ) -> Result<Vec<u8>, BackendError> {
-        let lock_start = tokio::time::Instant::now();
-        let mut guard = match timeout(timeout_duration, self.connection.lock()).await {
-            Ok(g) => g,
-            Err(_) => {
-                return Err(BackendError::Timeout {
-                    backend: self.name.clone(),
-                    timeout: timeout_duration,
-                });
-            }
-        };
-
-        let remaining = timeout_duration.saturating_sub(lock_start.elapsed());
-        if remaining.is_zero() {
-            return Err(BackendError::Timeout {
-                backend: self.name.clone(),
-                timeout: timeout_duration,
-            });
-        }
-
-        let res = timeout(remaining, async {
+        let res = timeout(timeout_duration, async {
             let mut last_err = None;
             for attempt in 0..2 {
-                if guard.is_none() {
-                    match TcpStream::connect(self.addr).await {
-                        Ok(stream) => {
-                            let _ = stream.set_nodelay(true);
-                            *guard = Some(BufReader::new(stream));
-                        }
-                        Err(source) => {
-                            return Err(BackendError::Connect {
-                                backend: self.name.clone(),
-                                source,
-                            });
-                        }
-                    }
-                }
-
-                let reader = guard.as_mut().unwrap();
+                let mut reader = self.acquire_conn().await?;
 
                 // 接続にリクエストを送信し、確実にフラッシュ
                 if let Err(source) = reader.get_mut().write_all(wire).await {
                     debug!(backend = %self.name, attempt, error = %source, "write failed on connection, resetting");
-                    *guard = None;
                     last_err = Some(BackendError::Io {
                         backend: self.name.clone(),
                         source,
@@ -170,7 +172,6 @@ impl Backend {
                 }
                 if let Err(source) = reader.get_mut().flush().await {
                     debug!(backend = %self.name, attempt, error = %source, "flush failed on connection, resetting");
-                    *guard = None;
                     last_err = Some(BackendError::Io {
                         backend: self.name.clone(),
                         source,
@@ -179,21 +180,21 @@ impl Backend {
                 }
 
                 let mut buf = Vec::with_capacity(1024);
-                let mut take_reader = reader.take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
+                let mut take_reader = (&mut reader).take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
                 match take_reader.read_until(b'\n', &mut buf).await {
                     Ok(n) if n > 0 && !buf.is_empty() => {
                         if buf.len() > MAX_BACKEND_RESPONSE_BYTES || !buf.ends_with(b"\n") {
                             warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes or missing newline");
-                            *guard = None;
                             return Err(BackendError::EmptyResponse {
                                 backend: self.name.clone(),
                             });
                         }
+                        // 正常に送受信完了した接続をプールへ返却
+                        self.release_conn(reader).await;
                         return Ok(buf);
                     }
                     Ok(_) => {
                         debug!(backend = %self.name, attempt, "empty response on persistent connection, resetting");
-                        *guard = None;
                         last_err = Some(BackendError::EmptyResponse {
                             backend: self.name.clone(),
                         });
@@ -201,7 +202,6 @@ impl Backend {
                     }
                     Err(source) => {
                         debug!(backend = %self.name, attempt, error = %source, "read error on connection, resetting");
-                        *guard = None;
                         last_err = Some(BackendError::Io {
                             backend: self.name.clone(),
                             source,
@@ -219,14 +219,10 @@ impl Backend {
 
         match res {
             Ok(inner) => inner,
-            Err(_) => {
-                // タイムアウト時は途中の送受信で接続状態が不整合になるため、確実に破棄
-                *guard = None;
-                Err(BackendError::Timeout {
-                    backend: self.name.clone(),
-                    timeout: timeout_duration,
-                })
-            }
+            Err(_) => Err(BackendError::Timeout {
+                backend: self.name.clone(),
+                timeout: timeout_duration,
+            }),
         }
     }
 }

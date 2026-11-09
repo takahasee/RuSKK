@@ -58,6 +58,50 @@ async fn backend_not_found() {
     assert_eq!(resp, b"4\n");
 }
 
+#[tokio::test]
+async fn backend_pool_concurrent_queries() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    // 複数並行接続を処理するモックサーバー
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let _ = stream.write_all(b"1/\xe3\x81\x82/\n").await;
+                    }
+                });
+            }
+        }
+    });
+
+    let backend = Backend::new(
+        "mock-pool",
+        addr,
+        UpstreamEncoding::Utf8,
+        Duration::from_secs(1),
+    );
+
+    // 10 個の並行クエリを同時に実行
+    let mut handles = Vec::new();
+    for _ in 0..10 {
+        let b = backend.clone();
+        handles.push(tokio::spawn(async move {
+            b.query(&Request::Lookup(b"a")).await.unwrap()
+        }));
+    }
+
+    for h in handles {
+        let resp = h.await.unwrap();
+        assert_eq!(resp, b"1/\xe3\x81\x82/\n");
+    }
+}
+
 async fn spawn_mock(handler: fn(&[u8]) -> Vec<u8>) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

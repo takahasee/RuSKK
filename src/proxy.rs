@@ -21,6 +21,7 @@ pub struct Proxy {
     pub primary: Backend,
     pub fallback: Backend,
     pub predictor: SharedPredictor,
+    pub lookup_cache: Arc<crate::cache::LookupCache>,
     pub okuri_expansion: bool,
     pub context_ranking: bool,
     pub annotation_priority: bool,
@@ -141,14 +142,15 @@ impl Proxy {
         let proxy = Arc::new(self);
         let shared_context = Arc::new(std::sync::Mutex::new(SharedContextState::default()));
 
-        // Primary バックエンド（azooKey）をバックグラウンドでウォームアップ
+        // Primary バックエンド（azooKey）およびシステム辞書をバックグラウンドでウォームアップ
         // （macOS の App Nap による初回スリープを解除し、通常変換・補完エンジンを先行初期化する）
         {
-            let warmup_primary = proxy.primary.clone();
+            let warmup_proxy = Arc::clone(&proxy);
             tokio::spawn(async move {
                 // 1. 通常変換（Lookup）モデルのウォームアップ
                 let req_lookup = Request::Lookup("あ".as_bytes());
-                let _ = warmup_primary
+                let _ = warmup_proxy
+                    .primary
                     .query_with_timeout(&req_lookup, Duration::from_secs(3))
                     .await;
 
@@ -167,11 +169,27 @@ impl Proxy {
                 ];
                 for &kana in WARMUP_CHARS {
                     let req_comp = Request::Completion(kana);
-                    let _ = warmup_primary
+                    let _ = warmup_proxy
+                        .primary
                         .query_with_timeout(&req_comp, Duration::from_millis(500))
                         .await;
                 }
                 tracing::debug!("primary backend lookup and completion warmup complete");
+
+                // 3. システム辞書キャッシュのバックグラウンド先行ウォームアップ
+                // （起動直後の初弾 Lookup における FFI キャッシュミス 160ms を完全解消）
+                if warmup_proxy.annotation_priority {
+                    let words_to_warmup: Vec<String> = {
+                        let guard = warmup_proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                        guard.frequencies.keys().take(64).cloned().collect()
+                    };
+                    tokio::task::spawn_blocking(move || {
+                        for word in words_to_warmup {
+                            let _ = crate::system_dict::is_annotated_or_in_dict(&word, None);
+                        }
+                        tracing::debug!("system dictionary cache warmup complete");
+                    });
+                }
             });
         }
 
@@ -302,6 +320,32 @@ async fn handle_client(
                 let mut final_response = None;
                 let mut top_candidate_for_context: Option<String> = None;
 
+                let lookup_key = crate::cache::LookupKey::new(
+                    ctx_ref.first().map(|a| a.as_ref()),
+                    &midashi_str,
+                );
+
+                // 【ゼロレイテンシ・キャッシュ参照】
+                // 過去に同一文脈・同一見出し語で変換済みの場合は、TCP 往復・辞書判定・整列を完全バイパスし即答
+                if let Some(cached) = proxy.lookup_cache.get(&lookup_key) {
+                    debug!(midashi = %midashi_str, "lookup cache hit");
+                    if proxy.context_ranking
+                        && !is_completion_burst
+                        && let Some(ref top) = cached.top_candidate
+                    {
+                        let clean = crate::frequency::clean_candidate(top);
+                        if contains_kanji(clean) {
+                            let mut ctx =
+                                shared_context.lock().unwrap_or_else(|e| e.into_inner());
+                            ctx.on_lookup_result(&midashi_str, Arc::from(clean), now);
+                        }
+                    }
+                    writer.write_all(&cached.response).await?;
+                    conn_last_response_time = Some(Instant::now());
+                    writer.flush().await?;
+                    continue;
+                }
+
                 // 接頭語（例: "さい>", "ちょう>", "ご>"）および接尾語（例: ">せい", ">ひ", ">てき", ">わたs"）の専用処理。
                 // SKK の仕様上、接頭語・接尾語は `>` を含む見出し語として辞書に登録されており、候補文字列には `>` を含めない。
                 // Primary (azooKey) は SKK の `>` 接辞構文を解釈せず文字通りの記号 `>` を候補に付与してしまうため、
@@ -319,6 +363,15 @@ async fn handle_client(
                     )
                     .await;
                     debug!(?peer, kind = ?midashi_kind, resp = ?String::from_utf8_lossy(&resp_to_send), "sending affix response to client");
+                    if is_found(&resp_to_send) {
+                        proxy.lookup_cache.insert(
+                            lookup_key,
+                            crate::cache::CachedLookup {
+                                response: resp_to_send.clone(),
+                                top_candidate: None,
+                            },
+                        );
+                    }
                     writer.write_all(&resp_to_send).await?;
                     conn_last_response_time = Some(Instant::now());
                     writer.flush().await?;
@@ -328,29 +381,37 @@ async fn handle_client(
                 // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき", "かきおこs" -> "かきおこす"）の活用復元試行
                 if proxy.okuri_expansion {
                     let variations = crate::okuri::expand_okuri_variations(&midashi_str);
-                    let mut responses = Vec::with_capacity(variations.len());
-
                     let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
                     let max_total_okuri = Duration::from_millis(600).min(remaining_overall);
+                    let okuri_timeout = proxy
+                        .primary
+                        .timeout
+                        .min(Duration::from_millis(300))
+                        .min(max_total_okuri);
 
-                    for var in variations {
-                        let elapsed_okuri = lookup_start.elapsed();
-                        if elapsed_okuri >= max_total_okuri {
-                            break;
+                    // Primary バックエンドのコネクションプールを活用し、全活用形を完全並行照会
+                    let mut handles = Vec::with_capacity(variations.len());
+                    for (idx, var) in variations.into_iter().enumerate() {
+                        let primary = proxy.primary.clone();
+                        handles.push(tokio::spawn(async move {
+                            let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
+                            let res = primary.query_with_timeout(&okuri_req, okuri_timeout).await;
+                            (idx, res, var)
+                        }));
+                    }
+
+                    let mut query_results = Vec::with_capacity(handles.len());
+                    for handle in handles {
+                        if let Ok(res) = handle.await {
+                            query_results.push(res);
                         }
-                        let remaining = max_total_okuri.saturating_sub(elapsed_okuri);
-                        let okuri_timeout = proxy
-                            .primary
-                            .timeout
-                            .min(Duration::from_millis(300))
-                            .min(remaining);
-                        let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
-                        if let Ok(okuri_resp) = proxy
-                            .primary
-                            .query_with_timeout(&okuri_req, okuri_timeout)
-                            .await
-                            && is_found(&okuri_resp)
-                        {
+                    }
+                    // 活用の優先順位（order_suffixes_for_stem）を保持するため、元のインデックス順に整列
+                    query_results.sort_by_key(|(idx, _, _)| *idx);
+
+                    let mut responses = Vec::with_capacity(query_results.len());
+                    for (_, res, var) in query_results {
+                        if let Ok(okuri_resp) = res && is_found(&okuri_resp) {
                             responses.push((okuri_resp, var));
                         }
                     }
@@ -381,8 +442,7 @@ async fn handle_client(
                     }
 
                     if !all_stem_cands.is_empty() {
-                        let mut merged_cands: Vec<String> =
-                            all_stem_cands.into_iter().map(|s| s.to_string()).collect();
+                        let mut merged_cands: Vec<&str> = all_stem_cands;
 
                         // 元の見出し語（midashi_str）で Fallback (yaskkserv2 / 巨大SKK辞書) を照会し、
                         // 辞書が本来持っている全候補（異体字・専門用語・注釈付き）を末尾に重複排除してマージする。
@@ -390,36 +450,40 @@ async fn handle_client(
                         // 辞書の全候補も漏れなく提供され、変換候補数が少なくなる現象を根本的に解消する。
                         let remaining_fb = overall_deadline.saturating_sub(lookup_start.elapsed());
                         let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200)).min(remaining_fb);
-                        if !fb_timeout.is_zero()
-                            && let Ok(fallback_resp) = proxy
+                        let fallback_resp_opt = if !fb_timeout.is_zero() {
+                            proxy
                                 .fallback
                                 .query_with_timeout(&Request::Lookup(midashi_str.as_bytes()), fb_timeout)
                                 .await
-                            && is_found(&fallback_resp)
+                                .ok()
+                        } else {
+                            None
+                        };
+
+                        if let Some(ref fallback_resp) = fallback_resp_opt
+                            && is_found(fallback_resp)
                         {
                             let fb_cands =
-                                crate::encoding::parse_candidates_unpacked(&fallback_resp);
+                                crate::encoding::parse_candidates_unpacked_borrowed(fallback_resp);
                             for cand in fb_cands {
-                                let clean = crate::frequency::clean_candidate(&cand);
+                                let clean = crate::frequency::clean_candidate(cand);
                                 if !clean.is_empty()
                                     && !merged_cands
                                         .iter()
-                                        .any(|c| crate::frequency::clean_candidate(c) == clean)
+                                        .any(|&c| crate::frequency::clean_candidate(c) == clean)
                                 {
                                     merged_cands.push(cand);
                                 }
                             }
                         }
 
-                        let cands_refs: Vec<&str> =
-                            merged_cands.iter().map(|s| s.as_str()).collect();
                         let norm_midashi = crate::okuri::normalize_okuri_midashi_key(&midashi_str);
                         let ranked = {
                             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
                             guard.rank_candidates_borrowed(
                                 ctx_ref,
                                 &norm_midashi,
-                                &cands_refs,
+                                &merged_cands,
                                 proxy.annotation_priority,
                             )
                         };
@@ -496,26 +560,21 @@ async fn handle_client(
                                         .await
                                     && is_found(&fallback_resp)
                                 {
-                                    let mut merged_cands: Vec<String> =
-                                        parse_candidates_borrowed(&response)
-                                            .into_iter()
-                                            .map(|s| s.to_string())
-                                            .collect();
+                                    let mut merged_cands: Vec<&str> =
+                                        parse_candidates_borrowed(&response);
                                     let fb_cands =
-                                        crate::encoding::parse_candidates_unpacked(&fallback_resp);
+                                        crate::encoding::parse_candidates_unpacked_borrowed(&fallback_resp);
                                     for cand in fb_cands {
-                                        let clean = crate::frequency::clean_candidate(&cand);
+                                        let clean = crate::frequency::clean_candidate(cand);
                                         if !clean.is_empty()
-                                            && !merged_cands.iter().any(|c| {
+                                            && !merged_cands.iter().any(|&c| {
                                                 crate::frequency::clean_candidate(c) == clean
                                             })
                                         {
                                             merged_cands.push(cand);
                                         }
                                     }
-                                    let merged_refs: Vec<&str> =
-                                        merged_cands.iter().map(|s| s.as_str()).collect();
-                                    response = format_candidates_response_str(&merged_refs);
+                                    response = format_candidates_response_str(&merged_cands);
                                 }
                             }
                         }
@@ -575,6 +634,16 @@ async fn handle_client(
                         let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
                         ctx.on_lookup_result(&midashi_str, Arc::from(clean), now);
                     }
+                }
+
+                if is_found(&resp_to_send) {
+                    proxy.lookup_cache.insert(
+                        lookup_key,
+                        crate::cache::CachedLookup {
+                            response: resp_to_send.clone(),
+                            top_candidate: top_candidate_for_context.clone(),
+                        },
+                    );
                 }
 
                 debug!(?peer, resp = ?String::from_utf8_lossy(&resp_to_send), "sending response to client");

@@ -321,8 +321,14 @@ impl FrequencyPredictor {
                 };
 
                 let annotation_score: u64 = if effective_annotation_priority {
-                    let in_dict =
-                        crate::system_dict::is_annotated_or_in_dict(cand, Some(midashi));
+                    // 上位12件までは未キャッシュ時のシステム辞書 FFI 照会を許可し、
+                    // 13件目以降はキャッシュヒットのみ採用して重い FFI レイテンシスパイクを完全に防止する
+                    let allow_cold_ffi = idx < 12;
+                    let in_dict = crate::system_dict::is_annotated_or_in_dict_fast(
+                        cand,
+                        Some(midashi),
+                        allow_cold_ffi,
+                    );
                     let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
                     let shape_bonus = if !is_okuri
                         && (in_dict || !is_unverified_okuri_fragment(clean))

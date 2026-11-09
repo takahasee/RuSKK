@@ -124,18 +124,26 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
 /// SKKの送りあり辞書エントリ（例: `1/[っ/思/]/重/御持/想;注釈/`）に含まれる
 /// 角括弧ブロック `[送り仮名/候補...]` も適切に展開し、語幹候補を抽出する。
 pub fn parse_candidates_unpacked(response: &[u8]) -> Vec<String> {
+    parse_candidates_unpacked_borrowed(response)
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// 角括弧ブロックを展開し、完全ゼロアロケーション（借用スライス）で候補を抽出する。
+pub fn parse_candidates_unpacked_borrowed(response: &[u8]) -> Vec<&str> {
     if !response.starts_with(b"1") {
         return Vec::new();
     }
     let body = response[1..].strip_suffix(b"\n").unwrap_or(&response[1..]);
     if let Ok(body_str) = std::str::from_utf8(body) {
-        parse_candidates_from_str(body_str)
+        parse_candidates_from_str_borrowed(body_str)
     } else {
         Vec::new()
     }
 }
 
-fn parse_candidates_from_str(body_str: &str) -> Vec<String> {
+fn parse_candidates_from_str_borrowed(body_str: &str) -> Vec<&str> {
     let mut cands = Vec::new();
     let mut in_block = false;
 
@@ -154,15 +162,15 @@ fn parse_candidates_from_str(body_str: &str) -> Vec<String> {
         if in_block {
             if let Some(cand) = part.strip_suffix(']') {
                 let cand = cand.trim();
-                if !cand.is_empty() && !cands.iter().any(|c| c == cand) {
-                    cands.push(cand.to_string());
+                if !cand.is_empty() && !cands.contains(&cand) {
+                    cands.push(cand);
                 }
                 in_block = false;
-            } else if !part.is_empty() && !cands.iter().any(|c| c == part) {
-                cands.push(part.to_string());
+            } else if !part.is_empty() && !cands.contains(&part) {
+                cands.push(part);
             }
-        } else if !part.is_empty() && !cands.iter().any(|c| c == part) {
-            cands.push(part.to_string());
+        } else if !part.is_empty() && !cands.contains(&part) {
+            cands.push(part);
         }
     }
     cands

@@ -73,11 +73,14 @@ async fn main() -> anyhow::Result<()> {
     );
     let predictor = Arc::new(RwLock::new(initial_predictor));
 
+    let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
+
     let proxy = Proxy {
         listen: args.listen.clone(),
         primary: args.primary(),
         fallback: args.fallback(),
         predictor: Arc::clone(&predictor),
+        lookup_cache: Arc::clone(&lookup_cache),
         okuri_expansion: args.is_okuri_expansion_enabled(),
         context_ranking: args.is_context_ranking_enabled(),
         annotation_priority: args.is_annotation_priority_enabled(),
@@ -94,9 +97,9 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // SIGHUP を受け取ったら ~/.ruskkserv-frequency.json をホットリロードする。
+    // SIGHUP を受け取ったら ~/.ruskkserv-frequency.json をホットリロードし、変換キャッシュをクリアする。
     // import-user-dict --send-reload 実行後に predictor を再起動なしで更新するために使用する。
-    let reload = reload_on_sighup(Arc::clone(&predictor), history_path);
+    let reload = reload_on_sighup(Arc::clone(&predictor), Arc::clone(&lookup_cache), history_path);
 
     tokio::select! {
         result = proxy.run() => { result? }
@@ -108,14 +111,20 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// SIGHUP を受け取るたびに predictor を ~/.ruskkserv-frequency.json から再ロードする。
+/// SIGHUP を受け取るたびに predictor を ~/.ruskkserv-frequency.json から再ロードし、
+/// メモリ上の変換キャッシュを全消去して即座に最新状態を反映する。
 /// このタスクは永久に実行され続け、プロセスが終了するまでシグナルを待ち受ける。
-async fn reload_on_sighup(predictor: SharedPredictor, path: Option<PathBuf>) {
+async fn reload_on_sighup(
+    predictor: SharedPredictor,
+    lookup_cache: Arc<ruskkserv::cache::LookupCache>,
+    path: Option<PathBuf>,
+) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sighup = signal(SignalKind::hangup()).expect("SIGHUP handler");
     loop {
         sighup.recv().await;
-        info!("received SIGHUP — reloading predictor");
+        info!("received SIGHUP — reloading predictor and clearing lookup cache");
+        lookup_cache.clear();
         let mut guard = predictor.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref p) = path {
             match guard.load(p) {
