@@ -1614,6 +1614,10 @@ async fn test_proxy_annotation_priority() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // CoreServices DictionaryServices の初回フレームワーク初期化（~700-900ms）を無関係な語で済ませ、
+    // 本番デーモン起動後と同じ状態で「謎造語xyz」と「東京」の未キャッシュ比較を検証する
+    let _ = ruskkserv::system_dict::is_annotated_or_in_dict("日本", None);
+
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
@@ -1622,8 +1626,8 @@ async fn test_proxy_annotation_priority() {
     let resp = String::from_utf8_lossy(&buf[..n]);
 
     // 謎造語xyz は最下位（末尾）に沈み、東京および時間;時刻が上位に来ていること
-    assert!(resp.starts_with("1/"));
-    assert!(resp.ends_with("/謎造語xyz/\n"));
+    assert!(resp.starts_with("1/"), "unexpected resp: {resp:?}");
+    assert!(resp.ends_with("/謎造語xyz/\n"), "unexpected resp: {resp:?}");
 
     drop(client);
     proxy_handle.abort();
@@ -1817,6 +1821,10 @@ async fn test_proxy_okuri_nashi_demotes_fragments_and_merges_fallback() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    // CoreServices DictionaryServices の初回フレームワーク初期化を無関係な語で済ませ、
+    // 単独実行時・並列実行時のいずれでも初回変換デッドライン (850ms) 内で通常辞書判定を検証する
+    let _ = ruskkserv::system_dict::is_annotated_or_in_dict("日本", None);
+
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
 
@@ -1944,6 +1952,10 @@ async fn test_proxy_prefix_and_suffix_routing() {
     });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // CoreServices DictionaryServices の初回フレームワーク初期化を無関係な語で済ませ、
+    // 単独実行時・並列実行時のいずれでも初回変換デッドライン (850ms) 内で通常辞書判定を検証する
+    let _ = ruskkserv::system_dict::is_annotated_or_in_dict("日本", None);
 
     let mut client = TcpStream::connect(proxy_addr).await.unwrap();
     let mut buf = [0u8; 512];
@@ -2086,6 +2098,200 @@ async fn test_proxy_lookup_cache_hits_and_avoids_upstream() {
         primary_req_count.load(Ordering::SeqCst),
         count_after_first + 1,
         "キャッシュクリア後の照会は Primary への照会数が増加すること"
+    );
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+}
+
+/// Primary が 350ms 遅延してミス (`4\n`) を返し、Fallback が 550ms かかる場合でも、
+/// 200ms 経過時点での並列ヘッジ照会により overall_deadline (850ms) 内に初回変換が成功することを検証する。
+/// また Primary が遅延後にヒットした場合は、従来通り Primary が優先されることも確認する。
+#[tokio::test]
+async fn test_proxy_hedged_fallback_resolves_slow_first_conversion_within_deadline() {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+
+    let primary_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    if req.contains("おそいかち") {
+                        let _ = stream.write_all("1/遅い勝ち/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fallback_addr = fallback_listener.local_addr().unwrap();
+
+    let fallback_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = fallback_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if req.contains("おそいかち") {
+                        let _ = stream.write_all("1/フォールバック側/\n".as_bytes()).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(520)).await;
+                        let _ = stream.write_all("1/バックアップ/\n".as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-slow-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(600),
+        ),
+        fallback: Backend::new(
+            "mock-slow-fallback",
+            fallback_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(850),
+        ),
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. Primary が 350ms でミス + Fallback が 520ms でも、200ms 時点からのヘッジ並列化により
+    //    直列合計 (870ms > 850ms) を下回る ~720ms で初回変換がヒットすること
+    let start = tokio::time::Instant::now();
+    client.write_all("1ばっくあっぷ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/バックアップ/\n");
+    assert!(
+        elapsed < Duration::from_millis(840),
+        "hedged fallback should finish within overall_deadline, took {:?}",
+        elapsed
+    );
+
+    // 2. Fallback が高速に返せても、Primary がタイムアウト内 (350ms) でヒットすれば Primary が勝つこと
+    client.write_all("1おそいかち \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/遅い勝ち/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+    fallback_handle.abort();
+}
+
+/// バックエンド応答が overall_deadline (850ms) 直前に到達しても、
+/// 同期システム辞書 FFI が予算超過時にスキップされるため、初回変換が 1.0 秒タイムアウトを超えずに応答できることを検証する。
+#[tokio::test]
+async fn test_proxy_caps_cold_ffi_within_overall_deadline() {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+
+    let primary_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    // FFI 安全マージン（790ms）付近の 780ms 遅延で応答を返す
+                    tokio::time::sleep(Duration::from_millis(780)).await;
+                    let _ = stream
+                        .write_all("1/未知初回語A91/未知初回語B92/未知初回語C93/\n".as_bytes())
+                        .await;
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        primary: Backend::new(
+            "mock-near-deadline-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(850),
+        ),
+        fallback: Backend::new(
+            "mock-fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    let start = tokio::time::Instant::now();
+    client.write_all("1ちえんご \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        String::from_utf8_lossy(&buf[..n]),
+        "1/未知初回語A91/未知初回語B92/未知初回語C93/\n"
+    );
+    assert!(
+        elapsed < Duration::from_millis(920),
+        "cold FFI must stay capped inside overall_deadline, took {:?}",
+        elapsed
     );
 
     drop(client);

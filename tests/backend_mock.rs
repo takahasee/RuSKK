@@ -137,3 +137,80 @@ fn test_completion_merge_logic() {
     let formatted = ruskkserv::encoding::format_candidates_response_str(&merged);
     assert_eq!(formatted, "1/あ/い/う/\n".as_bytes());
 }
+
+#[tokio::test]
+async fn backend_recovers_when_multiple_pooled_connections_are_stale() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let close_idle_conns = Arc::new(AtomicBool::new(false));
+    let close_notify = Arc::new(Notify::new());
+    let close_flag_srv = Arc::clone(&close_idle_conns);
+    let close_notify_srv = Arc::clone(&close_notify);
+
+    let srv_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let close_flag = Arc::clone(&close_flag_srv);
+            let notify = Arc::clone(&close_notify_srv);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                loop {
+                    tokio::select! {
+                        n_res = stream.read(&mut buf) => {
+                            match n_res {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {
+                                    if close_flag.load(Ordering::SeqCst) {
+                                        // 失効した接続として即座に閉じることはせず、2巡目の通常応答
+                                        let _ = stream.write_all("1/新接続成功/\n".as_bytes()).await;
+                                    } else {
+                                        let _ = stream.write_all("1/初回プール構築/\n".as_bytes()).await;
+                                    }
+                                }
+                            }
+                        }
+                        _ = notify.notified(), if !close_flag.load(Ordering::SeqCst) => {
+                            // 通知を受けたら既存のアイドルソケットをサーバー側から切断する
+                            break;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    let backend = Backend::new(
+        "mock-stale-pool",
+        addr,
+        UpstreamEncoding::Utf8,
+        Duration::from_secs(1),
+    );
+
+    // 1. 同時に 5 本の接続を開き、プールに 5 本のアイドル接続を溜める
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let b = backend.clone();
+        handles.push(tokio::spawn(async move {
+            b.query(&Request::Lookup(b"a")).await.unwrap()
+        }));
+    }
+    for h in handles {
+        let resp = h.await.unwrap();
+        assert_eq!(resp, "1/初回プール構築/\n".as_bytes());
+    }
+
+    // 2. サーバー側でプール内の全 5 本を切断し、以後は新規接続に「新接続成功」を返す
+    close_idle_conns.store(true, Ordering::SeqCst);
+    close_notify.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // 3. プールに 2 本以上（5本）の死んだ接続があっても、初回クエリでプールを全破棄して新規接続し成功すること
+    let resp = backend.query(&Request::Lookup(b"a")).await.unwrap();
+    assert_eq!(resp, "1/新接続成功/\n".as_bytes());
+
+    srv_handle.abort();
+}

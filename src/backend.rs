@@ -70,14 +70,8 @@ impl Backend {
         }
     }
 
-    /// アイドル状態の接続をプールから取得するか、新規接続を作成する
-    async fn acquire_conn(&self) -> Result<BufReader<TcpStream>, BackendError> {
-        {
-            let mut guard = self.pool.lock().await;
-            if let Some(stream) = guard.pop() {
-                return Ok(stream);
-            }
-        }
+    /// 新規 TCP 接続を確立する
+    async fn connect_fresh(&self) -> Result<BufReader<TcpStream>, BackendError> {
         match TcpStream::connect(self.addr).await {
             Ok(stream) => {
                 let _ = stream.set_nodelay(true);
@@ -88,6 +82,18 @@ impl Backend {
                 source,
             }),
         }
+    }
+
+    /// アイドル状態の接続をプールから取得するか、新規接続を作成する。
+    /// 戻り値の bool はプール由来の再利用接続（true）か新規接続（false）かを示す。
+    async fn acquire_conn(&self) -> Result<(BufReader<TcpStream>, bool), BackendError> {
+        {
+            let mut guard = self.pool.lock().await;
+            if let Some(stream) = guard.pop() {
+                return Ok((stream, true));
+            }
+        }
+        self.connect_fresh().await.map(|s| (s, false))
     }
 
     /// 正常終了した接続をプールに返却する
@@ -158,55 +164,29 @@ impl Backend {
     ) -> Result<Vec<u8>, BackendError> {
         let res = timeout(timeout_duration, async {
             let mut last_err = None;
+            let mut force_fresh = false;
             for attempt in 0..2 {
-                let mut reader = self.acquire_conn().await?;
+                let (mut reader, from_pool) = if force_fresh {
+                    (self.connect_fresh().await?, false)
+                } else {
+                    self.acquire_conn().await?
+                };
 
-                // 接続にリクエストを送信し、確実にフラッシュ
-                if let Err(source) = reader.get_mut().write_all(wire).await {
-                    debug!(backend = %self.name, attempt, error = %source, "write failed on connection, resetting");
-                    last_err = Some(BackendError::Io {
-                        backend: self.name.clone(),
-                        source,
-                    });
-                    continue;
-                }
-                if let Err(source) = reader.get_mut().flush().await {
-                    debug!(backend = %self.name, attempt, error = %source, "flush failed on connection, resetting");
-                    last_err = Some(BackendError::Io {
-                        backend: self.name.clone(),
-                        source,
-                    });
-                    continue;
-                }
-
-                let mut buf = Vec::with_capacity(1024);
-                let mut take_reader = (&mut reader).take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
-                match take_reader.read_until(b'\n', &mut buf).await {
-                    Ok(n) if n > 0 && !buf.is_empty() => {
-                        if buf.len() > MAX_BACKEND_RESPONSE_BYTES || !buf.ends_with(b"\n") {
-                            warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes or missing newline");
-                            return Err(BackendError::EmptyResponse {
-                                backend: self.name.clone(),
-                            });
-                        }
-                        // 正常に送受信完了した接続をプールへ返却
+                match self.exchange_once(&mut reader, wire, attempt).await {
+                    Ok(buf) => {
+                        // 正常に送受信完了した接続のみプールへ返却
                         self.release_conn(reader).await;
                         return Ok(buf);
                     }
-                    Ok(_) => {
-                        debug!(backend = %self.name, attempt, "empty response on persistent connection, resetting");
-                        last_err = Some(BackendError::EmptyResponse {
-                            backend: self.name.clone(),
-                        });
-                        continue;
-                    }
-                    Err(source) => {
-                        debug!(backend = %self.name, attempt, error = %source, "read error on connection, resetting");
-                        last_err = Some(BackendError::Io {
-                            backend: self.name.clone(),
-                            source,
-                        });
-                        continue;
+                    Err((err, false)) => return Err(err),
+                    Err((err, true)) => {
+                        if from_pool {
+                            // スリープや再起動でプール内の複数ソケットが同時に失効している可能性があるため、
+                            // プールを一括破棄し、再試行は必ず新規接続で行う
+                            self.clear_pool().await;
+                            force_fresh = true;
+                        }
+                        last_err = Some(err);
                     }
                 }
             }
@@ -223,6 +203,79 @@ impl Backend {
                 backend: self.name.clone(),
                 timeout: timeout_duration,
             }),
+        }
+    }
+
+    async fn exchange_once(
+        &self,
+        reader: &mut BufReader<TcpStream>,
+        wire: &[u8],
+        attempt: usize,
+    ) -> Result<Vec<u8>, (BackendError, bool)> {
+        if let Err(source) = reader.get_mut().write_all(wire).await {
+            debug!(backend = %self.name, attempt, error = %source, "write failed on connection, resetting");
+            return Err((
+                BackendError::Io {
+                    backend: self.name.clone(),
+                    source,
+                },
+                true,
+            ));
+        }
+        if let Err(source) = reader.get_mut().flush().await {
+            debug!(backend = %self.name, attempt, error = %source, "flush failed on connection, resetting");
+            return Err((
+                BackendError::Io {
+                    backend: self.name.clone(),
+                    source,
+                },
+                true,
+            ));
+        }
+
+        let mut buf = Vec::with_capacity(1024);
+        let mut take_reader = reader.take(MAX_BACKEND_RESPONSE_BYTES as u64 + 1);
+        match take_reader.read_until(b'\n', &mut buf).await {
+            Ok(n) if n > 0 && !buf.is_empty() => {
+                if buf.len() > MAX_BACKEND_RESPONSE_BYTES {
+                    warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes");
+                    return Err((
+                        BackendError::EmptyResponse {
+                            backend: self.name.clone(),
+                        },
+                        false,
+                    ));
+                }
+                if !buf.ends_with(b"\n") {
+                    debug!(backend = %self.name, attempt, len = buf.len(), "backend response missing newline (EOF), resetting");
+                    return Err((
+                        BackendError::EmptyResponse {
+                            backend: self.name.clone(),
+                        },
+                        true,
+                    ));
+                }
+                Ok(buf)
+            }
+            Ok(_) => {
+                debug!(backend = %self.name, attempt, "empty response on persistent connection, resetting");
+                Err((
+                    BackendError::EmptyResponse {
+                        backend: self.name.clone(),
+                    },
+                    true,
+                ))
+            }
+            Err(source) => {
+                debug!(backend = %self.name, attempt, error = %source, "read error on connection, resetting");
+                Err((
+                    BackendError::Io {
+                        backend: self.name.clone(),
+                        source,
+                    },
+                    true,
+                ))
+            }
         }
     }
 }

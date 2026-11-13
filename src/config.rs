@@ -29,7 +29,7 @@ pub struct Args {
     pub azookey_timeout_ms: u64,
 
     /// Timeout for yaskkserv2 queries in ms (capped by 850ms overall deadline; 200ms in okuri merge)
-    #[arg(long, default_value_t = 700)]
+    #[arg(long, default_value_t = 850)]
     pub yaskkserv2_timeout_ms: u64,
 
     /// 送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能） [default: true]
@@ -138,7 +138,7 @@ mod tests {
         // デフォルトでは未指定（None）で、is_*_enabled() は環境変数がなければ true
         let default_args = Args::try_parse_from(["ruskkserv"]).unwrap();
         assert_eq!(default_args.azookey_timeout_ms, 600);
-        assert_eq!(default_args.yaskkserv2_timeout_ms, 700);
+        assert_eq!(default_args.yaskkserv2_timeout_ms, 850);
         assert_eq!(default_args.okuri_expansion, None);
         assert_eq!(default_args.context_ranking, None);
         assert_eq!(default_args.annotation_priority, None);

@@ -47,6 +47,7 @@ load_config() {
   RUSKKSERV_BIN="$(expand_path "$RUSKKSERV_BIN")"
   YASKKSERV2_BIN="$(expand_path "$YASKKSERV2_BIN")"
   YASKKSERV2_DICTIONARY="$(expand_path "$YASKKSERV2_DICTIONARY")"
+  YASKKSERV2_GOOGLE_CACHE="$(expand_path "${YASKKSERV2_GOOGLE_CACHE:-${HOME}/Library/Caches/ruskkserv/yaskkserv2-google.cache}")"
   LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskkserv}")"
   WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskkserv.sh"
   IMPORTER_APP="${HOME}/Applications/RuSKKservImporter.app"
@@ -81,6 +82,7 @@ render_plist() {
     -e "s|@SKK_PROXY_BIN@|${RUSKKSERV_BIN}|g" \
     -e "s|@YASKKSERV2_BIN@|${YASKKSERV2_BIN}|g" \
     -e "s|@YASKKSERV2_DICTIONARY@|${YASKKSERV2_DICTIONARY}|g" \
+    -e "s|@YASKKSERV2_GOOGLE_CACHE@|${YASKKSERV2_GOOGLE_CACHE}|g" \
     -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
     -e "s|@IMPORTER_APP_BIN@|${IMPORTER_APP_BIN}|g" \
     -e "s|@LOG_DIR@|${LOG_DIR}|g" \
@@ -104,6 +106,7 @@ do_install() {
   check_binaries
 
   mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR"
+  mkdir -p -m 700 "$(dirname "$YASKKSERV2_GOOGLE_CACHE")"
   chmod +x "$WAIT_SCRIPT" "${ROOT}/scripts/build-importer-app.sh"
 
   # 旧 skk-proxy 関連の登録をクリーンアップ
@@ -118,6 +121,8 @@ do_install() {
     "${LAUNCH_AGENTS}/com.ruskkserv.skkserv.plist"
 
   bootout_if_loaded "com.ruskkserv.yaskkserv2"
+  # yaskkserv2 は自身でデーモン化するため、旧設定を掴み続けないよう既存プロセスも停止する
+  pkill -x yaskkserv2 2>/dev/null || true
   bootout_if_loaded "com.ruskkserv.skkserv"
 
   launchctl enable "$DOMAIN/com.ruskkserv.yaskkserv2" 2>/dev/null || true

@@ -34,8 +34,8 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
 5. **macSKK の辞書競合を解消するシームレス統合**:
    - 巨大辞書群（NEologd, Wikipedia 等）を yaskkserv2 に集約し、macSKK は RuSKKserv 一本に一本化。
    - ユーザー辞書の学習順序を冪等に取り込むインポートコマンド（`import-user-dict`）と SIGHUP ホットリロードを完備。
-6. **並行クエリプール・インメモリキャッシュ・Apple Silicon 最適化による極小レイテンシ**:
-   - **接続プール & 並行クエリ**: Primary バックエンドにノンブロッキング接続プールを導入し、送りあり活用展開を完全並行照会。
+6. **並行クエリプール・インメモリキャッシュ・初回変換耐性・Apple Silicon 最適化による極小レイテンシ**:
+   - **接続プール & 並行クエリ・初回変換耐性**: Primary バックエンドにノンブロッキング接続プール（失効ソケット一括破棄＋新規接続フォールバック対応）を導入し、送りあり活用展開の完全並行照会や Primary 遅延時（200ms 超過）の並列ヘッジフォールバック、同期システム辞書 FFI のデッドライン（850ms）内制御＋バックグラウンドプリウォームに対応。
    - **インメモリ変換キャッシュ (`LookupCache`)**: 容量 4,096 件の高速キャッシュ（直前確定文脈分離・SIGHUP 自動クリア対応）により、過去に変換した単語や頻出語を **0.1ms 未満（ナノ秒オーダー）** で即答。
    - **ゼロコピー & Apple Silicon 最適化**: パースの借用スライス化、EUC-JP 一括 SIMD デコード（2バイト UTF-8 衝突回避付き）、Apple Silicon 128バイト キャッシュライン整合（`#[repr(align(128))]`）、`memchr` NEON ベクトル走査、Full LTO、`mimalloc` を完備。
 
@@ -46,7 +46,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  azoo-key-skkserv (:1180, Primary)
 ### 1. ビルド & テスト
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # 全 67 件のユニット・結合テスト合格を確認
+cargo test             # 全 72 件のユニット・結合テスト合格を確認
 ```
 
 ### 2. LaunchAgent による常駐運用
@@ -261,7 +261,7 @@ Options:
       --azookey-timeout-ms <AZOOKEY_TIMEOUT_MS>
           Timeout for azoo-key-skkserv queries in ms (capped by 850ms overall deadline; 300ms/query in okuri expansion) [default: 600]
       --yaskkserv2-timeout-ms <YASKKSERV2_TIMEOUT_MS>
-          Timeout for yaskkserv2 queries in ms (capped by 850ms overall deadline; 200ms in okuri merge) [default: 700]
+          Timeout for yaskkserv2 queries in ms (capped by 850ms overall deadline; 200ms in okuri merge) [default: 850]
       --okuri-expansion [<OKURI_EXPANSION>]
           送りあり見出し（例: かk -> かく）の活用復元を行うか（環境変数 RUSKKSERV_OKURI_EXPANSION でも制御可能） [default: true] [possible values: true, false]
       --context-ranking [<CONTEXT_RANKING>]

@@ -144,6 +144,13 @@
   3. **インメモリ変換キャッシュ (`LookupCache`)**: 容量 4,096 件の高速キャッシュ（キー: `(直前確定文脈, 見出し語)`）を導入。過去に変換した単語や同一見出し語は upstream 照会・辞書判定・整列を完全バイパスし **0.1ms 未満（ナノ秒オーダー、約 1,000倍）** で即答。SIGHUP ホットリロード時に自動クリアされるため辞書更新とも完全同期。
   4. **システム辞書照会の終止形最優先化と上位候補ガード**: 送りあり見出しにおいて語幹単体（「切」）の前に終止形（「切る」）を最優先照会して FFI キャッシュミスを抑制。さらに未キャッシュ時の重い FFI 呼び出しを上位 12 候補に限定し、13 番目以降の低位候補によるレイテンシスパイクを完全防止。
 
+### ⑬ 初回変換取りこぼし対策（FFI デッドライン制御・ヘッジフォールバック・プールリカバリ）(v0.2.9)
+- **背景**: macSKK の `SKKServService` / `SKKServClient.xpc` は 1.0 秒でタイムアウトするため、初回変換時の `DCSCopyTextDefinition` コールド FFI 遅延、`yaskkserv2`（Google Suggest キャッシュ未設定）の 700ms タイムアウト、およびスリープ後の接続プール複数失効によって初回のみ候補が返らない事象が発生していた。
+- **メカニズム (`src/proxy.rs`, `src/system_dict.rs`, `src/frequency.rs`, `src/backend.rs`, `src/config.rs`, `launchd/`)**:
+  1. **FFI 予算管理とバックグラウンドプリウォーム**: `OVERALL_LOOKUP_DEADLINE` (`850ms`) 内に同期システム辞書 FFI（`compute_ffi_deadline`）を収め、予算超過時は未キャッシュ候補の同期照会を打ち切って即答し、`tokio::task::spawn_blocking` で裏側プリウォーム（`prewarm_entries`）のみ実施。暫定順位での `LookupCache` 汚染も回避。起動時の `context_frequencies` 辞書ウォームアップも `Proxy::run` 開始直後に並列実行。
+  2. **並列ヘッジフォールバックと Google Suggest キャッシュ**: `--yaskkserv2-timeout-ms` デフォルトを `700` → `850` に拡張し、Primary が `200ms` (`PRIMARY_HEDGE_DELAY`) を超えて応答しない場合は Fallback を並列ヘッジ起動（ヒット優先順位は Primary 維持）。さらに `launchd/com.ruskkserv.yaskkserv2.plist` に `--google-cache-filename`（デフォルト `~/Library/Caches/ruskkserv/yaskkserv2-google.cache`）を設定し、再インストール時に `pkill -x yaskkserv2` で旧デーモンを停止。
+  3. **失効プール一括破棄リカバリ (`Backend`)**: プール由来の再利用接続がエラー・EOF となった場合は `clear_pool()` で残りの失効接続を全破棄し、リトライ時は必ず `connect_fresh()` で新規接続を行う。
+
 ---
 
 ## 3. LaunchAgent 運用仕様
@@ -168,7 +175,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全64件合格）
+cargo test             # ユニットテスト & 結合テスト（全72件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

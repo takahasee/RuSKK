@@ -3,9 +3,40 @@
 //! 国語辞典に項目が存在する単語、および SKK 注釈付き単語を判定して高速にキャッシュする。
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 
 use crate::frequency::clean_candidate;
+
+/// CoreServices DictionaryServices の初回ロード（最大 ~600ms）が完了したかを記録するフラグ。
+static FFI_WARMED: AtomicBool = AtomicBool::new(false);
+
+/// フォアグラウンド変換がシステム辞書 FFI を待機・実行中であることを示すカウンタ。
+/// バックグラウンドの事前ウォームアップ・再加熱がこの値を見て一時譲歩する。
+static FOREGROUND_FFI_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ForegroundWaiterGuard;
+
+impl ForegroundWaiterGuard {
+    #[inline]
+    fn new() -> Self {
+        FOREGROUND_FFI_WAITERS.fetch_add(1, Ordering::AcqRel);
+        Self
+    }
+}
+
+impl Drop for ForegroundWaiterGuard {
+    #[inline]
+    fn drop(&mut self) {
+        FOREGROUND_FFI_WAITERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// 初回のシステム辞書 FFI 初期化が完了済みか返す。
+#[inline]
+pub fn is_ffi_warmed() -> bool {
+    FFI_WARMED.load(Ordering::Acquire)
+}
 
 #[cfg(target_os = "macos")]
 mod ffi {
@@ -64,17 +95,46 @@ mod ffi {
 /// "書こ" → "か・く【書く】"、"取ろ" → 空文字列）、返却された定義ヘッダの見出し語と照合し、
 /// 活用断片（送り仮名漏れ）の誤ヒットを排除する。
 #[cfg(target_os = "macos")]
-fn query_system_dict_definition(word: &str) -> bool {
-    if word.is_empty() {
-        return false;
-    }
+fn try_acquire_ffi_lock(
+    ffi_deadline: Option<std::time::Instant>,
+) -> Option<MutexGuard<'static, ()>> {
     // DictionaryServices (DCSCopyTextDefinition) の内部インデックス参照はマルチスレッド同時初期化・照会時に
     // 競合して NULL を返すことがあるため、キャッシュミス時の FFI 呼び出しのみ Mutex で直列化する。
     static FFI_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _guard = FFI_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let lock = FFI_LOCK.get_or_init(|| Mutex::new(()));
+    let Some(deadline) = ffi_deadline else {
+        return Some(lock.lock().unwrap_or_else(|e| e.into_inner()));
+    };
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+            Err(TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+}
+
+/// 予算期限内に FFI ロックを取得できた場合のみ macOS システム辞書を照会する。
+/// ロック待機で期限超過した場合は `None` を返し、キャッシュ未登録のままスキップを通知する。
+#[cfg(target_os = "macos")]
+fn query_system_dict_definition_budgeted(
+    word: &str,
+    ffi_deadline: Option<std::time::Instant>,
+) -> Option<bool> {
+    if word.is_empty() {
+        return Some(false);
+    }
+    let _guard = try_acquire_ffi_lock(ffi_deadline)?;
+    Some(query_system_dict_definition_locked(word))
+}
+
+#[cfg(target_os = "macos")]
+fn query_system_dict_definition_locked(word: &str) -> bool {
     unsafe {
         let cf_str = ffi::CFStringCreateWithBytes(
             std::ptr::null(),
@@ -93,6 +153,7 @@ fn query_system_dict_definition(word: &str) -> bool {
             length: ffi::CFStringGetLength(cf_str),
         };
         let def = ffi::DCSCopyTextDefinition(std::ptr::null(), cf_str, range);
+        FFI_WARMED.store(true, Ordering::Release);
         ffi::CFRelease(cf_str);
         if def.is_null() {
             return false;
@@ -248,8 +309,11 @@ fn matches_bracket_entry_variants(word: &str, entry: &str) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn query_system_dict_definition(_word: &str) -> bool {
-    false
+fn query_system_dict_definition_budgeted(
+    _word: &str,
+    _ffi_deadline: Option<std::time::Instant>,
+) -> Option<bool> {
+    Some(false)
 }
 
 /// システム辞書判定のインメモリキャッシュ（最大20,000件）
@@ -281,21 +345,27 @@ impl SystemDictCache {
         guard.get(word).copied()
     }
 
-    /// 単語がシステム辞書に存在するか、キャッシュ付きで高速判定する。
-    pub fn has_definition(&self, word: &str) -> bool {
+    /// 単語がシステム辞書に存在するか、予算期限・キャッシュ付きで判定する。
+    /// ロック競合等で期限内に FFI を開始できなかった場合は `None` を返す（キャッシュには書き込まない）。
+    pub(crate) fn has_definition_with_deadline(
+        &self,
+        word: &str,
+        ffi_deadline: Option<std::time::Instant>,
+        track_foreground: bool,
+    ) -> Option<bool> {
         if word.is_empty() {
-            return false;
+            return Some(false);
         }
 
         // 読み取りロックで高速参照
         if let Ok(guard) = self.cache.read()
             && let Some(&res) = guard.get(word)
         {
-            return res;
+            return Some(res);
         }
 
-        // キャッシュにない場合はシステム辞書を照会
-        let res = query_system_dict_definition(word);
+        let _fg = track_foreground.then(ForegroundWaiterGuard::new);
+        let res = query_system_dict_definition_budgeted(word, ffi_deadline)?;
 
         if let Ok(mut guard) = self.cache.write() {
             if guard.len() >= MAX_CACHE_ENTRIES {
@@ -304,7 +374,13 @@ impl SystemDictCache {
             guard.insert(word.to_string(), res);
         }
 
-        res
+        Some(res)
+    }
+
+    /// 単語がシステム辞書に存在するか、キャッシュ付きで高速判定する。
+    pub fn has_definition(&self, word: &str) -> bool {
+        self.has_definition_with_deadline(word, None, false)
+            .unwrap_or(false)
     }
 }
 
@@ -316,29 +392,50 @@ fn global_dict_cache() -> &'static SystemDictCache {
 
 /// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する（annotationが引ける）」か判定する。
 /// 送りあり見出し（例: "かk", "すばらしi"）が渡された場合、語幹＋終止形（例: "書く", "素晴らしい"）でも判定する。
-/// `allow_cold_ffi` が false の場合、インメモリキャッシュに存在する結果のみを使用し、
-/// 未キャッシュ時の重い FFI 照会をスキップする。
-pub fn is_annotated_or_in_dict_fast(
+/// `allow_cold_ffi` が false または `ffi_deadline` を超過した場合はインメモリキャッシュのみを参照し、
+/// 未キャッシュの重い FFI 照会をスキップする。戻り値は `(辞書掲載/注釈ありか, 予算超過/禁止により未キャッシュ FFI をスキップしたか)`。
+pub fn is_annotated_or_in_dict_budgeted(
     candidate: &str,
     midashi: Option<&str>,
     allow_cold_ffi: bool,
-) -> bool {
+    ffi_deadline: Option<std::time::Instant>,
+) -> (bool, bool) {
+    is_annotated_or_in_dict_impl(candidate, midashi, allow_cold_ffi, ffi_deadline, true)
+}
+
+fn is_annotated_or_in_dict_impl(
+    candidate: &str,
+    midashi: Option<&str>,
+    allow_cold_ffi: bool,
+    ffi_deadline: Option<std::time::Instant>,
+    track_foreground: bool,
+) -> (bool, bool) {
     // 1. 候補文字列自体に ';' による SKK 注釈が含まれている場合は即座に true
     if candidate.contains(';') {
-        return true;
+        return (true, false);
     }
 
     let clean = clean_candidate(candidate);
     if clean.is_empty() {
-        return false;
+        return (false, false);
     }
 
     let cache = global_dict_cache();
-    let check_word = |w: &str| -> bool {
-        if allow_cold_ffi {
-            cache.has_definition(w)
-        } else {
-            cache.has_cached_definition(w).unwrap_or(false)
+    let mut skipped_cold = false;
+    let mut check_word = |w: &str| -> bool {
+        if let Some(cached) = cache.has_cached_definition(w) {
+            return cached;
+        }
+        if !allow_cold_ffi || ffi_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            skipped_cold = true;
+            return false;
+        }
+        match cache.has_definition_with_deadline(w, ffi_deadline, track_foreground) {
+            Some(res) => res,
+            None => {
+                skipped_cold = true;
+                false
+            }
         }
     };
 
@@ -356,7 +453,7 @@ pub fn is_annotated_or_in_dict_fast(
                 full_word.push_str(clean);
                 full_word.push_str(suffix);
                 if check_word(&full_word) {
-                    return true;
+                    return (true, false);
                 }
                 suffix.chars().next().and_then(crate::okuri::kana_to_okuri_key)
             }
@@ -369,14 +466,43 @@ pub fn is_annotated_or_in_dict_fast(
                 full_word.push_str(clean);
                 full_word.push_str(suffix);
                 if check_word(&full_word) {
-                    return true;
+                    return (true, false);
                 }
             }
         }
     }
 
     // 3. 送りなし見出し、または語幹＋終止形でヒットしなかった場合、単語本体がシステム辞書に存在するか
-    check_word(clean)
+    if check_word(clean) {
+        (true, false)
+    } else {
+        (false, skipped_cold)
+    }
+}
+
+/// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する（annotationが引ける）」か判定する。
+/// `allow_cold_ffi` が false の場合、インメモリキャッシュに存在する結果のみを使用し、
+/// 未キャッシュ時の重い FFI 照会をスキップする。
+#[inline]
+pub fn is_annotated_or_in_dict_fast(
+    candidate: &str,
+    midashi: Option<&str>,
+    allow_cold_ffi: bool,
+) -> bool {
+    is_annotated_or_in_dict_budgeted(candidate, midashi, allow_cold_ffi, None).0
+}
+
+/// 予算制限により本番リクエスト中にスキップされた候補群をバックグラウンドでシステム辞書キャッシュへ先行登録する。
+/// フォアグラウンド変換が FFI を待機・実行中の場合は一時譲歩し、ユーザー入力をブロックしない。
+pub fn prewarm_entries(entries: &[(String, Option<String>)]) {
+    for (candidate, midashi) in entries {
+        let mut waited = 0u8;
+        while FOREGROUND_FFI_WAITERS.load(Ordering::Acquire) > 0 && waited < 50 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            waited += 1;
+        }
+        let _ = is_annotated_or_in_dict_impl(candidate, midashi.as_deref(), true, None, false);
+    }
 }
 
 /// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する」か判定する（標準判定）。
@@ -502,5 +628,34 @@ mod tests {
             hot_elapsed,
             hot_elapsed / (words.len() as u32)
         );
+    }
+
+    #[test]
+    fn test_budgeted_dict_lookup_respects_deadline_and_uses_cache() {
+        use std::time::{Duration, Instant};
+
+        // 注釈付きはデッドライン超過でも常に即 true（FFI スキップなし）
+        let past_deadline = Instant::now().checked_sub(Duration::from_secs(1)).unwrap_or_else(Instant::now);
+        assert_eq!(
+            is_annotated_or_in_dict_budgeted("画;注釈", None, true, Some(past_deadline)),
+            (true, false)
+        );
+
+        // 未キャッシュ・未知語に過去デッドラインを渡すとコールド FFI をスキップし cold_skipped=true となる
+        let unseen = "予算超過時未キャッシュ検証用テスト語XYZ987654321";
+        assert_eq!(
+            is_annotated_or_in_dict_budgeted(unseen, None, true, Some(past_deadline)),
+            (false, true)
+        );
+
+        // 一度通常照会でキャッシュに載せた後は、過去デッドラインでもキャッシュヒットして同じ結果が返る
+        #[cfg(target_os = "macos")]
+        {
+            assert!(is_annotated_or_in_dict("時間", None));
+            assert_eq!(
+                is_annotated_or_in_dict_budgeted("時間", None, true, Some(past_deadline)),
+                (true, false)
+            );
+        }
     }
 }

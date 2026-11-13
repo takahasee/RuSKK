@@ -266,8 +266,28 @@ impl FrequencyPredictor {
         candidates: &[&'a str],
         annotation_priority: bool,
     ) -> Vec<&'a str> {
+        self.rank_candidates_borrowed_with_deadline(
+            context,
+            midashi,
+            candidates,
+            annotation_priority,
+            None,
+        )
+        .0
+    }
+
+    /// `ffi_deadline` を上限として未キャッシュ時のシステム辞書 FFI 照会を制御しながら候補を並び替える。
+    /// 予算超過により未照会のままスキップされた上位候補（`idx < 12`）のスライスも併せて返す。
+    pub fn rank_candidates_borrowed_with_deadline<'a, S: AsRef<str>>(
+        &self,
+        context: &[S],
+        midashi: &str,
+        candidates: &[&'a str],
+        annotation_priority: bool,
+        ffi_deadline: Option<std::time::Instant>,
+    ) -> (Vec<&'a str>, Vec<&'a str>) {
         if candidates.len() <= 1 {
-            return candidates.to_vec();
+            return (candidates.to_vec(), Vec::new());
         }
 
         let freq_map = self.get_freq_map(midashi);
@@ -297,7 +317,7 @@ impl FrequencyPredictor {
         );
         let effective_annotation_priority = annotation_priority && !is_affix;
         if !has_freq && !has_context && !effective_annotation_priority {
-            return candidates.to_vec();
+            return (candidates.to_vec(), Vec::new());
         }
 
         const ANNOTATION_BONUS: u64 = 100;
@@ -306,54 +326,60 @@ impl FrequencyPredictor {
         let is_okuri = effective_annotation_priority
             && crate::okuri::parse_okuri_midashi_extended(midashi).is_some();
 
-        let mut indexed_cands: Vec<(usize, &'a str, u64)> = candidates
-            .iter()
-            .enumerate()
-            .map(|(idx, &cand)| {
-                let clean = clean_candidate(cand);
-                let global_count = freq_map.map(|m| get_score(m, clean)).unwrap_or(0);
-                let context_score: u64 = if let Some(m) = single_ctx_map {
-                    get_score(m, clean)
-                } else if !multi_ctx_maps.is_empty() {
-                    multi_ctx_maps.iter().map(|m| get_score(m, clean)).sum()
+        let mut skipped_cold: Vec<&'a str> = Vec::new();
+        let mut indexed_cands: Vec<(usize, &'a str, u64)> = Vec::with_capacity(candidates.len());
+
+        for (idx, &cand) in candidates.iter().enumerate() {
+            let clean = clean_candidate(cand);
+            let global_count = freq_map.map(|m| get_score(m, clean)).unwrap_or(0);
+            let context_score: u64 = if let Some(m) = single_ctx_map {
+                get_score(m, clean)
+            } else if !multi_ctx_maps.is_empty() {
+                multi_ctx_maps.iter().map(|m| get_score(m, clean)).sum()
+            } else {
+                0
+            };
+
+            let annotation_score: u64 = if effective_annotation_priority {
+                // 上位12件かつ ffi_deadline 内のみ未キャッシュ時のシステム辞書 FFI 照会を許可し、
+                // 13件目以降または予算超過時はキャッシュヒットのみ採用して応答タイムアウトを防止する
+                let within_index_cap = idx < 12;
+                let (in_dict, cold_skipped) = crate::system_dict::is_annotated_or_in_dict_budgeted(
+                    cand,
+                    Some(midashi),
+                    within_index_cap,
+                    ffi_deadline,
+                );
+                if within_index_cap && cold_skipped {
+                    skipped_cold.push(cand);
+                }
+                let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
+                let shape_bonus = if !is_okuri
+                    && (in_dict || !is_unverified_okuri_fragment(clean))
+                {
+                    OKURI_NASHI_CLEAN_BONUS
                 } else {
                     0
                 };
+                dict_bonus + shape_bonus
+            } else {
+                0
+            };
 
-                let annotation_score: u64 = if effective_annotation_priority {
-                    // 上位12件までは未キャッシュ時のシステム辞書 FFI 照会を許可し、
-                    // 13件目以降はキャッシュヒットのみ採用して重い FFI レイテンシスパイクを完全に防止する
-                    let allow_cold_ffi = idx < 12;
-                    let in_dict = crate::system_dict::is_annotated_or_in_dict_fast(
-                        cand,
-                        Some(midashi),
-                        allow_cold_ffi,
-                    );
-                    let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
-                    let shape_bonus = if !is_okuri
-                        && (in_dict || !is_unverified_okuri_fragment(clean))
-                    {
-                        OKURI_NASHI_CLEAN_BONUS
-                    } else {
-                        0
-                    };
-                    dict_bonus + shape_bonus
-                } else {
-                    0
-                };
-
-                let total_score = annotation_score + global_count + context_score * 10;
-                (idx, cand, total_score)
-            })
-            .collect();
+            let total_score = annotation_score + global_count + context_score * 10;
+            indexed_cands.push((idx, cand, total_score));
+        }
 
         if indexed_cands.iter().all(|(_, _, score)| *score == 0) {
-            return candidates.to_vec();
+            return (candidates.to_vec(), skipped_cold);
         }
 
         indexed_cands.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
 
-        indexed_cands.into_iter().map(|(_, cand, _)| cand).collect()
+        (
+            indexed_cands.into_iter().map(|(_, cand, _)| cand).collect(),
+            skipped_cold,
+        )
     }
 
     /// seed ロード時に frequencies / context_frequencies の各マップに対して、
@@ -1039,5 +1065,37 @@ mod tests {
         let ranked_hi =
             predictor.rank_candidates_borrowed(&[] as &[&str], "ひ>", &hi_prefix, true);
         assert_eq!(ranked_hi, vec!["被", "非", "乾;かわく"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_rank_candidates_with_expired_deadline_skips_cold_ffi_and_reports() {
+        use std::time::{Duration, Instant};
+
+        let predictor = FrequencyPredictor::new(None);
+        // 「時間」だけ事前にシステム辞書キャッシュへ載せておく
+        assert!(crate::system_dict::is_annotated_or_in_dict("時間", None));
+
+        let expired = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now);
+        let cold_a = "予算超過未キャッシュテスト語A999111";
+        let cold_b = "予算超過未キャッシュテスト語B999222";
+        let cands = [cold_a, "時間", cold_b];
+
+        let (ranked, skipped) = predictor.rank_candidates_borrowed_with_deadline(
+            &[] as &[&str],
+            "じかん",
+            &cands,
+            true,
+            Some(expired),
+        );
+
+        // キャッシュ済みの「時間」は加点されて第1候補に昇格する
+        assert_eq!(ranked.first().copied(), Some("時間"));
+        // 未キャッシュの2語はコールド FFI をスキップしたことが報告される
+        assert!(skipped.contains(&cold_a));
+        assert!(skipped.contains(&cold_b));
+        assert!(!skipped.contains(&"時間"));
     }
 }
