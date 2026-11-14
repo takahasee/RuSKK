@@ -6,3 +6,4 @@
 .vscode/
 .idea/
 backup/
+.continue/agents/new-config.yaml
