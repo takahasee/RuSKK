@@ -21,7 +21,6 @@ expand_path() {
 }
 
 RUSKKSERV_BIN="$(expand_path "${RUSKKSERV_BIN:-${SKK_PROXY_BIN:-}}")"
-MACSKK_USER_DICT_PATH="$(expand_path "${MACSKK_USER_DICT_PATH:-}")"
 
 APP_DIR="${HOME}/Applications/RuSKKservImporter.app"
 CONTENTS_DIR="${APP_DIR}/Contents"
@@ -62,8 +61,14 @@ fi
 cp -p "$RUSKKSERV_BIN" "${MACOS_DIR}/RuSKKservImporter"
 chmod +x "${MACOS_DIR}/RuSKKservImporter"
 
-# アプリバンドルとして固定署名 (Identifier を固定し、Designated Requirement を固定することで再コンパイル後も TCC 権限を維持)
-codesign --force --deep --sign - --identifier "com.ruskkserv.importer" -r='designated => identifier "com.ruskkserv.importer"' "$APP_DIR"
+# 署名処理: RUSKKSERV_CODESIGN_IDENTITY が指定されていれば Keychain の証明書で厳密署名する。
+# 未指定時は、再コンパイル後も macOS の TCC 権限を引き継ぐため、識別子固定の ad-hoc 署名にフォールバックする
+# （※同一マシン上の他バイナリが同 Identifier で ad-hoc 署名すれば TCC 権限を継承できるトレードオフがある）。
+if [ -n "${RUSKKSERV_CODESIGN_IDENTITY:-}" ]; then
+  codesign --force --deep --sign "$RUSKKSERV_CODESIGN_IDENTITY" --identifier "com.ruskkserv.importer" "$APP_DIR"
+else
+  codesign --force --deep --sign - --identifier "com.ruskkserv.importer" -r='designated => identifier "com.ruskkserv.importer"' "$APP_DIR"
+fi
 
 echo "Successfully built RuSKKservImporter.app at ${APP_DIR}"
 

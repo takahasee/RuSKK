@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use ruskkserv::backend::{Backend, UpstreamEncoding};
+use ruskkserv::config::BackendOrder;
 use ruskkserv::encoding::encode_euc_jp;
 use ruskkserv::frequency::{FrequencyPredictor, SharedPredictor};
 use ruskkserv::proxy::Proxy;
@@ -102,18 +103,19 @@ async fn test_yaskkserv2_standalone_seed_ranking() {
     // Fallback is yaskkserv2 with UpstreamEncoding::EucJp
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-primary-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "yaskkserv2-fallback",
             yaskkserv2_addr,
             UpstreamEncoding::EucJp,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor.clone(),
         lookup_cache: Default::default(),
         okuri_expansion: false,

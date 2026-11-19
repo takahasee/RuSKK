@@ -5,24 +5,37 @@ use clap::Parser;
 
 use crate::backend::{Backend, UpstreamEncoding};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum BackendOrder {
+    /// yaskkserv2 を優先し、ミス・失敗時のみ azoo-key-skkserv へフォールバック（デフォルト）
+    #[default]
+    Yaskkserv2First,
+    /// azoo-key-skkserv を優先し、ミス・失敗時のみ yaskkserv2 へフォールバック（従来順）
+    AzookeyFirst,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "ruskkserv",
-    about = "skkserv proxy: azoo-key-skkserv first, yaskkserv2 fallback",
+    about = "skkserv proxy: yaskkserv2 primary, azoo-key-skkserv fallback (configurable)",
     version
 )]
 pub struct Args {
     /// Address to listen on (macSKK connects here)
     #[arg(long, default_value = "127.0.0.1:1178")]
-    pub listen: String,
+    pub listen: SocketAddr,
 
-    /// azoo-key-skkserv address (primary)
+    /// azoo-key-skkserv address
     #[arg(long, default_value = "127.0.0.1:1180")]
     pub azookey: SocketAddr,
 
-    /// yaskkserv2 address (fallback)
+    /// yaskkserv2 address
     #[arg(long, default_value = "127.0.0.1:1179")]
     pub yaskkserv2: SocketAddr,
+
+    /// バックエンドの参照順（yaskkserv2-first [デフォルト] / azookey-first; 環境変数 RUSKKSERV_BACKEND_ORDER でも制御可能）
+    #[arg(long, value_enum)]
+    pub backend_order: Option<BackendOrder>,
 
     /// Timeout for azoo-key-skkserv queries in ms (capped by 850ms overall deadline; 300ms/query in okuri expansion)
     #[arg(long, default_value_t = 600)]
@@ -82,7 +95,7 @@ pub enum Command {
 }
 
 impl Args {
-    pub fn primary(&self) -> Backend {
+    pub fn azookey(&self) -> Backend {
         Backend::new(
             "azoo-key-skkserv",
             self.azookey,
@@ -91,13 +104,40 @@ impl Args {
         )
     }
 
-    pub fn fallback(&self) -> Backend {
+    pub fn yaskkserv2(&self) -> Backend {
         Backend::new(
             "yaskkserv2",
             self.yaskkserv2,
             UpstreamEncoding::EucJp,
             Duration::from_millis(self.yaskkserv2_timeout_ms),
         )
+    }
+
+    pub fn primary(&self) -> Backend {
+        self.azookey()
+    }
+
+    pub fn fallback(&self) -> Backend {
+        self.yaskkserv2()
+    }
+
+    pub fn resolved_backend_order(&self) -> BackendOrder {
+        if let Some(order) = self.backend_order {
+            return order;
+        }
+        if let Ok(val) = std::env::var("RUSKKSERV_BACKEND_ORDER") {
+            let norm = val.trim().to_ascii_lowercase();
+            if matches!(norm.as_str(), "azookey" | "azookey-first" | "azookey_first") {
+                return BackendOrder::AzookeyFirst;
+            }
+            if matches!(
+                norm.as_str(),
+                "yaskkserv2" | "yaskkserv2-first" | "yaskkserv2_first"
+            ) {
+                return BackendOrder::Yaskkserv2First;
+            }
+        }
+        BackendOrder::Yaskkserv2First
     }
 
     pub fn is_okuri_expansion_enabled(&self) -> bool {
@@ -175,5 +215,28 @@ mod tests {
         assert!(bare_flags.is_okuri_expansion_enabled());
         assert!(bare_flags.is_context_ranking_enabled());
         assert!(bare_flags.is_annotation_priority_enabled());
+
+        // デフォルトの listen アドレスが 127.0.0.1:1178 で、不正なホスト名は起動時に拒否されること
+        assert_eq!(default_args.listen, "127.0.0.1:1178".parse::<SocketAddr>().unwrap());
+        assert!(Args::try_parse_from(["ruskkserv", "--listen", "not-an-addr"]).is_err());
+
+        // backend_order のデフォルトと CLI 上書き検証
+        assert_eq!(default_args.backend_order, None);
+        assert_eq!(
+            default_args.resolved_backend_order(),
+            BackendOrder::Yaskkserv2First
+        );
+        let azoo_first = Args::try_parse_from(["ruskkserv", "--backend-order=azookey-first"]).unwrap();
+        assert_eq!(azoo_first.backend_order, Some(BackendOrder::AzookeyFirst));
+        assert_eq!(
+            azoo_first.resolved_backend_order(),
+            BackendOrder::AzookeyFirst
+        );
+        let yaskk_first =
+            Args::try_parse_from(["ruskkserv", "--backend-order=yaskkserv2-first"]).unwrap();
+        assert_eq!(
+            yaskk_first.resolved_backend_order(),
+            BackendOrder::Yaskkserv2First
+        );
     }
 }

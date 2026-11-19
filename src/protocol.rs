@@ -22,6 +22,13 @@ pub enum ProtocolError {
     Empty,
     #[error("unknown opcode: {0}")]
     UnknownOpcode(u8),
+    #[error("invalid midashi")]
+    InvalidMidashi,
+}
+
+#[inline]
+fn has_disallowed_midashi_byte(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b <= 0x20 || b == 0x7F)
 }
 
 /// Parse one skkserv request from a line (without trailing LF).
@@ -43,17 +50,30 @@ pub fn parse_request(line: &[u8]) -> Result<Request<'_>, ProtocolError> {
 
     match opcode {
         b'0' => Ok(Request::End),
-        b'1' => Ok(Request::Lookup(operand)),
+        b'1' => {
+            // リクエストスマグリング防止: 見出し語内部の空白・制御文字（\r, \n, \0 等）を拒否する
+            if has_disallowed_midashi_byte(operand) {
+                return Err(ProtocolError::InvalidMidashi);
+            }
+            Ok(Request::Lookup(operand))
+        }
         b'2' => Ok(Request::Version),
         b'3' => Ok(Request::Host),
-        b'4' => Ok(Request::Completion(operand)),
+        b'4' => {
+            if has_disallowed_midashi_byte(operand) {
+                return Err(ProtocolError::InvalidMidashi);
+            }
+            Ok(Request::Completion(operand))
+        }
         other => Err(ProtocolError::UnknownOpcode(other)),
     }
 }
 
 /// Rebuild a wire request for forwarding to an upstream skkserv.
 fn encode_request_inner(request: &Request<'_>, is_euc: bool) -> Vec<u8> {
-    use crate::encoding::{decode_euc_or_utf8, encode_euc_jp};
+    use std::borrow::Cow;
+
+    use crate::encoding::{decode_euc_or_utf8, encode_euc_jp_cow};
 
     let (opcode, midashi) = match request {
         Request::End => return b"0 \n".to_vec(),
@@ -63,18 +83,29 @@ fn encode_request_inner(request: &Request<'_>, is_euc: bool) -> Vec<u8> {
         Request::Completion(m) => (b'4', m),
     };
 
-    let midashi_str = decode_euc_or_utf8(midashi);
-    let mut buf;
-    if is_euc {
-        let euc = encode_euc_jp(&midashi_str);
-        buf = Vec::with_capacity(euc.len() + 3);
-        buf.push(opcode);
-        buf.extend_from_slice(&euc);
+    // defense-in-depth: 空白・制御文字を含むバイトが渡された場合も必ず除外してフレーム境界を保護する
+    let sanitized_midashi: Cow<'_, [u8]> = if has_disallowed_midashi_byte(midashi) {
+        Cow::Owned(
+            midashi
+                .iter()
+                .copied()
+                .filter(|&b| b > 0x20 && b != 0x7F)
+                .collect(),
+        )
     } else {
-        buf = Vec::with_capacity(midashi_str.len() + 3);
-        buf.push(opcode);
-        buf.extend_from_slice(midashi_str.as_bytes());
-    }
+        Cow::Borrowed(*midashi)
+    };
+
+    let midashi_str = decode_euc_or_utf8(&sanitized_midashi);
+    let payload: Cow<'_, [u8]> = if is_euc {
+        encode_euc_jp_cow(&midashi_str)
+    } else {
+        Cow::Borrowed(midashi_str.as_bytes())
+    };
+
+    let mut buf = Vec::with_capacity(payload.len() + 3);
+    buf.push(opcode);
+    buf.extend_from_slice(&payload);
     buf.extend_from_slice(b" \n");
     buf
 }
@@ -135,5 +166,37 @@ mod tests {
         let req = Request::Lookup(b"test");
         let wire = encode_request(&req);
         assert_eq!(wire, b"1test \n");
+    }
+
+    #[test]
+    fn reject_smuggling_midashi_and_sanitize_encode() {
+        assert!(matches!(
+            parse_request(b"1foo 1bar "),
+            Err(ProtocolError::InvalidMidashi)
+        ));
+        assert!(matches!(
+            parse_request(b"1foo\rbar"),
+            Err(ProtocolError::InvalidMidashi)
+        ));
+        assert!(matches!(
+            parse_request(b"1foo\n1bar"),
+            Err(ProtocolError::InvalidMidashi)
+        ));
+        assert!(matches!(
+            parse_request(b"1foo\0bar"),
+            Err(ProtocolError::InvalidMidashi)
+        ));
+        assert!(matches!(
+            parse_request(b"4kan 1bar"),
+            Err(ProtocolError::InvalidMidashi)
+        ));
+
+        // 空 operand はプロキシ側で接続維持のまま 4\n を返せるようパースは許容する
+        assert_eq!(parse_request(b"1 ").unwrap(), Request::Lookup(b""));
+        assert_eq!(parse_request(b"4 ").unwrap(), Request::Completion(b""));
+
+        // defense-in-depth: 制御文字や空白が encode_request に渡されても除去されること
+        let sanitized = encode_request(&Request::Lookup(b"foo 1bar\r\n\0"));
+        assert_eq!(sanitized, b"1foo1bar \n");
     }
 }

@@ -214,3 +214,52 @@ async fn backend_recovers_when_multiple_pooled_connections_are_stale() {
 
     srv_handle.abort();
 }
+
+#[tokio::test]
+async fn backend_discards_polluted_connection_with_trailing_buffer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let conn_seq = Arc::new(AtomicUsize::new(0));
+    let conn_seq_srv = Arc::clone(&conn_seq);
+
+    let srv_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let seq = conn_seq_srv.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    if seq == 0 {
+                        // 1 本目の接続では 2 行分を一度に返し、BufReader バッファへ余剰行を残す
+                        let _ = stream.write_all("1/初回/\n1/汚染残骸/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all("1/新規正常/\n".as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let backend = Backend::new(
+        "mock-polluted-pool",
+        addr,
+        UpstreamEncoding::Utf8,
+        Duration::from_secs(1),
+    );
+
+    let first = backend.query(&Request::Lookup(b"a")).await.unwrap();
+    assert_eq!(first, "1/初回/\n".as_bytes());
+
+    // 1 本目の接続は余剰バイトが残っていたためプールへ返却されず破棄され、
+    // 2 回目のクエリは新規接続（seq=1）を使って正しい応答を受け取る
+    let second = backend.query(&Request::Lookup(b"b")).await.unwrap();
+    assert_eq!(second, "1/新規正常/\n".as_bytes());
+    assert_eq!(conn_seq.load(Ordering::SeqCst), 2);
+
+    srv_handle.abort();
+}

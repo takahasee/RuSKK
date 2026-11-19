@@ -1,20 +1,27 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::backend::Backend;
+use crate::config::BackendOrder;
 use crate::encoding::{
-    contains_bracket_block, decode_euc_or_utf8, extract_first_candidate,
+    contains_okuri_bracket_block, decode_euc_or_utf8, extract_first_candidate,
     format_candidates_response_str, has_multiple_candidates, parse_candidates_borrowed,
 };
 use crate::frequency::SharedPredictor;
 use crate::protocol::{Request, is_found, parse_request};
 
 const MAX_LINE_BYTES: u64 = 8192;
+/// 同時接続クライアントの上限数（ローカル DoS / FD 枯渇対策）
+const MAX_CONCURRENT_CLIENTS: usize = 64;
+/// クライアント接続の無通信アイドルタイムアウト
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 /// 1 回の Lookup / Completion 全体に許容する上限（macSKK の 1.0 秒制限に安全マージンを持たせる）
 const OVERALL_LOOKUP_DEADLINE: Duration = Duration::from_millis(850);
 /// 同期システム辞書 FFI 照会に許すデッドライン手前の安全マージン
@@ -23,13 +30,14 @@ const FFI_DEADLINE_MARGIN: Duration = Duration::from_millis(80);
 const MIN_COLD_FFI_REMAINING: Duration = Duration::from_millis(25);
 /// 初期化済みの通常リクエスト内で同期コールド FFI 照会に費やす時間の上限
 const MAX_COLD_FFI_BUDGET: Duration = Duration::from_millis(450);
-/// Primary 応答がこの時間を超えたら、裏で Fallback のヘッジ照会を並列起動する
+/// 先頭バックエンド応答がこの時間を超えたら、裏で2番目バックエンドのヘッジ照会を並列起動する
 const PRIMARY_HEDGE_DELAY: Duration = Duration::from_millis(200);
 
 pub struct Proxy {
     pub listen: String,
-    pub primary: Backend,
-    pub fallback: Backend,
+    pub azookey: Backend,
+    pub yaskkserv2: Backend,
+    pub backend_order: BackendOrder,
     pub predictor: SharedPredictor,
     pub lookup_cache: Arc<crate::cache::LookupCache>,
     pub okuri_expansion: bool,
@@ -92,18 +100,18 @@ impl SharedContextState {
                 // macSKK の ▽ 開始時・再入力時の機械的 Lookup であり未確定のため、昇格せずに破棄する。
                 // 特に 1 文字見出し（「き」「さ」等）は「▽き (1) → Space確定 (2) → 次の▽き (3)」で
                 // 3 回 Lookup されて初めて「1文字単語として確定後に次の同頭文字語を入力した」とみなせる。
-                debug!(
-                    discarded = %pending.word,
-                    prev_midashi = %pending.midashi,
-                    new_midashi = %midashi,
+                trace!(
+                    discarded = ?pending.word,
+                    prev_midashi = ?pending.midashi,
+                    new_midashi = ?midashi,
                     "discarded pending context (input extension)"
                 );
             } else if now.duration_since(pending.time) <= CONTEXT_TTL {
                 // 見出し語が変わったため、前回の単語が確定したと判定して昇格
                 self.session_context = Some((pending.word, pending.time));
-                debug!(
+                trace!(
                     context = ?self.session_context,
-                    new_midashi = %midashi,
+                    new_midashi = ?midashi,
                     "promoted pending context"
                 );
             } else {
@@ -140,72 +148,79 @@ fn is_input_extension(new: &str, prev: &str) -> bool {
 impl Proxy {
     pub async fn run(self) -> anyhow::Result<()> {
         let listener = TcpListener::bind(&self.listen).await?;
-        info!(listen = %self.listen, "ruskkserv listening");
+        info!(listen = %self.listen, backend_order = ?self.backend_order, "ruskkserv listening");
         info!(
-            primary = %self.primary.name,
-            primary_addr = %self.primary.addr,
-            fallback = %self.fallback.name,
-            fallback_addr = %self.fallback.addr,
+            yaskkserv2_addr = %self.yaskkserv2.addr,
+            azookey_addr = %self.azookey.addr,
             "backends configured"
         );
 
         let proxy = Arc::new(self);
         let shared_context = Arc::new(std::sync::Mutex::new(SharedContextState::default()));
 
-        // Primary バックエンド（azooKey）およびシステム辞書をバックグラウンドで並行ウォームアップ
-        // （macOS の App Nap 解除・補完モデル展開と CoreServices 辞書インデックス初期化を同時進行させる）
+        // バックエンドおよびシステム辞書をバックグラウンドで並行ウォームアップ
+        // （macOS の App Nap 解除・補完モデル展開と CoreServices 辞書インデックス初期化・接続プール確立を同時進行させる）
         if proxy.annotation_priority {
-            let words_to_warmup: Vec<(String, Option<String>)> = {
-                let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                guard
-                    .context_frequencies
-                    .keys()
-                    .take(32)
-                    .map(|w| (w.clone(), None))
-                    .collect()
-            };
-            if !words_to_warmup.is_empty() {
-                tokio::task::spawn_blocking(move || {
-                    crate::system_dict::prewarm_entries(&words_to_warmup);
-                    tracing::debug!("system dictionary cache warmup complete");
-                });
-            }
+            const REPRESENTATIVE_WORDS: &[&str] = &["日本", "時間", "切る", "着る"];
+            crate::system_dict::enqueue_prewarm(
+                REPRESENTATIVE_WORDS.iter().map(|&w| (w.to_string(), None)),
+            );
         }
         {
             let warmup_proxy = Arc::clone(&proxy);
             tokio::spawn(async move {
-                // 1. 通常変換（Lookup）モデルのウォームアップ
                 let req_lookup = Request::Lookup("あ".as_bytes());
                 let _ = warmup_proxy
-                    .primary
-                    .query_with_timeout(&req_lookup, Duration::from_secs(3))
+                    .yaskkserv2
+                    .query_with_timeout(&req_lookup, Duration::from_millis(500))
                     .await;
-
-                // 2. 補完（Completion）エンジンのウォームアップ（五十音の代表文字を照会してトライ木等をメモリ展開）
-                const WARMUP_CHARS: &[&[u8]] = &[
-                    "あ".as_bytes(),
-                    "か".as_bytes(),
-                    "さ".as_bytes(),
-                    "た".as_bytes(),
-                    "な".as_bytes(),
-                    "は".as_bytes(),
-                    "ま".as_bytes(),
-                    "や".as_bytes(),
-                    "ら".as_bytes(),
-                    "わ".as_bytes(),
-                ];
-                for &kana in WARMUP_CHARS {
-                    let req_comp = Request::Completion(kana);
-                    let _ = warmup_proxy
-                        .primary
-                        .query_with_timeout(&req_comp, Duration::from_millis(500))
-                        .await;
+                debug!("yaskkserv2 connection warmup complete");
+            });
+        }
+        {
+            let warmup_proxy = Arc::clone(&proxy);
+            tokio::spawn(async move {
+                // 1. azoo-key-skkserv 通常変換（Lookup）モデルのウォームアップ
+                let req_lookup = Request::Lookup("あ".as_bytes());
+                if warmup_proxy
+                    .azookey
+                    .query_with_timeout(&req_lookup, Duration::from_secs(3))
+                    .await
+                    .is_ok()
+                {
+                    // 2. 補完（Completion）エンジンのウォームアップ（五十音の代表文字を照会してトライ木等をメモリ展開）
+                    const WARMUP_CHARS: &[&[u8]] = &[
+                        "あ".as_bytes(),
+                        "か".as_bytes(),
+                        "さ".as_bytes(),
+                        "た".as_bytes(),
+                        "な".as_bytes(),
+                        "は".as_bytes(),
+                        "ま".as_bytes(),
+                        "や".as_bytes(),
+                        "ら".as_bytes(),
+                        "わ".as_bytes(),
+                    ];
+                    for &kana in WARMUP_CHARS {
+                        let req_comp = Request::Completion(kana);
+                        let _ = warmup_proxy
+                            .azookey
+                            .query_with_timeout(&req_comp, Duration::from_millis(500))
+                            .await;
+                    }
+                    debug!("azookey backend lookup and completion warmup complete");
+                } else {
+                    debug!("azookey backend unavailable at startup warmup, skipping completion warmup");
                 }
-                tracing::debug!("primary backend lookup and completion warmup complete");
             });
         }
 
+        let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
+
         loop {
+            let Ok(permit) = Arc::clone(&conn_limit).acquire_owned().await else {
+                break;
+            };
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     debug!(%peer, "client connected");
@@ -213,16 +228,20 @@ impl Proxy {
                     let proxy = Arc::clone(&proxy);
                     let shared_context = Arc::clone(&shared_context);
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(err) = handle_client(proxy, shared_context, stream).await {
                             debug!(%peer, error = %err, "client session ended");
                         }
                     });
                 }
                 Err(err) => {
+                    drop(permit);
                     error!(error = %err, "accept failed");
+                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -240,9 +259,20 @@ async fn handle_client(
     loop {
         line.clear();
 
-        // 8KB を超える改行なし不正データによるメモリ枯渇 (OOM DoS) を防ぐため、take で上限を設定
+        // 8KB を超える改行なし不正データによるメモリ枯渇 (OOM DoS) を防ぐため、take とアイドルタイムアウトを設定
         let mut take_reader = (&mut reader).take(MAX_LINE_BYTES + 1);
-        let n = take_reader.read_until(b'\n', &mut line).await?;
+        let n = match tokio::time::timeout(
+            CLIENT_IDLE_TIMEOUT,
+            take_reader.read_until(b'\n', &mut line),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                debug!(?peer, "client idle timeout, closing connection");
+                break;
+            }
+        };
 
         if n == 0 {
             break;
@@ -264,7 +294,7 @@ async fn handle_client(
             line.truncate(line.len() - 1);
         }
 
-        debug!(?peer, raw_line = %decode_euc_or_utf8(&line), "received request from client");
+        trace!(?peer, raw_line = ?decode_euc_or_utf8(&line), "received request from client");
 
         let request = match parse_request(&line) {
             Ok(req) => req,
@@ -291,6 +321,12 @@ async fn handle_client(
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Lookup(midashi) => {
+                if midashi.is_empty() {
+                    writer.write_all(b"4\n").await?;
+                    conn_last_response_time = Some(Instant::now());
+                    continue;
+                }
+
                 let midashi_str = decode_euc_or_utf8(midashi);
                 let midashi_kind = crate::okuri::classify_midashi(&midashi_str);
                 let is_affix = !matches!(midashi_kind, crate::okuri::MidashiKind::Normal(_));
@@ -328,20 +364,12 @@ async fn handle_client(
 
                 let lookup_start = Instant::now();
                 let overall_deadline = OVERALL_LOOKUP_DEADLINE;
-                let mut okuri_handled = false;
-                let mut final_response = None;
-                let mut top_candidate_for_context: Option<String> = None;
-                let mut skip_lookup_cache = false;
-
-                let lookup_key = crate::cache::LookupKey::new(
-                    ctx_ref.first().map(|a| a.as_ref()),
-                    &midashi_str,
-                );
+                let ctx_key = ctx_ref.first().map(|a| a.as_ref());
 
                 // 【ゼロレイテンシ・キャッシュ参照】
-                // 過去に同一文脈・同一見出し語で変換済みの場合は、TCP 往復・辞書判定・整列を完全バイパスし即答
-                if let Some(cached) = proxy.lookup_cache.get(&lookup_key) {
-                    debug!(midashi = %midashi_str, "lookup cache hit");
+                // 過去に同一文脈・同一見出し語で変換済みの場合は、キー確保・TCP 往復・辞書判定・整列を完全バイパスし即答
+                if let Some(cached) = proxy.lookup_cache.get_by_ref(ctx_key, &midashi_str) {
+                    trace!(midashi = ?midashi_str, "lookup cache hit");
                     if proxy.context_ranking
                         && !is_completion_burst
                         && let Some(ref top) = cached.top_candidate
@@ -355,14 +383,12 @@ async fn handle_client(
                     }
                     writer.write_all(&cached.response).await?;
                     conn_last_response_time = Some(Instant::now());
-                    writer.flush().await?;
                     continue;
                 }
 
                 // 接頭語（例: "さい>", "ちょう>", "ご>"）および接尾語（例: ">せい", ">ひ", ">てき", ">わたs"）の専用処理。
                 // SKK の仕様上、接頭語・接尾語は `>` を含む見出し語として辞書に登録されており、候補文字列には `>` を含めない。
-                // Primary (azooKey) は SKK の `>` 接辞構文を解釈せず文字通りの記号 `>` を候補に付与してしまうため、
-                // 接頭語・接尾語は本来の SKK 辞書サーバーである Fallback (yaskkserv2) を最優先で照会する。
+                // yaskkserv2 を最優先で照会し、ミス時のみ `>` を除いた読みで azoo-key-skkserv を照会する。
                 if let crate::okuri::MidashiKind::Prefix(inner)
                 | crate::okuri::MidashiKind::Suffix(inner) = midashi_kind
                 {
@@ -375,304 +401,52 @@ async fn handle_client(
                         overall_deadline,
                     )
                     .await;
-                    debug!(?peer, kind = ?midashi_kind, resp = ?String::from_utf8_lossy(&resp_to_send), "sending affix response to client");
-                    if is_found(&resp_to_send) {
+                    let resp_arc: Arc<[u8]> = Arc::from(resp_to_send);
+                    trace!(?peer, kind = ?midashi_kind, resp = ?String::from_utf8_lossy(&resp_arc), "sending affix response to client");
+                    if is_found(&resp_arc) {
                         proxy.lookup_cache.insert(
-                            lookup_key,
+                            crate::cache::LookupKey::new(ctx_key, &midashi_str),
                             crate::cache::CachedLookup {
-                                response: resp_to_send.clone(),
+                                response: Arc::clone(&resp_arc),
                                 top_candidate: None,
                             },
                         );
                     }
-                    writer.write_all(&resp_to_send).await?;
+                    writer.write_all(&resp_arc).await?;
                     conn_last_response_time = Some(Instant::now());
-                    writer.flush().await?;
                     continue;
                 }
 
-                // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき", "まぜがk" -> "まぜがき", "かきおこs" -> "かきおこす"）の活用復元試行
-                if proxy.okuri_expansion {
-                    let variations = crate::okuri::expand_okuri_variations(&midashi_str);
-                    let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
-                    let max_total_okuri = Duration::from_millis(600).min(remaining_overall);
-                    let okuri_timeout = proxy
-                        .primary
-                        .timeout
-                        .min(Duration::from_millis(300))
-                        .min(max_total_okuri);
-
-                    // Primary バックエンドのコネクションプールを活用し、全活用形を完全並行照会
-                    let mut handles = Vec::with_capacity(variations.len());
-                    for (idx, var) in variations.into_iter().enumerate() {
-                        let primary = proxy.primary.clone();
-                        handles.push(tokio::spawn(async move {
-                            let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
-                            let res = primary.query_with_timeout(&okuri_req, okuri_timeout).await;
-                            (idx, res, var)
-                        }));
-                    }
-
-                    let mut query_results = Vec::with_capacity(handles.len());
-                    for handle in handles {
-                        if let Ok(res) = handle.await {
-                            query_results.push(res);
-                        }
-                    }
-                    // 活用の優先順位（order_suffixes_for_stem）を保持するため、元のインデックス順に整列
-                    query_results.sort_by_key(|(idx, _, _)| *idx);
-
-                    let mut responses = Vec::with_capacity(query_results.len());
-                    for (_, res, var) in query_results {
-                        if let Ok(okuri_resp) = res && is_found(&okuri_resp) {
-                            responses.push((okuri_resp, var));
-                        }
-                    }
-
-                    let mut all_stem_cands = Vec::new();
-                    for (resp, var) in &responses {
-                        let raw_cands = parse_candidates_borrowed(resp);
-                        let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
-                            &raw_cands,
-                            &var.okuri_suffix,
-                            &var.query_midashi,
-                        );
-
-                        debug!(
-                            midashi = %midashi_str,
-                            query = %var.query_midashi,
-                            suffix = %var.okuri_suffix,
-                            resp = ?String::from_utf8_lossy(resp),
-                            stems = ?stem_cands,
-                            "okuri variation checked"
-                        );
-
-                        for stem in stem_cands {
-                            if !all_stem_cands.contains(&stem) {
-                                 all_stem_cands.push(stem);
-                            }
-                        }
-                    }
-
-                    if !all_stem_cands.is_empty() {
-                        let mut merged_cands: Vec<&str> = all_stem_cands;
-
-                        // 元の見出し語（midashi_str）で Fallback (yaskkserv2 / 巨大SKK辞書) を照会し、
-                        // 辞書が本来持っている全候補（異体字・専門用語・注釈付き）を末尾に重複排除してマージする。
-                        // これにより azooKey の賢い促音・活用語幹が最優先となりつつ、
-                        // 辞書の全候補も漏れなく提供され、変換候補数が少なくなる現象を根本的に解消する。
-                        let remaining_fb = overall_deadline.saturating_sub(lookup_start.elapsed());
-                        let fb_timeout = proxy.fallback.timeout.min(Duration::from_millis(200)).min(remaining_fb);
-                        let fallback_resp_opt = if !fb_timeout.is_zero() {
-                            proxy
-                                .fallback
-                                .query_with_timeout(&Request::Lookup(midashi_str.as_bytes()), fb_timeout)
-                                .await
-                                .ok()
-                        } else {
-                            None
-                        };
-
-                        if let Some(ref fallback_resp) = fallback_resp_opt
-                            && is_found(fallback_resp)
-                        {
-                            let fb_cands =
-                                crate::encoding::parse_candidates_unpacked_borrowed(fallback_resp);
-                            for cand in fb_cands {
-                                let clean = crate::frequency::clean_candidate(cand);
-                                if !clean.is_empty()
-                                    && !merged_cands
-                                        .iter()
-                                        .any(|&c| crate::frequency::clean_candidate(c) == clean)
-                                {
-                                    merged_cands.push(cand);
-                                }
-                            }
-                        }
-
-                        let norm_midashi = crate::okuri::normalize_okuri_midashi_key(&midashi_str);
-                        let ffi_deadline = compute_ffi_deadline(
-                            lookup_start.elapsed(),
-                            overall_deadline,
-                            FFI_DEADLINE_MARGIN,
-                        );
-                        let (ranked, had_skipped) = rank_with_budget_and_prewarm(
-                            &proxy.predictor,
+                let outcome = match proxy.backend_order {
+                    BackendOrder::Yaskkserv2First => {
+                        handle_lookup_yaskkserv2_first(
+                            &proxy,
+                            &request,
+                            &midashi_str,
                             ctx_ref,
-                            &norm_midashi,
-                            &merged_cands,
-                            proxy.annotation_priority,
-                            ffi_deadline,
-                        );
-                        if had_skipped {
-                            skip_lookup_cache = true;
-                        }
-                        if let Some(&top) = ranked.first() {
-                            top_candidate_for_context = Some(top.to_string());
-                        }
-                        final_response = Some(format_candidates_response_str(&ranked));
-                        okuri_handled = true;
+                            lookup_start,
+                            overall_deadline,
+                        )
+                        .await
                     }
-                }
-
-                // 送りなし見出し、または送り復元が無効／失敗した場合は従来通りの照会
-                let resp_to_send = if okuri_handled && let Some(resp) = final_response {
-                    resp
-                } else {
-                    let (mut response, hit) =
-                        lookup_with_fallback(&proxy, &request, lookup_start, overall_deadline).await;
-                    if is_found(&response) {
-                        // Primary (azooKey) ヒット時でも、以下のいずれかに該当する場合は
-                        // Fallback (yaskkserv2) の候補も照会・マージして欠落を防ぐ:
-                        // 1. frequencies に登録された最高スコア候補が Primary 返却候補に存在しない場合（例: "みぎや" -> "→"）
-                        // 2. 送りなし見出しに対して Primary の第1候補が辞書未掲載の送り仮名断片だった場合（例: "がそ" -> "貸そ", "げそ" -> "解そ"）
-                        // 3. 補完連射でない通常変換で、送りなし見出しに対する Primary の第1候補がシステム国語辞典未掲載の合成語だった場合
-                        //    （例: "せつびご" -> "設備後"［名詞+接尾語の誤結合］）
-                        if hit == BackendHit::Primary && !contains_bracket_block(&response) {
-                            let mut first_is_unverified_fragment = false;
-                            let mut first_not_in_dict = false;
-                            if proxy.annotation_priority
-                                && crate::okuri::parse_okuri_midashi_extended(&midashi_str)
-                                    .is_none()
-                                && let Some(first) = extract_first_candidate(&response)
-                            {
-                                let first_check_deadline = compute_ffi_deadline(
-                                    lookup_start.elapsed(),
-                                    overall_deadline,
-                                    FFI_DEADLINE_MARGIN + Duration::from_millis(30),
-                                );
-                                let (in_dict, cold_skipped) =
-                                    crate::system_dict::is_annotated_or_in_dict_budgeted(
-                                        first,
-                                        Some(&midashi_str),
-                                        true,
-                                        Some(first_check_deadline),
-                                    );
-                                if cold_skipped {
-                                    // 締切直前のため同期 FFI をスキップし、裏でキャッシュを温めて初回応答を遅延させない
-                                    skip_lookup_cache = true;
-                                    let first_owned = first.to_string();
-                                    let midashi_owned: String = midashi_str.as_ref().to_string();
-                                    tokio::task::spawn_blocking(move || {
-                                        let _ = crate::system_dict::is_annotated_or_in_dict(
-                                            &first_owned,
-                                            Some(&midashi_owned),
-                                        );
-                                    });
-                                } else if !in_dict {
-                                    first_is_unverified_fragment =
-                                        crate::frequency::is_unverified_okuri_fragment(
-                                            crate::frequency::clean_candidate(first),
-                                        );
-                                    if !is_completion_burst {
-                                        first_not_in_dict = true;
-                                    }
-                                }
-                            }
-
-                            let missing_top_freq = {
-                                let guard =
-                                    proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                // frequencies にエントリがある見出し語のみスライス借用で照合
-                                guard.should_rank(&[] as &[&str], &midashi_str) && {
-                                    let cands = parse_candidates_borrowed(&response);
-                                    guard.is_top_freq_candidate_missing(&midashi_str, &cands)
-                                }
-                            };
-
-                            if first_is_unverified_fragment || missing_top_freq || first_not_in_dict
-                            {
-                                let remaining_fb =
-                                    overall_deadline.saturating_sub(lookup_start.elapsed());
-                                let cap_ms = if first_is_unverified_fragment || missing_top_freq {
-                                    Duration::from_millis(200)
-                                } else {
-                                    // ローカルバイナリ辞書（<2ms）のヒット回収を目的とし、Google Suggest タイムアウト待ちを抑制
-                                    Duration::from_millis(40)
-                                };
-                                let fb_timeout =
-                                    proxy.fallback.timeout.min(cap_ms).min(remaining_fb);
-                                if !fb_timeout.is_zero()
-                                    && let Ok(fallback_resp) = proxy
-                                        .fallback
-                                        .query_with_timeout(&request, fb_timeout)
-                                        .await
-                                    && is_found(&fallback_resp)
-                                {
-                                    let mut merged_cands: Vec<&str> =
-                                        parse_candidates_borrowed(&response);
-                                    let fb_cands =
-                                        crate::encoding::parse_candidates_unpacked_borrowed(&fallback_resp);
-                                    for cand in fb_cands {
-                                        let clean = crate::frequency::clean_candidate(cand);
-                                        if !clean.is_empty()
-                                            && !merged_cands.iter().any(|&c| {
-                                                crate::frequency::clean_candidate(c) == clean
-                                            })
-                                        {
-                                            merged_cands.push(cand);
-                                        }
-                                    }
-                                    response = format_candidates_response_str(&merged_cands);
-                                }
-                            }
-                        }
-
-                        // 【ファストパス】単一候補（候補数 <= 1）の場合は並び替えの余地がないため完全ゼロコピー直結。
-                        // また、角括弧ブロック（例: `/[っ/思/]/`）を含むレスポンスは単純ソートで構造が破壊されるため並び替えをスキップ。
-                        // 複数候補（角括弧なし）の場合、annotation_priority 有効時または頻度・文脈ルール存在時のみ借用パースして整列する。
-                        let should_rank = has_multiple_candidates(&response)
-                            && !contains_bracket_block(&response)
-                            && (proxy.annotation_priority || {
-                                let guard =
-                                    proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                                guard.should_rank(ctx_ref, &midashi_str)
-                            });
-
-                        if should_rank {
-                            // ゼロコピーで借用スライスパースして並び替え
-                            let cands = parse_candidates_borrowed(&response);
-                            if !cands.is_empty() {
-                                let ffi_deadline = compute_ffi_deadline(
-                                    lookup_start.elapsed(),
-                                    overall_deadline,
-                                    FFI_DEADLINE_MARGIN,
-                                );
-                                let (ranked, had_skipped) = rank_with_budget_and_prewarm(
-                                    &proxy.predictor,
-                                    ctx_ref,
-                                    &midashi_str,
-                                    &cands,
-                                    proxy.annotation_priority,
-                                    ffi_deadline,
-                                );
-                                if had_skipped {
-                                    skip_lookup_cache = true;
-                                }
-                                if let Some(&top) = ranked.first() {
-                                    top_candidate_for_context = Some(top.to_string());
-                                }
-                                format_candidates_response_str(&ranked)
-                            } else {
-                                response
-                            }
-                        } else {
-                            // 単一候補・角括弧ブロック含有・並び替え対象外（annotation_priority 無効かつルールなし）:
-                            // パース・アロケーション完全スキップ（ゼロコピー直結）
-                            if let Some(top) = extract_first_candidate(&response) {
-                                top_candidate_for_context = Some(top.to_string());
-                            }
-                            response
-                        }
-                    } else {
-                        response
+                    BackendOrder::AzookeyFirst => {
+                        handle_lookup_azookey_first(
+                            &proxy,
+                            &request,
+                            &midashi_str,
+                            ctx_ref,
+                            lookup_start,
+                            overall_deadline,
+                            is_completion_burst,
+                        )
+                        .await
                     }
                 };
 
                 // 文脈連動が有効で、補完連射でなく、返却第1候補が漢字を含む場合のみ次回のための直前単語として保留する。
                 if proxy.context_ranking
                     && !is_completion_burst
-                    && let Some(ref top) = top_candidate_for_context
+                    && let Some(ref top) = outcome.top_candidate
                 {
                     let clean = crate::frequency::clean_candidate(top);
                     if contains_kanji(clean) {
@@ -681,21 +455,27 @@ async fn handle_client(
                     }
                 }
 
-                if !skip_lookup_cache && is_found(&resp_to_send) {
+                let resp_arc: Arc<[u8]> = Arc::from(outcome.response);
+                if !outcome.skip_cache && is_found(&resp_arc) {
                     proxy.lookup_cache.insert(
-                        lookup_key,
+                        crate::cache::LookupKey::new(ctx_key, &midashi_str),
                         crate::cache::CachedLookup {
-                            response: resp_to_send.clone(),
-                            top_candidate: top_candidate_for_context.clone(),
+                            response: Arc::clone(&resp_arc),
+                            top_candidate: outcome.top_candidate.map(Arc::from),
                         },
                     );
                 }
 
-                debug!(?peer, resp = ?String::from_utf8_lossy(&resp_to_send), "sending response to client");
-                writer.write_all(&resp_to_send).await?;
+                trace!(?peer, resp = ?String::from_utf8_lossy(&resp_arc), "sending response to client");
+                writer.write_all(&resp_arc).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Completion(prefix) => {
+                if prefix.is_empty() {
+                    writer.write_all(b"4\n").await?;
+                    conn_last_response_time = Some(Instant::now());
+                    continue;
+                }
                 let start = Instant::now();
                 let overall_deadline = OVERALL_LOOKUP_DEADLINE;
                 let prefix_str = decode_euc_or_utf8(prefix);
@@ -704,33 +484,698 @@ async fn handle_client(
                     crate::okuri::MidashiKind::Normal(_)
                 );
                 let (response, hit) = if is_affix_comp {
-                    // 接尾語補完（例: `4>せ `）などは SKK 辞書を持つ Fallback (yaskkserv2) へ直接照会
-                    lookup_fallback_only(&proxy, &request, start, overall_deadline).await
+                    // 接尾語補完（例: `4>せ `）などは SKK 辞書を持つ yaskkserv2 へ直接照会
+                    let (resp, ok) = lookup_single_backend(
+                        &proxy.yaskkserv2,
+                        &request,
+                        start,
+                        overall_deadline,
+                    )
+                    .await;
+                    (
+                        resp,
+                        if ok {
+                            BackendHit::Yaskkserv2
+                        } else {
+                            BackendHit::None
+                        },
+                    )
                 } else {
-                    lookup_with_fallback(&proxy, &request, start, overall_deadline).await
+                    match proxy.backend_order {
+                        BackendOrder::Yaskkserv2First => {
+                            lookup_yaskkserv2_first(&proxy, &request, start, overall_deadline).await
+                        }
+                        BackendOrder::AzookeyFirst => {
+                            lookup_azookey_first(&proxy, &request, start, overall_deadline).await
+                        }
+                    }
                 };
-                debug!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
+                trace!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 writer.write_all(&response).await?;
                 conn_last_response_time = Some(Instant::now());
             }
         }
-        writer.flush().await?;
     }
 
     Ok(())
 }
 
-/// どのバックエンドが応答したかを示す列挙型
+struct LookupOutcome {
+    response: Vec<u8>,
+    top_candidate: Option<String>,
+    skip_cache: bool,
+}
+
+/// 候補スライスに対し、必要に応じてシステム辞書／頻度／文脈共起による並び替えとキャッシュ前登録を行い、レスポンスを生成する。
+fn rank_candidates_to_response(
+    proxy: &Proxy,
+    ctx_ref: &[Arc<str>],
+    lookup_start: Instant,
+    overall_deadline: Duration,
+    rank_midashi: &str,
+    cands: &[&str],
+    first_cold_skipped: bool,
+) -> LookupOutcome {
+    if cands.is_empty() {
+        return LookupOutcome {
+            response: b"4\n".to_vec(),
+            top_candidate: None,
+            skip_cache: false,
+        };
+    }
+
+    let should_rank = cands.len() > 1
+        && (proxy.annotation_priority || {
+            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+            guard.should_rank(ctx_ref, rank_midashi)
+        });
+
+    if should_rank {
+        let ffi_deadline = compute_ffi_deadline(
+            lookup_start.elapsed(),
+            overall_deadline,
+            FFI_DEADLINE_MARGIN,
+        );
+        let (ranked, had_skipped) = rank_with_budget_and_prewarm(
+            &proxy.predictor,
+            ctx_ref,
+            rank_midashi,
+            cands,
+            proxy.annotation_priority,
+            ffi_deadline,
+        );
+        let top_candidate = ranked.first().map(|&t| t.to_string());
+        LookupOutcome {
+            response: format_candidates_response_str(&ranked),
+            top_candidate,
+            skip_cache: had_skipped || first_cold_skipped,
+        }
+    } else {
+        if first_cold_skipped
+            && proxy.annotation_priority
+            && let Some(&first) = cands.first()
+        {
+            crate::system_dict::enqueue_prewarm([(
+                first.to_string(),
+                Some(rank_midashi.to_string()),
+            )]);
+        }
+        let top_candidate = cands.first().map(|&t| t.to_string());
+        LookupOutcome {
+            response: format_candidates_response_str(cands),
+            top_candidate,
+            skip_cache: first_cold_skipped,
+        }
+    }
+}
+
+/// 生レスポンスバイト列から、角括弧ブロック展開または通常パースを行い、ランキング・整形結果を返す。
+#[allow(clippy::too_many_arguments)]
+fn finalize_raw_response(
+    proxy: &Proxy,
+    ctx_ref: &[Arc<str>],
+    lookup_start: Instant,
+    overall_deadline: Duration,
+    rank_midashi: &str,
+    response: Vec<u8>,
+    first_cold_skipped: bool,
+) -> LookupOutcome {
+    if !is_found(&response) {
+        return LookupOutcome {
+            response,
+            top_candidate: None,
+            skip_cache: false,
+        };
+    }
+
+    if contains_okuri_bracket_block(&response) {
+        let unpacked = crate::encoding::parse_candidates_unpacked_borrowed(&response);
+        if unpacked.is_empty() {
+            return LookupOutcome {
+                response,
+                top_candidate: None,
+                skip_cache: false,
+            };
+        }
+        return rank_candidates_to_response(
+            proxy,
+            ctx_ref,
+            lookup_start,
+            overall_deadline,
+            rank_midashi,
+            &unpacked,
+            first_cold_skipped,
+        );
+    }
+
+    let should_rank = has_multiple_candidates(&response)
+        && (proxy.annotation_priority || {
+            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+            guard.should_rank(ctx_ref, rank_midashi)
+        });
+
+    if should_rank {
+        let cands = parse_candidates_borrowed(&response);
+        if !cands.is_empty() {
+            return rank_candidates_to_response(
+                proxy,
+                ctx_ref,
+                lookup_start,
+                overall_deadline,
+                rank_midashi,
+                &cands,
+                first_cold_skipped,
+            );
+        }
+    }
+
+    if first_cold_skipped
+        && proxy.annotation_priority
+        && let Some(first) = extract_first_candidate(&response)
+    {
+        crate::system_dict::enqueue_prewarm([(
+            first.to_string(),
+            Some(rank_midashi.to_string()),
+        )]);
+    }
+    let top_candidate = extract_first_candidate(&response).map(|s| s.to_string());
+    LookupOutcome {
+        response,
+        top_candidate,
+        skip_cache: first_cold_skipped,
+    }
+}
+
+/// `azoo-key-skkserv` に対して送りあり見出しの活用バリエーションを並行照会し、
+/// 抽出された重複なしの語幹候補リストを返す。語幹が 1 件も得られなければ `None`。
+async fn expand_azookey_okuri(
+    azookey: &Backend,
+    midashi_str: &str,
+    lookup_start: Instant,
+    overall_deadline: Duration,
+) -> Option<Vec<String>> {
+    let variations = crate::okuri::expand_okuri_variations(midashi_str);
+    if variations.is_empty() {
+        return None;
+    }
+
+    let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
+    let max_total_okuri = Duration::from_millis(600).min(remaining_overall);
+    let okuri_timeout = azookey
+        .timeout
+        .min(Duration::from_millis(300))
+        .min(max_total_okuri);
+    if okuri_timeout.is_zero() {
+        return None;
+    }
+
+    // azoo-key-skkserv のコネクションプールを活用し、全活用形を完全並行照会
+    let mut handles = Vec::with_capacity(variations.len());
+    for (idx, var) in variations.into_iter().enumerate() {
+        let backend = azookey.clone();
+        handles.push(tokio::spawn(async move {
+            let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
+            let res = backend.query_with_timeout(&okuri_req, okuri_timeout).await;
+            (idx, res, var)
+        }));
+    }
+
+    let mut query_results = Vec::with_capacity(handles.len());
+    for handle in handles {
+        if let Ok(res) = handle.await {
+            query_results.push(res);
+        }
+    }
+    // 活用の優先順位（order_suffixes_for_stem）を保持するため、元のインデックス順に整列
+    query_results.sort_by_key(|(idx, _, _)| *idx);
+
+    let mut all_stem_cands: Vec<String> = Vec::new();
+    for (_, res, var) in query_results {
+        if let Ok(okuri_resp) = res
+            && is_found(&okuri_resp)
+        {
+            let raw_cands = parse_candidates_borrowed(&okuri_resp);
+            let stem_cands = crate::okuri::extract_stem_candidates_borrowed(
+                &raw_cands,
+                &var.okuri_suffix,
+                &var.query_midashi,
+            );
+
+            trace!(
+                midashi = ?midashi_str,
+                query = ?var.query_midashi,
+                suffix = ?var.okuri_suffix,
+                resp = ?String::from_utf8_lossy(&okuri_resp),
+                stems = ?stem_cands,
+                "okuri variation checked"
+            );
+
+            for stem in stem_cands {
+                if !all_stem_cands.iter().any(|existing| existing == stem) {
+                    all_stem_cands.push(stem.to_string());
+                }
+            }
+        }
+    }
+
+    if all_stem_cands.is_empty() {
+        None
+    } else {
+        Some(all_stem_cands)
+    }
+}
+
+/// `yaskkserv2` 優先モード時に `azoo-key-skkserv` へフォールバックするヘルパー。
+/// 送りあり展開が有効かつ対象見出し語であれば活用バリエーション展開を試し、
+/// それ以外または未ヒット時は通常の見出し語照会へフォールバックする。
+async fn query_azookey_fallback(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    midashi_str: &str,
+    is_okuri_candidate: bool,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, Option<Vec<String>>, BackendHit) {
+    if is_okuri_candidate
+        && let Some(stems) =
+            expand_azookey_okuri(&proxy.azookey, midashi_str, start, overall_deadline).await
+    {
+        let refs: Vec<&str> = stems.iter().map(|s| s.as_str()).collect();
+        let resp = format_candidates_response_str(&refs);
+        return (resp, Some(stems), BackendHit::Azookey);
+    }
+
+    let remaining = overall_deadline.saturating_sub(start.elapsed());
+    let azoo_timeout = proxy.azookey.timeout.min(remaining);
+    if azoo_timeout.is_zero() {
+        return (b"4\n".to_vec(), None, BackendHit::None);
+    }
+
+    match proxy.azookey.query_with_timeout(request, azoo_timeout).await {
+        Ok(response) => {
+            let hit = if is_found(&response) {
+                debug!(
+                    backend = %proxy.azookey.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "hit"
+                );
+                BackendHit::Azookey
+            } else {
+                debug!(
+                    backend = %proxy.azookey.name,
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "miss"
+                );
+                BackendHit::None
+            };
+            (response, None, hit)
+        }
+        Err(err) => {
+            warn!(
+                backend = %proxy.azookey.name,
+                error = %err,
+                elapsed_ms = start.elapsed().as_millis(),
+                "azookey fallback failed"
+            );
+            (b"4\n".to_vec(), None, BackendHit::None)
+        }
+    }
+}
+
+/// `yaskkserv2` 優先モードで Lookup を処理し、200ms 超過時の `azoo-key-skkserv` ヘッジ並列起動も行う。
+async fn lookup_yaskkserv2_then_azookey(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    midashi_str: &str,
+    is_okuri_candidate: bool,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, Option<Vec<String>>, BackendHit) {
+    let remaining_overall = overall_deadline.saturating_sub(start.elapsed());
+    if remaining_overall.is_zero() {
+        debug!("overall deadline reached before lookup, returning not found immediately");
+        return (b"4\n".to_vec(), None, BackendHit::None);
+    }
+
+    let yaskk_timeout = proxy.yaskkserv2.timeout.min(remaining_overall);
+    if !yaskk_timeout.is_zero() {
+        let mut yaskk_fut =
+            std::pin::pin!(proxy.yaskkserv2.query_with_timeout(request, yaskk_timeout));
+
+        let hedge_fired = if remaining_overall > PRIMARY_HEDGE_DELAY
+            && yaskk_timeout > PRIMARY_HEDGE_DELAY
+        {
+            tokio::select! {
+                res = &mut yaskk_fut => {
+                    if let Some(resp) = interpret_backend_result(&proxy.yaskkserv2, start, res) {
+                        return (resp, None, BackendHit::Yaskkserv2);
+                    }
+                    false
+                }
+                _ = tokio::time::sleep(PRIMARY_HEDGE_DELAY) => true,
+            }
+        } else {
+            if let Some(resp) =
+                interpret_backend_result(&proxy.yaskkserv2, start, yaskk_fut.as_mut().await)
+            {
+                return (resp, None, BackendHit::Yaskkserv2);
+            }
+            false
+        };
+
+        if hedge_fired {
+            let remaining_azoo = overall_deadline.saturating_sub(start.elapsed());
+            if !remaining_azoo.is_zero() {
+                debug!(
+                    elapsed_ms = start.elapsed().as_millis(),
+                    "yaskkserv2 slow, starting hedged azookey query"
+                );
+                let mut azoo_fut = std::pin::pin!(query_azookey_fallback(
+                    proxy,
+                    request,
+                    midashi_str,
+                    is_okuri_candidate,
+                    start,
+                    overall_deadline,
+                ));
+                let mut azoo_opt = None;
+
+                let yaskk_res = loop {
+                    if azoo_opt.is_none() {
+                        tokio::select! {
+                            res = &mut yaskk_fut => break res,
+                            fb = &mut azoo_fut => azoo_opt = Some(fb),
+                        }
+                    } else {
+                        break yaskk_fut.as_mut().await;
+                    }
+                };
+
+                if let Some(resp) = interpret_backend_result(&proxy.yaskkserv2, start, yaskk_res) {
+                    return (resp, None, BackendHit::Yaskkserv2);
+                }
+                return match azoo_opt {
+                    Some(res) => res,
+                    None => azoo_fut.await,
+                };
+            }
+            if let Some(resp) =
+                interpret_backend_result(&proxy.yaskkserv2, start, yaskk_fut.as_mut().await)
+            {
+                return (resp, None, BackendHit::Yaskkserv2);
+            }
+        }
+    }
+
+    query_azookey_fallback(
+        proxy,
+        request,
+        midashi_str,
+        is_okuri_candidate,
+        start,
+        overall_deadline,
+    )
+    .await
+}
+
+/// `BackendOrder::Yaskkserv2First` の通常変換パス：
+/// 1. `yaskkserv2` を優先照会（200ms 超過時は `azoo-key-skkserv` をヘッジ並列起動）
+/// 2. `yaskkserv2` ヒット時は必要に応じて角括弧ブロック展開＋文脈／頻度／システム辞書優先整列
+/// 3. `yaskkserv2` ミス／失敗時は `azoo-key-skkserv`（送りあり展開含む）へフォールバック
+async fn handle_lookup_yaskkserv2_first(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    midashi_str: &str,
+    ctx_ref: &[Arc<str>],
+    lookup_start: Instant,
+    overall_deadline: Duration,
+) -> LookupOutcome {
+    let is_okuri_candidate =
+        proxy.okuri_expansion && !crate::okuri::expand_okuri_variations(midashi_str).is_empty();
+
+    let (response, okuri_stems_opt, hit) = lookup_yaskkserv2_then_azookey(
+        proxy,
+        request,
+        midashi_str,
+        is_okuri_candidate,
+        lookup_start,
+        overall_deadline,
+    )
+    .await;
+
+    if !is_found(&response) {
+        return LookupOutcome {
+            response,
+            top_candidate: None,
+            skip_cache: false,
+        };
+    }
+
+    if hit == BackendHit::Azookey
+        && let Some(stems) = okuri_stems_opt
+    {
+        let stem_refs: Vec<&str> = stems.iter().map(|s| s.as_str()).collect();
+        let norm_midashi = crate::okuri::normalize_okuri_midashi_key(midashi_str);
+        return rank_candidates_to_response(
+            proxy,
+            ctx_ref,
+            lookup_start,
+            overall_deadline,
+            &norm_midashi,
+            &stem_refs,
+            false,
+        );
+    }
+
+    finalize_raw_response(
+        proxy,
+        ctx_ref,
+        lookup_start,
+        overall_deadline,
+        midashi_str,
+        response,
+        false,
+    )
+}
+
+/// `BackendOrder::AzookeyFirst`（従来順・ロールバックモード）の通常変換パス
+async fn handle_lookup_azookey_first(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    midashi_str: &str,
+    ctx_ref: &[Arc<str>],
+    lookup_start: Instant,
+    overall_deadline: Duration,
+    is_completion_burst: bool,
+) -> LookupOutcome {
+    // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき"）の活用復元試行
+    if proxy.okuri_expansion
+        && !crate::okuri::expand_okuri_variations(midashi_str).is_empty()
+    {
+        let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
+        let fb_timeout = proxy
+            .yaskkserv2
+            .timeout
+            .min(Duration::from_millis(200))
+            .min(remaining_overall);
+        let fb_handle = if !fb_timeout.is_zero() {
+            let yaskk = proxy.yaskkserv2.clone();
+            let req_midashi = midashi_str.to_string();
+            Some(tokio::spawn(async move {
+                let req = Request::Lookup(req_midashi.as_bytes());
+                yaskk.query_with_timeout(&req, fb_timeout).await.ok()
+            }))
+        } else {
+            None
+        };
+
+        if let Some(stems) =
+            expand_azookey_okuri(&proxy.azookey, midashi_str, lookup_start, overall_deadline).await
+        {
+            let mut merged_cands: Vec<&str> = stems.iter().map(|s| s.as_str()).collect();
+
+            // 元の見出し語で並列照会した yaskkserv2 の全候補（異体字・専門用語・注釈付き）を末尾に重複排除マージ
+            let fallback_resp_opt = if let Some(handle) = fb_handle {
+                handle.await.ok().flatten()
+            } else {
+                None
+            };
+
+            if let Some(ref fallback_resp) = fallback_resp_opt
+                && is_found(fallback_resp)
+            {
+                let fb_cands =
+                    crate::encoding::parse_candidates_unpacked_borrowed(fallback_resp);
+                append_unique_by_clean(&mut merged_cands, fb_cands);
+            }
+
+            let norm_midashi = crate::okuri::normalize_okuri_midashi_key(midashi_str);
+            return rank_candidates_to_response(
+                proxy,
+                ctx_ref,
+                lookup_start,
+                overall_deadline,
+                &norm_midashi,
+                &merged_cands,
+                false,
+            );
+        } else if let Some(handle) = fb_handle {
+            // 送り展開で語幹が得られなかった場合は通常パスへ委ねるため並列 yaskkserv2 をキャンセル
+            handle.abort();
+        }
+    }
+
+    // 送りなし見出し、または送り復元が無効／失敗した場合は azooKey 先・yaskkserv2 フォールバック照会
+    let (response, hit) =
+        lookup_azookey_first(proxy, request, lookup_start, overall_deadline).await;
+    if !is_found(&response) {
+        return LookupOutcome {
+            response,
+            top_candidate: None,
+            skip_cache: false,
+        };
+    }
+
+    let has_okuri_bracket = contains_okuri_bracket_block(&response);
+    let mut fallback_resp_buf: Option<Vec<u8>> = None;
+    let mut cands_buf: Option<Vec<&str>> = None;
+    let mut first_cold_skipped = false;
+
+    // azoo-key-skkserv ヒット時でも、以下のいずれかに該当する場合は
+    // yaskkserv2 の候補も照会・マージして欠落を防ぐ:
+    // 1. frequencies に登録された最高スコア候補が azooKey 返却候補に存在しない場合（例: "みぎや" -> "→"）
+    // 2. 送りなし見出しに対して azooKey の第1候補が辞書未掲載の送り仮名断片だった場合（例: "がそ" -> "貸そ", "げそ" -> "解そ"）
+    // 3. 補完連射でない通常変換で、送りなし見出しに対する azooKey の第1候補がシステム国語辞典未掲載の合成語だった場合
+    if hit == BackendHit::Azookey && !has_okuri_bracket {
+        let mut first_is_unverified_fragment = false;
+        let mut first_not_in_dict = false;
+        if proxy.annotation_priority
+            && crate::okuri::parse_okuri_midashi_extended(midashi_str).is_none()
+            && let Some(first) = extract_first_candidate(&response)
+        {
+            let first_check_deadline = compute_ffi_deadline(
+                lookup_start.elapsed(),
+                overall_deadline,
+                FFI_DEADLINE_MARGIN + Duration::from_millis(30),
+            );
+            let (in_dict, cold_skipped) =
+                crate::system_dict::is_annotated_or_in_dict_parsed_budgeted(
+                    first,
+                    None,
+                    true,
+                    Some(first_check_deadline),
+                );
+            if cold_skipped {
+                // 後段のランキング／prewarm 処理へ合流させ、二重起動と FFI 競合を防止する
+                first_cold_skipped = true;
+            } else if !in_dict {
+                first_is_unverified_fragment = crate::frequency::is_unverified_okuri_fragment(
+                    crate::frequency::clean_candidate(first),
+                );
+                if !is_completion_burst {
+                    first_not_in_dict = true;
+                }
+            }
+        }
+
+        let missing_top_freq = {
+            let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+            if guard.should_rank(&[] as &[&str], midashi_str) {
+                let parsed = cands_buf.get_or_insert_with(|| parse_candidates_borrowed(&response));
+                guard.is_top_freq_candidate_missing(midashi_str, parsed)
+            } else {
+                false
+            }
+        };
+
+        if first_is_unverified_fragment || missing_top_freq || first_not_in_dict {
+            let remaining_fb = overall_deadline.saturating_sub(lookup_start.elapsed());
+            let cap_ms = if first_is_unverified_fragment || missing_top_freq {
+                Duration::from_millis(200)
+            } else {
+                // ローカルバイナリ辞書（<2ms）のヒット回収を目的とし、Google Suggest タイムアウト待ちを抑制
+                Duration::from_millis(40)
+            };
+            let fb_timeout = proxy.yaskkserv2.timeout.min(cap_ms).min(remaining_fb);
+            if !fb_timeout.is_zero()
+                && let Ok(fallback_resp) = proxy
+                    .yaskkserv2
+                    .query_with_timeout(request, fb_timeout)
+                    .await
+                && is_found(&fallback_resp)
+            {
+                fallback_resp_buf = Some(fallback_resp);
+            }
+        }
+    }
+
+    if let Some(ref fb_buf) = fallback_resp_buf {
+        let mut merged = cands_buf
+            .take()
+            .unwrap_or_else(|| parse_candidates_borrowed(&response));
+        let fb_cands = crate::encoding::parse_candidates_unpacked_borrowed(fb_buf);
+        append_unique_by_clean(&mut merged, fb_cands);
+        return rank_candidates_to_response(
+            proxy,
+            ctx_ref,
+            lookup_start,
+            overall_deadline,
+            midashi_str,
+            &merged,
+            first_cold_skipped,
+        );
+    }
+
+    finalize_raw_response(
+        proxy,
+        ctx_ref,
+        lookup_start,
+        overall_deadline,
+        midashi_str,
+        response,
+        first_cold_skipped,
+    )
+}
+
+/// `dst` に既にある候補と `clean_candidate` ベースで重複しないものだけを `src` から末尾へ追加する。
+fn append_unique_by_clean<'a>(
+    dst: &mut Vec<&'a str>,
+    src: impl IntoIterator<Item = &'a str>,
+) {
+    let mut seen: HashSet<&'a str> = HashSet::with_capacity(dst.len() + 8);
+    for &existing in dst.iter() {
+        let clean = crate::frequency::clean_candidate(existing);
+        if !clean.is_empty() {
+            seen.insert(clean);
+        }
+    }
+    for cand in src {
+        let clean = crate::frequency::clean_candidate(cand);
+        if !clean.is_empty() && seen.insert(clean) {
+            dst.push(cand);
+        }
+    }
+}
+
+/// どの実効バックエンドが応答したかを示す列挙型
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BackendHit {
-    Primary,
-    Fallback,
+    Azookey,
+    Yaskkserv2,
+    None,
+}
+
+/// 汎用順序付き照会の結果位置
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderedHit {
+    First,
+    Second,
     None,
 }
 
 /// 接頭語（`midashi>`）および接尾語（`>midashi`）の変換照会処理。
-/// SKK 辞書を持つ Fallback (`yaskkserv2`) を最優先で照会し、ミス時のみ `>` を除去した内部読みで
-/// Primary (`azooKey`) を照会したうえで候補内の余分な `>` をサニタイズする。
+/// SKK 辞書を持つ `yaskkserv2` を最優先で照会し、ミス時のみ `>` を除去した内部読みで
+/// `azoo-key-skkserv` を照会したうえで候補内の余分な `>` をサニタイズする。
 async fn lookup_affix(
     proxy: &Proxy,
     request: &Request<'_>,
@@ -739,13 +1184,13 @@ async fn lookup_affix(
     start: Instant,
     overall_deadline: Duration,
 ) -> Vec<u8> {
-    let (mut response, hit) = lookup_fallback_only(proxy, request, start, overall_deadline).await;
+    let (mut response, found) =
+        lookup_single_backend(&proxy.yaskkserv2, request, start, overall_deadline).await;
 
-    if hit == BackendHit::Fallback && is_found(&response) {
-        if contains_bracket_block(&response) {
-            let unpacked = crate::encoding::parse_candidates_unpacked(&response);
-            let refs: Vec<&str> = unpacked.iter().map(|s| s.as_str()).collect();
-            response = format_candidates_response_str(&refs);
+    if found && is_found(&response) {
+        if contains_okuri_bracket_block(&response) {
+            let unpacked = crate::encoding::parse_candidates_unpacked_borrowed(&response);
+            response = format_candidates_response_str(&unpacked);
         }
         if has_multiple_candidates(&response) {
             let should_rank = {
@@ -766,33 +1211,29 @@ async fn lookup_affix(
         return response;
     }
 
-    // Fallback (yaskkserv2) に接頭語・接尾語エントリがない場合のみ、`>` を除いた読みで Primary を照会
+    // yaskkserv2 に接頭語・接尾語エントリがない場合のみ、`>` を除いた読みで azoo-key-skkserv を照会
     let remaining = overall_deadline.saturating_sub(start.elapsed());
-    let primary_timeout = proxy.primary.timeout.min(remaining);
-    if !primary_timeout.is_zero() {
+    let azookey_timeout = proxy.azookey.timeout.min(remaining);
+    if !azookey_timeout.is_zero() {
         let stripped_req = Request::Lookup(inner_reading.as_bytes());
         if let Ok(primary_resp) = proxy
-            .primary
-            .query_with_timeout(&stripped_req, primary_timeout)
+            .azookey
+            .query_with_timeout(&stripped_req, azookey_timeout)
             .await
             && is_found(&primary_resp)
         {
             let raw_cands = parse_candidates_borrowed(&primary_resp);
-            let mut sanitized: Vec<String> = Vec::with_capacity(raw_cands.len());
+            let mut sanitized: Vec<&str> = Vec::with_capacity(raw_cands.len());
+            let mut seen: HashSet<&str> = HashSet::with_capacity(raw_cands.len());
             for cand in raw_cands {
                 let cleaned = cand.trim_matches(['>', '?']);
                 let word = crate::frequency::clean_candidate(cleaned);
-                if !word.is_empty()
-                    && !sanitized
-                        .iter()
-                        .any(|c| crate::frequency::clean_candidate(c) == word)
-                {
-                    sanitized.push(cleaned.to_string());
+                if !word.is_empty() && seen.insert(word) {
+                    sanitized.push(cleaned);
                 }
             }
             if !sanitized.is_empty() {
-                let refs: Vec<&str> = sanitized.iter().map(|s| s.as_str()).collect();
-                return format_candidates_response_str(&refs);
+                return format_candidates_response_str(&sanitized);
             }
         }
     }
@@ -800,43 +1241,34 @@ async fn lookup_affix(
     response
 }
 
-/// Fallback（yaskkserv2）のみを照会するヘルパー（接頭語・接尾語の変換および補完用）。
-async fn lookup_fallback_only(
-    proxy: &Proxy,
+/// 指定バックエンド 1 系統のみを照会するヘルパー（接頭語・接尾語の変換および補完用）。
+async fn lookup_single_backend(
+    backend: &Backend,
     request: &Request<'_>,
     start: Instant,
     overall_deadline: Duration,
-) -> (Vec<u8>, BackendHit) {
+) -> (Vec<u8>, bool) {
     let elapsed = start.elapsed();
-    let fallback_timeout = proxy
-        .fallback
+    let backend_timeout = backend
         .timeout
         .min(overall_deadline.saturating_sub(elapsed));
-    if fallback_timeout.is_zero() {
-        return (b"4\n".to_vec(), BackendHit::None);
+    if backend_timeout.is_zero() {
+        return (b"4\n".to_vec(), false);
     }
 
-    match proxy
-        .fallback
-        .query_with_timeout(request, fallback_timeout)
-        .await
-    {
+    match backend.query_with_timeout(request, backend_timeout).await {
         Ok(response) => {
-            let hit = if is_found(&response) {
-                BackendHit::Fallback
-            } else {
-                BackendHit::None
-            };
-            (response, hit)
+            let found = is_found(&response);
+            (response, found)
         }
         Err(err) => {
             warn!(
-                backend = %proxy.fallback.name,
+                backend = %backend.name,
                 error = %err,
                 elapsed_ms = start.elapsed().as_millis(),
-                "fallback failed on affix query"
+                "backend failed on affix query"
             );
-            (b"4\n".to_vec(), BackendHit::None)
+            (b"4\n".to_vec(), false)
         }
     }
 }
@@ -883,26 +1315,25 @@ fn rank_with_budget_and_prewarm<'a, S: AsRef<str>>(
     };
     let had_skipped = !skipped_cold.is_empty();
     if had_skipped && annotation_priority {
-        let entries: Vec<(String, Option<String>)> = skipped_cold
-            .into_iter()
-            .map(|cand| (cand.to_string(), Some(midashi.to_string())))
-            .collect();
-        tokio::task::spawn_blocking(move || {
-            crate::system_dict::prewarm_entries(&entries);
-        });
+        let midashi_owned = midashi.to_string();
+        crate::system_dict::enqueue_prewarm(
+            skipped_cold
+                .into_iter()
+                .map(|cand| (cand.to_string(), Some(midashi_owned.clone()))),
+        );
     }
     (ranked, had_skipped)
 }
 
-fn interpret_primary_result(
-    proxy: &Proxy,
+fn interpret_backend_result(
+    backend: &Backend,
     start: Instant,
     res: Result<Vec<u8>, crate::backend::BackendError>,
 ) -> Option<Vec<u8>> {
     match res {
         Ok(response) if is_found(&response) => {
             debug!(
-                backend = %proxy.primary.name,
+                backend = %backend.name,
                 elapsed_ms = start.elapsed().as_millis(),
                 "hit"
             );
@@ -910,7 +1341,7 @@ fn interpret_primary_result(
         }
         Ok(_) => {
             debug!(
-                backend = %proxy.primary.name,
+                backend = %backend.name,
                 elapsed_ms = start.elapsed().as_millis(),
                 "miss, trying fallback"
             );
@@ -918,148 +1349,188 @@ fn interpret_primary_result(
         }
         Err(err) => {
             warn!(
-                backend = %proxy.primary.name,
+                backend = %backend.name,
                 error = %err,
                 elapsed_ms = start.elapsed().as_millis(),
-                "primary failed, trying fallback"
+                "first backend failed, trying fallback"
             );
             None
         }
     }
 }
 
-fn finalize_fallback_result(
-    proxy: &Proxy,
+fn finalize_second_result(
+    backend: &Backend,
     start: Instant,
     result: Result<Vec<u8>, crate::backend::BackendError>,
-) -> (Vec<u8>, BackendHit) {
+) -> (Vec<u8>, OrderedHit) {
     match result {
         Ok(response) => {
             let hit = if is_found(&response) {
                 debug!(
-                    backend = %proxy.fallback.name,
+                    backend = %backend.name,
                     elapsed_ms = start.elapsed().as_millis(),
                     "hit"
                 );
-                BackendHit::Fallback
+                OrderedHit::Second
             } else {
                 debug!(
-                    backend = %proxy.fallback.name,
+                    backend = %backend.name,
                     elapsed_ms = start.elapsed().as_millis(),
                     "miss"
                 );
-                BackendHit::None
+                OrderedHit::None
             };
             (response, hit)
         }
         Err(err) => {
             warn!(
-                backend = %proxy.fallback.name,
+                backend = %backend.name,
                 error = %err,
                 elapsed_ms = start.elapsed().as_millis(),
-                "fallback failed"
+                "fallback backend failed"
             );
-            (b"4\n".to_vec(), BackendHit::None)
+            (b"4\n".to_vec(), OrderedHit::None)
         }
     }
 }
 
-/// Primary（azooKey）を先に照会し、ミス時に Fallback（yaskkserv2）を照会する。
-/// Primary が 200ms を超えて遅延した場合は Fallback へのヘッジ照会を並列起動して、
-/// 全体デッドライン（850ms）内で初回変換失敗を防止し、macSKK の 1.0 秒制限を超えないようにする。
-/// 戻り値として (レスポンスバイト列, ヒットしたバックエンド) を返す。
-async fn lookup_with_fallback(
-    proxy: &Proxy,
+/// `first` バックエンドを先に照会し、ミス時に `second` バックエンドを照会する汎用ヘルパー。
+/// `first` が 200ms を超えて遅延した場合は `second` へのヘッジ照会を並列起動し、
+/// 全体デッドライン（850ms）内で初回変換失敗を防止する。
+async fn lookup_ordered(
+    first: &Backend,
+    second: &Backend,
     request: &Request<'_>,
     start: Instant,
     overall_deadline: Duration,
-) -> (Vec<u8>, BackendHit) {
+) -> (Vec<u8>, OrderedHit) {
     let remaining_overall = overall_deadline.saturating_sub(start.elapsed());
     if remaining_overall.is_zero() {
         debug!("overall deadline reached before lookup, returning not found immediately");
-        return (b"4\n".to_vec(), BackendHit::None);
+        return (b"4\n".to_vec(), OrderedHit::None);
     }
 
-    let primary_timeout = proxy.primary.timeout.min(remaining_overall);
+    let first_timeout = first.timeout.min(remaining_overall);
 
-    if !primary_timeout.is_zero() {
-        let mut primary_fut =
-            std::pin::pin!(proxy.primary.query_with_timeout(request, primary_timeout));
+    if !first_timeout.is_zero() {
+        let mut first_fut = std::pin::pin!(first.query_with_timeout(request, first_timeout));
 
         let hedge_fired = if remaining_overall > PRIMARY_HEDGE_DELAY
-            && primary_timeout > PRIMARY_HEDGE_DELAY
+            && first_timeout > PRIMARY_HEDGE_DELAY
         {
             tokio::select! {
-                res = &mut primary_fut => {
-                    if let Some(resp) = interpret_primary_result(proxy, start, res) {
-                        return (resp, BackendHit::Primary);
+                res = &mut first_fut => {
+                    if let Some(resp) = interpret_backend_result(first, start, res) {
+                        return (resp, OrderedHit::First);
                     }
                     false
                 }
                 _ = tokio::time::sleep(PRIMARY_HEDGE_DELAY) => true,
             }
         } else {
-            if let Some(resp) = interpret_primary_result(proxy, start, primary_fut.as_mut().await) {
-                return (resp, BackendHit::Primary);
+            if let Some(resp) = interpret_backend_result(first, start, first_fut.as_mut().await) {
+                return (resp, OrderedHit::First);
             }
             false
         };
 
         if hedge_fired {
-            let fb_timeout = proxy
-                .fallback
+            let second_timeout = second
                 .timeout
                 .min(overall_deadline.saturating_sub(start.elapsed()));
-            if !fb_timeout.is_zero() {
+            if !second_timeout.is_zero() {
                 debug!(
+                    backend = %first.name,
+                    fallback = %second.name,
                     elapsed_ms = start.elapsed().as_millis(),
-                    fb_timeout_ms = fb_timeout.as_millis(),
-                    "primary slow, starting hedged fallback query"
+                    second_timeout_ms = second_timeout.as_millis(),
+                    "first backend slow, starting hedged fallback query"
                 );
-                let mut fallback_fut =
-                    std::pin::pin!(proxy.fallback.query_with_timeout(request, fb_timeout));
-                let mut fb_opt: Option<Result<Vec<u8>, crate::backend::BackendError>> = None;
+                let mut second_fut =
+                    std::pin::pin!(second.query_with_timeout(request, second_timeout));
+                let mut second_opt: Option<Result<Vec<u8>, crate::backend::BackendError>> = None;
 
-                let primary_res = loop {
-                    if fb_opt.is_none() {
+                let first_res = loop {
+                    if second_opt.is_none() {
                         tokio::select! {
-                            res = &mut primary_fut => break res,
-                            fb_res = &mut fallback_fut => fb_opt = Some(fb_res),
+                            res = &mut first_fut => break res,
+                            fb_res = &mut second_fut => second_opt = Some(fb_res),
                         }
                     } else {
-                        break primary_fut.as_mut().await;
+                        break first_fut.as_mut().await;
                     }
                 };
 
-                if let Some(resp) = interpret_primary_result(proxy, start, primary_res) {
-                    return (resp, BackendHit::Primary);
+                if let Some(resp) = interpret_backend_result(first, start, first_res) {
+                    return (resp, OrderedHit::First);
                 }
-                let fallback_res = match fb_opt {
+                let second_res = match second_opt {
                     Some(res) => res,
-                    None => fallback_fut.await,
+                    None => second_fut.await,
                 };
-                return finalize_fallback_result(proxy, start, fallback_res);
+                return finalize_second_result(second, start, second_res);
             }
-            if let Some(resp) = interpret_primary_result(proxy, start, primary_fut.as_mut().await) {
-                return (resp, BackendHit::Primary);
+            if let Some(resp) = interpret_backend_result(first, start, first_fut.as_mut().await) {
+                return (resp, OrderedHit::First);
             }
         }
     }
 
-    let fallback_timeout = proxy
-        .fallback
+    let second_timeout = second
         .timeout
         .min(overall_deadline.saturating_sub(start.elapsed()));
-    if fallback_timeout.is_zero() {
+    if second_timeout.is_zero() {
         debug!("overall deadline reached before fallback, returning not found immediately");
-        return (b"4\n".to_vec(), BackendHit::None);
+        return (b"4\n".to_vec(), OrderedHit::None);
     }
 
-    let fallback_res = proxy
-        .fallback
-        .query_with_timeout(request, fallback_timeout)
-        .await;
-    finalize_fallback_result(proxy, start, fallback_res)
+    let second_res = second.query_with_timeout(request, second_timeout).await;
+    finalize_second_result(second, start, second_res)
+}
+
+async fn lookup_azookey_first(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, BackendHit) {
+    let (resp, ordered_hit) = lookup_ordered(
+        &proxy.azookey,
+        &proxy.yaskkserv2,
+        request,
+        start,
+        overall_deadline,
+    )
+    .await;
+    let hit = match ordered_hit {
+        OrderedHit::First => BackendHit::Azookey,
+        OrderedHit::Second => BackendHit::Yaskkserv2,
+        OrderedHit::None => BackendHit::None,
+    };
+    (resp, hit)
+}
+
+async fn lookup_yaskkserv2_first(
+    proxy: &Proxy,
+    request: &Request<'_>,
+    start: Instant,
+    overall_deadline: Duration,
+) -> (Vec<u8>, BackendHit) {
+    let (resp, ordered_hit) = lookup_ordered(
+        &proxy.yaskkserv2,
+        &proxy.azookey,
+        request,
+        start,
+        overall_deadline,
+    )
+    .await;
+    let hit = match ordered_hit {
+        OrderedHit::First => BackendHit::Yaskkserv2,
+        OrderedHit::Second => BackendHit::Azookey,
+        OrderedHit::None => BackendHit::None,
+    };
+    (resp, hit)
 }
 
 /// 文字列にCJK漢字が含まれているかを判定する。

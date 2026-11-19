@@ -1,19 +1,21 @@
+use std::borrow::Borrow;
 use std::collections::{HashMap, VecDeque};
-use std::sync::RwLock;
+use std::hash::{Hash, Hasher};
+use std::sync::{Arc, RwLock};
 
 /// 変換レスポンスのキャッシュエントリ
 #[derive(Debug, Clone)]
 pub struct CachedLookup {
     /// クライアントへ送信する完全なレスポンスバイト列（例: `1/切/着/伐/\n`）
-    pub response: Vec<u8>,
+    pub response: Arc<[u8]>,
     /// 直前確定文脈追跡用の第1候補（存在する場合）
-    pub top_candidate: Option<String>,
+    pub top_candidate: Option<Arc<str>>,
 }
 
 /// 変換キャッシュのキー
 /// 文脈連動候補昇格が有効な場合、直前確定単語によって候補順が変わるため
 /// `(context, midashi)` のペアをキーとする。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupKey {
     pub context: Option<String>,
     pub midashi: String,
@@ -29,16 +31,65 @@ impl LookupKey {
     }
 }
 
+/// キャッシュ検索時に `String` をヒープ確保せず `(Option<&str>, &str)` で照合するためのトレイト
+trait LookupKeyRef {
+    fn key_pair(&self) -> (Option<&str>, &str);
+}
+
+impl LookupKeyRef for LookupKey {
+    #[inline]
+    fn key_pair(&self) -> (Option<&str>, &str) {
+        (self.context.as_deref(), self.midashi.as_str())
+    }
+}
+
+impl LookupKeyRef for (Option<&str>, &str) {
+    #[inline]
+    fn key_pair(&self) -> (Option<&str>, &str) {
+        (self.0, self.1)
+    }
+}
+
+impl PartialEq for dyn LookupKeyRef + '_ {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.key_pair() == other.key_pair()
+    }
+}
+
+impl Eq for dyn LookupKeyRef + '_ {}
+
+impl Hash for dyn LookupKeyRef + '_ {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_pair().hash(state);
+    }
+}
+
+impl Hash for LookupKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key_pair().hash(state);
+    }
+}
+
+impl<'a> Borrow<dyn LookupKeyRef + 'a> for Arc<LookupKey> {
+    #[inline]
+    fn borrow(&self) -> &(dyn LookupKeyRef + 'a) {
+        self.as_ref()
+    }
+}
+
 /// スレッドセーフかつ高スループットなバウンデッド（容量制限付き）Lookup キャッシュ。
-/// 読み取り時は read ロックのみを取得し、ナノ秒オーダーでキャッシュヒットを返却する。
+/// 読み取り時は read ロックのみを取得し、借用キー照合と `Arc` 共有でヒープ確保ゼロの応答を行う。
 pub struct LookupCache {
     capacity: usize,
     inner: RwLock<CacheInner>,
 }
 
 struct CacheInner {
-    map: HashMap<LookupKey, CachedLookup>,
-    order: VecDeque<LookupKey>,
+    map: HashMap<Arc<LookupKey>, CachedLookup>,
+    order: VecDeque<Arc<LookupKey>>,
 }
 
 impl LookupCache {
@@ -54,17 +105,28 @@ impl LookupCache {
         }
     }
 
+    /// 借用スライスのみでキャッシュエントリを取得する（完全ゼロアロケーション読み取りパス）
+    pub fn get_by_ref(&self, context: Option<&str>, midashi: &str) -> Option<CachedLookup> {
+        let guard = self.inner.read().ok()?;
+        let key_ref: &(dyn LookupKeyRef + '_) = &(context, midashi);
+        guard.map.get(key_ref).cloned()
+    }
+
     /// キャッシュからエントリを取得する（高速読み取りパス）
     pub fn get(&self, key: &LookupKey) -> Option<CachedLookup> {
-        let guard = self.inner.read().ok()?;
-        guard.map.get(key).cloned()
+        self.get_by_ref(key.context.as_deref(), &key.midashi)
     }
 
     /// キャッシュにエントリを挿入する
     pub fn insert(&self, key: LookupKey, value: CachedLookup) {
+        if self.capacity == 0 {
+            return;
+        }
         if let Ok(mut guard) = self.inner.write() {
-            if let std::collections::hash_map::Entry::Occupied(mut e) = guard.map.entry(key.clone()) {
-                e.insert(value);
+            let key_ref: &(dyn LookupKeyRef + '_) =
+                &(key.context.as_deref(), key.midashi.as_str());
+            if let Some(existing) = guard.map.get_mut(key_ref) {
+                *existing = value;
                 return;
             }
 
@@ -74,8 +136,9 @@ impl LookupCache {
                 guard.map.remove(&oldest);
             }
 
-            guard.order.push_back(key.clone());
-            guard.map.insert(key, value);
+            let arc_key = Arc::new(key);
+            guard.order.push_back(Arc::clone(&arc_key));
+            guard.map.insert(arc_key, value);
         }
     }
 
@@ -113,14 +176,14 @@ mod tests {
 
         let k1 = LookupKey::new(None, "きr");
         let v1 = CachedLookup {
-            response: "1/切/着/\n".as_bytes().to_vec(),
-            top_candidate: Some("切".into()),
+            response: Arc::from("1/切/着/\n".as_bytes()),
+            top_candidate: Some(Arc::from("切")),
         };
 
         let k2 = LookupKey::new(Some("服"), "きr");
         let v2 = CachedLookup {
-            response: "1/着/切/\n".as_bytes().to_vec(),
-            top_candidate: Some("着".into()),
+            response: Arc::from("1/着/切/\n".as_bytes()),
+            top_candidate: Some(Arc::from("着")),
         };
 
         cache.insert(k1.clone(), v1.clone());
@@ -128,6 +191,22 @@ mod tests {
 
         assert_eq!(cache.get(&k1).unwrap().top_candidate.as_deref(), Some("切"));
         assert_eq!(cache.get(&k2).unwrap().top_candidate.as_deref(), Some("着"));
+        assert_eq!(
+            cache.get_by_ref(Some("服"), "きr").unwrap().response.as_ref(),
+            "1/着/切/\n".as_bytes()
+        );
+
+        // 既存キー更新でエントリ数が増えないこと
+        let v2_updated = CachedLookup {
+            response: Arc::from("1/着/切/伐/\n".as_bytes()),
+            top_candidate: Some(Arc::from("着")),
+        };
+        cache.insert(k2.clone(), v2_updated);
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache.get_by_ref(Some("服"), "きr").unwrap().response.as_ref(),
+            "1/着/切/伐/\n".as_bytes()
+        );
 
         // 容量超過テスト（3件目、4件目追加で最古の k1 が追い出される）
         let k3 = LookupKey::new(None, "にほん");
@@ -144,5 +223,11 @@ mod tests {
         cache.clear();
         assert_eq!(cache.len(), 0);
         assert!(cache.get(&k2).is_none());
+
+        // capacity == 0 では挿入されないこと
+        let zero_cache = LookupCache::new(0);
+        zero_cache.insert(k1.clone(), v1);
+        assert_eq!(zero_cache.len(), 0);
+        assert!(zero_cache.get(&k1).is_none());
     }
 }

@@ -10,8 +10,8 @@
 - **バイナリ / クレート名**: `ruskkserv`
 - **リポジトリ**: [GitHub: takahasee/RuSKKserv](https://github.com/takahasee/RuSKKserv)
 - **目的**: macSKK 向けの高速・インテリジェントな skkserv プロキシサーバー。
-  - **Primary**: `azoo-key-skkserv` (`127.0.0.1:1180`, EUC-JP request / UTF-8 response)
-  - **Fallback**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, Google Suggest 連携)
+  - **Primary (デフォルト / `--backend-order=yaskkserv2-first`)**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, Google Suggest 連携)
+  - **Fallback (`--backend-order=azookey-first` 指定時は Primary へ切替可能)**: `azoo-key-skkserv` (`127.0.0.1:1180`, EUC-JP request / UTF-8 response)
   - **Listen**: `127.0.0.1:1178` (UTF-8)
 
 ---
@@ -151,6 +151,15 @@
   2. **並列ヘッジフォールバックと Google Suggest キャッシュ**: `--yaskkserv2-timeout-ms` デフォルトを `700` → `850` に拡張し、Primary が `200ms` (`PRIMARY_HEDGE_DELAY`) を超えて応答しない場合は Fallback を並列ヘッジ起動（ヒット優先順位は Primary 維持）。さらに `launchd/com.ruskkserv.yaskkserv2.plist` に `--google-cache-filename`（デフォルト `~/Library/Caches/ruskkserv/yaskkserv2-google.cache`）を設定し、再インストール時に `pkill -x yaskkserv2` で旧デーモンを停止。
   3. **失効プール一括破棄リカバリ (`Backend`)**: プール由来の再利用接続がエラー・EOF となった場合は `clear_pool()` で残りの失効接続を全破棄し、リトライ時は必ず `connect_fresh()` で新規接続を行う。
 
+### ⑭ セキュリティ強化・最適化および参照順変更 (v0.3.0)
+- **バックエンド参照順の変更と切替スイッチ (`src/config.rs`, `src/proxy.rs`, `launchd/`)**:
+  - デフォルト参照順を `BackendOrder::Yaskkserv2First`（`yaskkserv2` 先 → ミス・失敗時 `azoo-key-skkserv`、200ms 超過時はヘッジ並列起動）へ変更し、`--backend-order=azookey-first` / `RUSKKSERV_BACKEND_ORDER=azookey-first` で従来順へ即座に戻せる構成とした。補完 (`opcode 4`) も同一参照順へ統一（接頭語・接尾語は `yaskkserv2` 先、ミス時 `>` 除去して `azoo-key-skkserv` を維持）。
+  - `yaskkserv2` 優先時も送りあり角括弧ブロック（`contains_okuri_bracket_block` で単体記号 `[` / `]` と区別）を展開し、文脈共起・頻度・システム辞書優先で整列する。`okuri_key_to_dict_suffixes` に `'t'`→`["う", "る"]`、`'k'`→`["い"]` を追加し、フォールバック先の `azoo-key-skkserv` でも送りあり展開・送りなし断片判定を維持。
+- **セキュリティ・堅牢性強化 (`launchd/`, `scripts/`, `src/`)**:
+  - `yaskkserv2` plist に `--listen-address 127.0.0.1 --no-daemonize` を追加し全 I/F 公開と 10 秒リスポーンループを解消。本番 `RUST_LOG` 既定を `info` 化し入力本文ログは `trace!` + `?` エスケープに変更、`LOG_DIR` (`0700`)・ログと seed ファイル (`0600` アトミック保存 `save()`)・`/usr/bin/pkill -u <uid>`・`escape_plist_sed`・同時接続上限 `64` / 無通信タイムアウト `600s`・リクエストスマグリング拒否 & `BufReader` 余剰バイト破棄・`saturating_*` を導入。
+- **パフォーマンス／冗長処理削減**:
+  - 送りあり並列＋`yaskkserv2` 並列マージ、`DEFAULT_MAX_POOL_SIZE = 12`、`LookupCache` 借用キー照合 (`LookupKeyRef`) & `Arc` 共有、`SystemDictCache` FIFO 退去・単一 `read`・`block_in_place`・単一有界 prewarm ワーカー (`enqueue_prewarm`)、`decode_euc_response_to_utf8`・`encode_euc_jp_cow`・ハイブリッド $O(N)$ 重複排除を適用。
+
 ---
 
 ## 3. LaunchAgent 運用仕様
@@ -175,7 +184,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全72件合格）
+cargo test             # ユニットテスト & 結合テスト（全82件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

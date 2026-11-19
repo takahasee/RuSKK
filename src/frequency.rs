@@ -1,10 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use std::sync::RwLock;
 use tracing::debug;
 
 /// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
@@ -41,6 +40,16 @@ impl FrequencyPredictor {
         predictor
     }
 
+    /// ファイル読み込みやエイリアス展開を行わずに、保存先パスだけを設定した空のインスタンスを生成する。
+    /// `init-seed` や `import-user-dict` など、直後に生データ読込・上書きを行う CLI サブコマンド用。
+    pub fn new_unloaded(storage_path: Option<PathBuf>) -> Self {
+        Self {
+            frequencies: HashMap::new(),
+            context_frequencies: HashMap::new(),
+            storage_path,
+        }
+    }
+
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
         if !path.as_ref().exists() {
             return Ok(());
@@ -71,12 +80,51 @@ impl FrequencyPredictor {
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
         if let Some(ref path) = self.storage_path {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
+            let parent = match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p,
+                _ => Path::new("."),
+            };
+            fs::create_dir_all(parent)?;
+
             let data = serde_json::to_string_pretty(&self)?;
-            fs::write(path, data)?;
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("ruskkserv-frequency.json");
+            let pid = std::process::id();
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp_path = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+
+            let write_result = (|| -> anyhow::Result<()> {
+                let mut file = opts.open(&tmp_path)?;
+                file.write_all(data.as_bytes())?;
+                file.sync_all()?;
+                Ok(())
+            })();
+
+            if let Err(err) = write_result {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err);
+            }
+
+            if let Err(err) = fs::rename(&tmp_path, path) {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(err.into());
+            }
         }
         Ok(())
     }
@@ -137,7 +185,7 @@ impl FrequencyPredictor {
     }
 
     /// macSKK などのユーザー辞書 (skk-jisyo.utf8) をパースし、
-    /// 候補の順番に応じたスコアを frequencies にインポート（加算）する。
+    /// 候補の順番に応じたスコアを frequencies にインポート（最大値で冪等更新）する。
     /// 送りありブロック（例: `きr /[る/着/切/伐/]/[り/切/]/`）も正確にパースし、
     /// `"[る"` や `"]"` などの不要記号の混入を完全に防止する。
     /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
@@ -323,8 +371,12 @@ impl FrequencyPredictor {
         const ANNOTATION_BONUS: u64 = 100;
         const OKURI_NASHI_CLEAN_BONUS: u64 = 20;
 
-        let is_okuri = effective_annotation_priority
-            && crate::okuri::parse_okuri_midashi_extended(midashi).is_some();
+        let parsed_okuri = if effective_annotation_priority {
+            crate::okuri::parse_okuri_midashi_extended(midashi)
+        } else {
+            None
+        };
+        let is_okuri = parsed_okuri.is_some();
 
         let mut skipped_cold: Vec<&'a str> = Vec::new();
         let mut indexed_cands: Vec<(usize, &'a str, u64)> = Vec::with_capacity(candidates.len());
@@ -344,12 +396,13 @@ impl FrequencyPredictor {
                 // 上位12件かつ ffi_deadline 内のみ未キャッシュ時のシステム辞書 FFI 照会を許可し、
                 // 13件目以降または予算超過時はキャッシュヒットのみ採用して応答タイムアウトを防止する
                 let within_index_cap = idx < 12;
-                let (in_dict, cold_skipped) = crate::system_dict::is_annotated_or_in_dict_budgeted(
-                    cand,
-                    Some(midashi),
-                    within_index_cap,
-                    ffi_deadline,
-                );
+                let (in_dict, cold_skipped) =
+                    crate::system_dict::is_annotated_or_in_dict_parsed_budgeted(
+                        cand,
+                        parsed_okuri.as_ref(),
+                        within_index_cap,
+                        ffi_deadline,
+                    );
                 if within_index_cap && cold_skipped {
                     skipped_cold.push(cand);
                 }
@@ -366,7 +419,9 @@ impl FrequencyPredictor {
                 0
             };
 
-            let total_score = annotation_score + global_count + context_score * 10;
+            let total_score = annotation_score
+                .saturating_add(global_count)
+                .saturating_add(context_score.saturating_mul(10));
             indexed_cands.push((idx, cand, total_score));
         }
 
@@ -452,16 +507,14 @@ fn expand_context_map_aliases(ctx_map: &mut HashMap<String, HashMap<String, u64>
     }
 
     // 2. キー側のエイリアス展開: "切る" があれば語幹 "切" でも参照できるようにする
-    let aliases: Vec<(String, HashMap<String, u64>)> = ctx_map
-        .iter()
-        .flat_map(|(k, v)| {
-            okuri_stem_aliases(k)
-                .into_iter()
-                .filter(|&stem| !ctx_map.contains_key(stem))
-                .map(|stem| (stem.to_string(), v.clone()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    let mut aliases: Vec<(String, HashMap<String, u64>)> = Vec::new();
+    for (k, v) in ctx_map.iter() {
+        for stem in okuri_stem_aliases(k) {
+            if !ctx_map.contains_key(stem) {
+                aliases.push((stem.to_string(), v.clone()));
+            }
+        }
+    }
 
     for (alias_key, alias_map) in aliases {
         let entry = ctx_map.entry(alias_key).or_default();
@@ -539,10 +592,11 @@ pub fn is_unverified_okuri_fragment(cand_clean: &str) -> bool {
 /// SKK 辞書エントリの候補部分（`/[る/着/切/伐/]/[り/切/]/` や `/変換/返還/`）から、
 /// 送り仮名ブロック `[...]` や注釈 `;...` を解析し、純粋な候補文字列のリストを返す。
 pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut seen: Option<HashSet<&str>> = None;
     let trimmed = cands_part.trim_matches('/');
     if trimmed.is_empty() {
-        return candidates;
+        return Vec::new();
     }
 
     let mut in_bracket = false;
@@ -566,9 +620,7 @@ pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
             is_first_in_bracket = false;
         } else if !p.is_empty() {
             let cand_text = clean_candidate(p);
-            if !cand_text.is_empty() && !candidates.iter().any(|c| c == cand_text) {
-                candidates.push(cand_text.to_string());
-            }
+            crate::encoding::push_unique_str(&mut candidates, &mut seen, cand_text);
         }
 
         if ends_bracket {
@@ -576,7 +628,7 @@ pub fn parse_dict_line_candidates(cands_part: &str) -> Vec<String> {
         }
     }
 
-    candidates
+    candidates.into_iter().map(|s| s.to_string()).collect()
 }
 
 pub type SharedPredictor = Arc<RwLock<FrequencyPredictor>>;
@@ -1097,5 +1149,43 @@ mod tests {
         assert!(skipped.contains(&cold_a));
         assert!(skipped.contains(&cold_b));
         assert!(!skipped.contains(&"時間"));
+    }
+
+    #[test]
+    fn test_atomic_save_permissions_and_saturating_score_overflow() {
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("freq.json");
+
+        let mut predictor = FrequencyPredictor::new_unloaded(Some(path.clone()));
+        predictor.frequencies.insert("てすと".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("テスト".to_string(), u64::MAX);
+            m
+        });
+        predictor.context_frequencies.insert("文脈".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("テスト".to_string(), u64::MAX);
+            m
+        });
+        predictor.save().unwrap();
+
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        // u64::MAX のスコアや context_score * 10 でもオーバーフローパニックしないこと
+        let ranked = predictor.rank_candidates_borrowed(
+            &["文脈"],
+            "てすと",
+            &["他候補", "テスト"],
+            true,
+        );
+        assert_eq!(ranked[0], "テスト");
     }
 }

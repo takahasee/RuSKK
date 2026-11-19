@@ -7,6 +7,9 @@
     <key>ProgramArguments</key>
     <array>
         <string>@YASKKSERV2_BIN@</string>
+        <string>--no-daemonize</string>
+        <string>--listen-address</string>
+        <string>127.0.0.1</string>
         <string>--port</string>
         <string>1179</string>
         <string>--google-suggest</string>

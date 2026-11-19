@@ -1,5 +1,6 @@
 use encoding_rs::EUC_JP;
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 /// UTF-8 として解釈した文字列が、実際には EUC-JP の 2 バイト漢字（第 1 バイト `0xC2..=0xDF`, 第 2 バイト `0xA1..=0xBF`:
 /// 例: 「的」`0xC5 0xAA`, 「中」`0xC3 0xBE`, 「比」`0xC8 0xBE` 等）が 2 バイト UTF-8（`U+0080..=U+07FF` のラテン拡張文字等）に
@@ -23,10 +24,15 @@ pub fn decode_euc_or_utf8(bytes: &[u8]) -> Cow<'_, str> {
     cow
 }
 
+/// Encode a UTF-8 string to EUC-JP bytes without extra allocation when ASCII.
+pub fn encode_euc_jp_cow(text: &str) -> Cow<'_, [u8]> {
+    let (cow, _, _) = EUC_JP.encode(text);
+    cow
+}
+
 /// Encode a UTF-8 string to EUC-JP bytes. Unmappable chars are replaced.
 pub fn encode_euc_jp(text: &str) -> Vec<u8> {
-    let (cow, _, _) = EUC_JP.encode(text);
-    cow.into_owned()
+    encode_euc_jp_cow(text).into_owned()
 }
 
 /// Convert an skkserv response body from EUC-JP to UTF-8 bytes.
@@ -45,7 +51,27 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
     // EUC-JP のマルチバイトコード (0xA1..=0xFE) は ASCII 記号 (0x00..=0x7F: '/', '1', '4', '\n') と
     // バイト値が衝突しないため、一括デコードするだけで区切り文字を完全に維持した UTF-8 バイト列が得られる。
     let (cow, _, _) = EUC_JP.decode(response);
-    cow.as_bytes().to_vec()
+    match cow {
+        Cow::Borrowed(s) => s.as_bytes().to_vec(),
+        Cow::Owned(s) => s.into_bytes(),
+    }
+}
+
+/// EUC-JP 専用バックエンド（yaskkserv2 等）のレスポンスを UTF-8 へ変換する。
+/// ASCII のみの場合は SIMD 最適化された `is_ascii()` 判定のみで即返却し、
+/// `from_utf8` / `is_genuine_utf8` の走査と所有権変換時の二重コピーを回避する。
+pub fn decode_euc_response_to_utf8(response: &[u8]) -> Vec<u8> {
+    if response.is_empty() {
+        return Vec::new();
+    }
+    if response.is_ascii() {
+        return response.to_vec();
+    }
+    let (cow, _, _) = EUC_JP.decode(response);
+    match cow {
+        Cow::Borrowed(s) => s.as_bytes().to_vec(),
+        Cow::Owned(s) => s.into_bytes(),
+    }
 }
 
 /// レスポンスバイト列から第1候補（最初の / と / の間）をゼロアロケーションで抽出
@@ -88,6 +114,23 @@ pub fn contains_bracket_block(response: &[u8]) -> bool {
     memchr::memchr2(b'[', b']', response).is_some()
 }
 
+/// 本物の SKK 送り仮名角括弧ブロック（例: `/[れ/切/]/`, `/[っ/思/]/`）が含まれているかを判定する。
+/// `1/「/」/[/]/\n` のような単体記号候補の `[` / `]` と区別するため、
+/// `/[` の直後に `/`・`\n`・`]` 以外のバイトが 1 バイト以上続く場合のみ true を返す。
+#[inline]
+pub fn contains_okuri_bracket_block(response: &[u8]) -> bool {
+    for idx in memchr::memchr_iter(b'[', response) {
+        if idx > 0
+            && response[idx - 1] == b'/'
+            && let Some(&next) = response.get(idx + 1)
+            && !matches!(next, b'/' | b'\n' | b']')
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// レスポンスバイト列から借用スライスの候補リスト（ゼロコピー）を抽出
 /// NEON 128-bit SIMD (`memchr_iter`) によりスラッシュ区切りを一括高速走査する。
 #[inline]
@@ -101,9 +144,7 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     for slash_idx in memchr::memchr_iter(b'/', body) {
         if slash_idx > prev {
             let part = &body[prev..slash_idx];
-            if !part.is_empty()
-                && let Ok(s) = std::str::from_utf8(part)
-            {
+            if let Ok(s) = std::str::from_utf8(part) {
                 cands.push(s);
             }
         }
@@ -111,9 +152,7 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
     }
     if prev < body.len() {
         let part = &body[prev..];
-        if !part.is_empty()
-            && let Ok(s) = std::str::from_utf8(part)
-        {
+        if let Ok(s) = std::str::from_utf8(part) {
             cands.push(s);
         }
     }
@@ -143,8 +182,38 @@ pub fn parse_candidates_unpacked_borrowed(response: &[u8]) -> Vec<&str> {
     }
 }
 
+/// 16 件までは軽量な線形探索、16 件超で `HashSet` を遅延構築して重複排除を行うヘルパー。
+pub(crate) fn push_unique_str<'a>(
+    cands: &mut Vec<&'a str>,
+    seen: &mut Option<HashSet<&'a str>>,
+    item: &'a str,
+) {
+    if item.is_empty() {
+        return;
+    }
+    if let Some(set) = seen.as_mut() {
+        if set.insert(item) {
+            cands.push(item);
+        }
+        return;
+    }
+    if cands.contains(&item) {
+        return;
+    }
+    if cands.len() >= 16 {
+        let mut set = HashSet::with_capacity(cands.len() * 2);
+        for &existing in cands.iter() {
+            set.insert(existing);
+        }
+        set.insert(item);
+        *seen = Some(set);
+    }
+    cands.push(item);
+}
+
 fn parse_candidates_from_str_borrowed(body_str: &str) -> Vec<&str> {
     let mut cands = Vec::new();
+    let mut seen = None;
     let mut in_block = false;
 
     for part in body_str.split('/') {
@@ -153,7 +222,7 @@ fn parse_candidates_from_str_borrowed(body_str: &str) -> Vec<&str> {
             continue;
         }
 
-        if part.starts_with('[') {
+        if part.starts_with('[') && part.len() > 1 {
             in_block = true;
             // `[okuri` または `[[okuri` などのヘッダをスキップ
             continue;
@@ -162,15 +231,13 @@ fn parse_candidates_from_str_borrowed(body_str: &str) -> Vec<&str> {
         if in_block {
             if let Some(cand) = part.strip_suffix(']') {
                 let cand = cand.trim();
-                if !cand.is_empty() && !cands.contains(&cand) {
-                    cands.push(cand);
-                }
+                push_unique_str(&mut cands, &mut seen, cand);
                 in_block = false;
-            } else if !part.is_empty() && !cands.contains(&part) {
-                cands.push(part);
+            } else {
+                push_unique_str(&mut cands, &mut seen, part);
             }
-        } else if !part.is_empty() && !cands.contains(&part) {
-            cands.push(part);
+        } else {
+            push_unique_str(&mut cands, &mut seen, part);
         }
     }
     cands
@@ -284,6 +351,22 @@ mod tests {
         let resp3 = "1/来/切/着/\n".as_bytes();
         let unpacked3 = parse_candidates_unpacked(resp3);
         assert_eq!(unpacked3, vec!["来", "切", "着"]);
+
+        // yaskkserv2 の送りあり複数ブロック＋注釈付きレスポンスの展開
+        let resp4 = "1/[れ/切/]/[る/伐;木を伐る/着/斬;人を斬る/\n".as_bytes();
+        assert!(contains_okuri_bracket_block(resp4));
+        assert_eq!(
+            parse_candidates_unpacked_borrowed(resp4),
+            vec!["切", "伐;木を伐る", "着", "斬;人を斬る"]
+        );
+
+        // 単体記号候補としての `[` / `]` は送り仮名ブロックと誤認せず保持すること
+        let resp5 = "1/「/」/[/]/\n".as_bytes();
+        assert!(!contains_okuri_bracket_block(resp5));
+        assert_eq!(
+            parse_candidates_unpacked_borrowed(resp5),
+            vec!["「", "」", "[", "]"]
+        );
     }
 
     #[test]

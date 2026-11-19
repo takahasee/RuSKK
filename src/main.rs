@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
     match args.command {
         Some(ruskkserv::config::Command::ImportUserDict { path, send_reload }) => {
             info!("Importing frequencies from {:?}", path);
-            let mut predictor = FrequencyPredictor::new(history_path);
+            let mut predictor = FrequencyPredictor::new_unloaded(history_path);
             if let Err(e) = predictor.import_from_skk_dict(&path) {
                 tracing::error!("Failed to import from skk dict: {}", e);
                 std::process::exit(1);
@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(ruskkserv::config::Command::InitSeed { force }) => {
-            let mut predictor = FrequencyPredictor::new(history_path.clone());
+            let mut predictor = FrequencyPredictor::new_unloaded(history_path.clone());
             if let Err(e) = predictor.init_seed(force) {
                 tracing::error!("Failed to initialize seed file: {}", e);
                 std::process::exit(1);
@@ -56,6 +56,13 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         None => {}
+    }
+
+    if !args.listen.ip().is_loopback() {
+        tracing::warn!(
+            listen = %args.listen,
+            "skkserv プロトコルには認証・暗号化がないため、ループバック以外への待受公開は非推奨です"
+        );
     }
 
     let mut initial_predictor = FrequencyPredictor::new(history_path.clone());
@@ -76,9 +83,10 @@ async fn main() -> anyhow::Result<()> {
     let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
 
     let proxy = Proxy {
-        listen: args.listen.clone(),
-        primary: args.primary(),
-        fallback: args.fallback(),
+        listen: args.listen.to_string(),
+        azookey: args.azookey(),
+        yaskkserv2: args.yaskkserv2(),
+        backend_order: args.resolved_backend_order(),
         predictor: Arc::clone(&predictor),
         lookup_cache: Arc::clone(&lookup_cache),
         okuri_expansion: args.is_okuri_expansion_enabled(),
@@ -143,12 +151,22 @@ async fn reload_on_sighup(
 }
 
 /// インポート成功後に実行中の ruskkserv プロセスへ SIGHUP を送る。
-/// macOS の pkill コマンドを使用する（`-x` で完全一致、誤送信防止）。
+/// PATH ハイジャックおよび他ユーザープロセス誤送信を防ぐため `/usr/bin/pkill` と `-u <uid> -x` を指定する。
 fn send_sighup_to_ruskkserv() {
-    match std::process::Command::new("pkill")
-        .args(["-HUP", "-x", "ruskkserv"])
-        .status()
+    let mut cmd = std::process::Command::new("/usr/bin/pkill");
+    cmd.arg("-HUP");
+    #[cfg(unix)]
     {
+        unsafe extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: geteuid() はスレッドセーフかつ失敗しない POSIX 関数で実効 UID を返す。
+        let uid = unsafe { geteuid() };
+        cmd.args(["-u", &uid.to_string()]);
+    }
+    cmd.args(["-x", "ruskkserv"]);
+
+    match cmd.status() {
         Ok(status) if status.success() => {
             info!("sent SIGHUP to ruskkserv — predictor hot-reload triggered");
         }

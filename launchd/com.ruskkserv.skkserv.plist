@@ -21,13 +21,15 @@
         <key>YASKKSERV2_PORT</key>
         <string>1179</string>
         <key>RUST_LOG</key>
-        <string>ruskkserv=debug,info</string>
+        <string>@RUSKKSERV_LOG_LEVEL@</string>
         <key>RUSKKSERV_OKURI_EXPANSION</key>
         <string>@RUSKKSERV_OKURI_EXPANSION@</string>
         <key>RUSKKSERV_CONTEXT_RANKING</key>
         <string>@RUSKKSERV_CONTEXT_RANKING@</string>
         <key>RUSKKSERV_ANNOTATION_PRIORITY</key>
         <string>@RUSKKSERV_ANNOTATION_PRIORITY@</string>
+        <key>RUSKKSERV_BACKEND_ORDER</key>
+        <string>@RUSKKSERV_BACKEND_ORDER@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

@@ -2,6 +2,9 @@
 //! MeCab / ChaSen の活用表規則に基づき、SKKの送りキー（アルファベット）から
 //! 終止形・活用形の平仮名を合成し、azooKey から返った候補から語幹（単漢字）を抽出する。
 
+use std::collections::HashSet;
+
+use crate::encoding::push_unique_str;
 use crate::frequency::clean_candidate;
 
 /// 送りキー（アルファベット1文字）から終止形・連用形・下一段（名詞形）などの送り仮名（平仮名）のリストを返す。
@@ -61,9 +64,9 @@ pub fn okuri_key_to_suffixes(key: char) -> &'static [&'static str] {
 /// 口語音便（なきゃ・なくちゃ・った等）を省き、辞書見出し語となる五段終止形・連用形・一段終止形を優先する。
 pub fn okuri_key_to_dict_suffixes(key: char) -> &'static [&'static str] {
     match key.to_ascii_lowercase() {
-        'k' => &["く", "き", "け", "ける"],
+        'k' => &["く", "き", "け", "ける", "い"],
         's' => &["す", "し", "せ", "せる"],
-        't' => &["つ", "ち", "て", "てる"],
+        't' => &["つ", "ち", "て", "てる", "う", "る"],
         'n' => &["ぬ", "に", "ね", "ねる", "ない"],
         'm' => &["む", "み", "め", "める"],
         'r' => &["る", "り", "れ", "れる"],
@@ -639,7 +642,8 @@ pub fn extract_stem_candidates_borrowed<'a>(
     okuri_suffix: &str,
     query_midashi: &str,
 ) -> Vec<&'a str> {
-    let mut stems = Vec::with_capacity(candidates.len() * 2);
+    let mut stems = Vec::with_capacity(candidates.len());
+    let mut seen: Option<HashSet<&'a str>> = None;
     let query_char_count = query_midashi.chars().count();
     let suffix_char_count = okuri_suffix.chars().count();
     let stem_char_count = query_char_count.saturating_sub(suffix_char_count);
@@ -652,8 +656,8 @@ pub fn extract_stem_candidates_borrowed<'a>(
 
         // 1. 送り仮名（例: "き", "く"）を剥がした語幹（例: "交ぜ書き" -> "交ぜ書", "書く" -> "書"）を抽出
         if let Some(stem) = clean.strip_suffix(okuri_suffix) {
-            if is_valid_stem(stem, stem_char_count) && !stems.contains(&stem) {
-                stems.push(stem);
+            if is_valid_stem(stem, stem_char_count) {
+                push_unique_str(&mut stems, &mut seen, stem);
             }
             continue;
         }
@@ -674,9 +678,8 @@ pub fn extract_stem_candidates_borrowed<'a>(
             && clean_char_count >= 2
             && clean_char_count <= stem_char_count
             && is_valid_stem(clean, stem_char_count)
-            && !stems.contains(&clean)
         {
-            stems.push(clean);
+            push_unique_str(&mut stems, &mut seen, clean);
         }
     }
 

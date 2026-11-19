@@ -2,11 +2,12 @@
 //! CoreServices の DictionaryServices API (DCSCopyTextDefinition) を呼び出し、
 //! 国語辞典に項目が存在する単語、および SKK 注釈付き単語を判定して高速にキャッシュする。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, TryLockError};
 
 use crate::frequency::clean_candidate;
+use crate::okuri::{OkuriMidashi, parse_okuri_midashi_extended};
 
 /// CoreServices DictionaryServices の初回ロード（最大 ~600ms）が完了したかを記録するフラグ。
 static FFI_WARMED: AtomicBool = AtomicBool::new(false);
@@ -119,6 +120,21 @@ fn try_acquire_ffi_lock(
     }
 }
 
+/// マルチスレッド Tokio ランタイム上の場合のみ `block_in_place` で囲み、
+/// 非同期ワーカースレッドが同期 FFI / mutex 待機でブロックされないようにする。
+#[inline]
+fn run_sync_ffi<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// 予算期限内に FFI ロックを取得できた場合のみ macOS システム辞書を照会する。
 /// ロック待機で期限超過した場合は `None` を返し、キャッシュ未登録のままスキップを通知する。
 #[cfg(target_os = "macos")]
@@ -129,8 +145,10 @@ fn query_system_dict_definition_budgeted(
     if word.is_empty() {
         return Some(false);
     }
-    let _guard = try_acquire_ffi_lock(ffi_deadline)?;
-    Some(query_system_dict_definition_locked(word))
+    run_sync_ffi(|| {
+        let _guard = try_acquire_ffi_lock(ffi_deadline)?;
+        Some(query_system_dict_definition_locked(word))
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -265,9 +283,50 @@ fn matches_dict_headword(word: &str, def_text: &str) -> bool {
             || word.starts_with(&head_prefix))
 }
 
+#[inline]
+fn needs_bracket_normalization(entry: &str) -> bool {
+    entry.chars().any(|c| {
+        matches!(
+            c,
+            '（' | '(' | '〔' | '[' | '）' | ')' | '〕' | ']' | '‐' | '-' | '・' | ' ' | '　'
+        )
+    })
+}
+
+/// 短い方の文字列が長い方の文字列の順序付き文字部分列であり、
+/// かつ追加で出現する差分文字がすべて平仮名（中間送り仮名の省略差）であるか判定する。
+fn is_okurigana_variant_subsequence(a: &str, b: &str, a_count: usize, b_count: usize) -> bool {
+    let (shorter, longer) = if a_count <= b_count { (a, b) } else { (b, a) };
+    let mut short_iter = shorter.chars().peekable();
+    for lc in longer.chars() {
+        if short_iter.peek() == Some(&lc) {
+            short_iter.next();
+        } else if !('\u{3041}'..='\u{3096}').contains(&lc) {
+            return false;
+        }
+    }
+    short_iter.peek().is_none()
+}
+
+/// 3文字以上の複合語における中間送り仮名省略の許容判定
+#[inline]
+fn matches_compound_okuri_variant(word: &str, candidate_form: &str) -> bool {
+    let word_count = word.chars().count();
+    let form_count = candidate_form.chars().count();
+    word_count >= 3
+        && form_count >= 3
+        && word.chars().next() == candidate_form.chars().next()
+        && word.chars().last() == candidate_form.chars().last()
+        && is_okurigana_variant_subsequence(word, candidate_form, word_count, form_count)
+}
+
 /// `【...】` 内の個別見出し表記（例: `売（り）上げ`）と `word` を照合する。
 /// 括弧内の送り仮名を「省いた形（売上げ）」「含めた形（売り上げ）」の双方、および3文字以上の複合語の中間送り仮名揺れを許容する。
 fn matches_bracket_entry_variants(word: &str, entry: &str) -> bool {
+    if !needs_bracket_normalization(entry) {
+        return entry == word || matches_compound_okuri_variant(word, entry);
+    }
+
     let mut without_parens = String::with_capacity(entry.len());
     let mut with_parens = String::with_capacity(entry.len());
     let mut depth = 0usize;
@@ -294,18 +353,7 @@ fn matches_bracket_entry_variants(word: &str, entry: &str) -> bool {
         return true;
     }
 
-    // 3文字以上の複合語における中間送り仮名省略の許容（先頭文字と末尾文字が一致する場合のみ）
-    let word_count = word.chars().count();
-    let entry_count = with_parens.chars().count();
-    if word_count >= 3
-        && entry_count >= 3
-        && word.chars().next() == with_parens.chars().next()
-        && word.chars().last() == with_parens.chars().last()
-    {
-        return true;
-    }
-
-    false
+    matches_compound_okuri_variant(word, &with_parens)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -316,17 +364,27 @@ fn query_system_dict_definition_budgeted(
     Some(false)
 }
 
-/// システム辞書判定のインメモリキャッシュ（最大20,000件）
+/// システム辞書判定のインメモリキャッシュ（最大20,000件、FIFO 退去）
 const MAX_CACHE_ENTRIES: usize = 20_000;
+/// バックグラウンド事前登録キューの上限件数
+const MAX_PREWARM_QUEUE: usize = 256;
+
+struct SystemDictCacheInner {
+    map: HashMap<Arc<str>, bool>,
+    order: VecDeque<Arc<str>>,
+}
 
 pub struct SystemDictCache {
-    cache: RwLock<HashMap<String, bool>>,
+    cache: RwLock<SystemDictCacheInner>,
 }
 
 impl Default for SystemDictCache {
     fn default() -> Self {
         Self {
-            cache: RwLock::new(HashMap::with_capacity(1024)),
+            cache: RwLock::new(SystemDictCacheInner {
+                map: HashMap::with_capacity(1024),
+                order: VecDeque::with_capacity(1024),
+            }),
         }
     }
 }
@@ -342,7 +400,50 @@ impl SystemDictCache {
             return Some(false);
         }
         let guard = self.cache.read().ok()?;
-        guard.get(word).copied()
+        guard.map.get(word).copied()
+    }
+
+    /// 単語がシステム辞書に存在するか、1 回の read ロック参照＋予算期限制御で判定する。
+    /// キャッシュミス時、`allow_cold_ffi == false` または予算超過で FFI を開始できない場合は `None` を返す。
+    pub(crate) fn lookup_with_budget(
+        &self,
+        word: &str,
+        allow_cold_ffi: bool,
+        ffi_deadline: Option<std::time::Instant>,
+        track_foreground: bool,
+    ) -> Option<bool> {
+        if word.is_empty() {
+            return Some(false);
+        }
+
+        // 読み取りロックで高速参照（ヒット時は 1 回のロック取得で完結）
+        if let Ok(guard) = self.cache.read()
+            && let Some(&res) = guard.map.get(word)
+        {
+            return Some(res);
+        }
+
+        if !allow_cold_ffi || ffi_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return None;
+        }
+
+        let _fg = track_foreground.then(ForegroundWaiterGuard::new);
+        let res = query_system_dict_definition_budgeted(word, ffi_deadline)?;
+
+        if let Ok(mut guard) = self.cache.write()
+            && !guard.map.contains_key(word)
+        {
+            while guard.map.len() >= MAX_CACHE_ENTRIES
+                && let Some(oldest) = guard.order.pop_front()
+            {
+                guard.map.remove(&oldest);
+            }
+            let key: Arc<str> = Arc::from(word);
+            guard.order.push_back(Arc::clone(&key));
+            guard.map.insert(key, res);
+        }
+
+        Some(res)
     }
 
     /// 単語がシステム辞書に存在するか、予算期限・キャッシュ付きで判定する。
@@ -353,28 +454,7 @@ impl SystemDictCache {
         ffi_deadline: Option<std::time::Instant>,
         track_foreground: bool,
     ) -> Option<bool> {
-        if word.is_empty() {
-            return Some(false);
-        }
-
-        // 読み取りロックで高速参照
-        if let Ok(guard) = self.cache.read()
-            && let Some(&res) = guard.get(word)
-        {
-            return Some(res);
-        }
-
-        let _fg = track_foreground.then(ForegroundWaiterGuard::new);
-        let res = query_system_dict_definition_budgeted(word, ffi_deadline)?;
-
-        if let Ok(mut guard) = self.cache.write() {
-            if guard.len() >= MAX_CACHE_ENTRIES {
-                guard.clear();
-            }
-            guard.insert(word.to_string(), res);
-        }
-
-        Some(res)
+        self.lookup_with_budget(word, true, ffi_deadline, track_foreground)
     }
 
     /// 単語がシステム辞書に存在するか、キャッシュ付きで高速判定する。
@@ -400,12 +480,28 @@ pub fn is_annotated_or_in_dict_budgeted(
     allow_cold_ffi: bool,
     ffi_deadline: Option<std::time::Instant>,
 ) -> (bool, bool) {
-    is_annotated_or_in_dict_impl(candidate, midashi, allow_cold_ffi, ffi_deadline, true)
+    let parsed_okuri = midashi.and_then(parse_okuri_midashi_extended);
+    is_annotated_or_in_dict_parsed_budgeted(
+        candidate,
+        parsed_okuri.as_ref(),
+        allow_cold_ffi,
+        ffi_deadline,
+    )
+}
+
+/// 事前にパース済みの `OkuriMidashi` を受け取り、繰り返し見出し語パースを行わずに判定する。
+pub fn is_annotated_or_in_dict_parsed_budgeted(
+    candidate: &str,
+    parsed_okuri: Option<&OkuriMidashi<'_>>,
+    allow_cold_ffi: bool,
+    ffi_deadline: Option<std::time::Instant>,
+) -> (bool, bool) {
+    is_annotated_or_in_dict_impl(candidate, parsed_okuri, allow_cold_ffi, ffi_deadline, true)
 }
 
 fn is_annotated_or_in_dict_impl(
     candidate: &str,
-    midashi: Option<&str>,
+    parsed_okuri: Option<&OkuriMidashi<'_>>,
     allow_cold_ffi: bool,
     ffi_deadline: Option<std::time::Instant>,
     track_foreground: bool,
@@ -423,14 +519,7 @@ fn is_annotated_or_in_dict_impl(
     let cache = global_dict_cache();
     let mut skipped_cold = false;
     let mut check_word = |w: &str| -> bool {
-        if let Some(cached) = cache.has_cached_definition(w) {
-            return cached;
-        }
-        if !allow_cold_ffi || ffi_deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            skipped_cold = true;
-            return false;
-        }
-        match cache.has_definition_with_deadline(w, ffi_deadline, track_foreground) {
+        match cache.lookup_with_budget(w, allow_cold_ffi, ffi_deadline, track_foreground) {
             Some(res) => res,
             None => {
                 skipped_cold = true;
@@ -442,32 +531,37 @@ fn is_annotated_or_in_dict_impl(
     // 2. 送りあり見出しの場合、語幹＋終止形・名詞形送り仮名を最優先で照会する。
     //    動詞・形容詞の語幹単体（例: 「切」）よりも終止形（例: 「切る」）の方が国語辞典の見出し語に
     //    100%確実にヒットするため、終止形を先に照会して不要なキャッシュミスと FFI 呼び出しを激減させる。
-    if let Some(mid) = midashi
-        && let Some(parsed) = crate::okuri::parse_okuri_midashi_extended(mid)
-    {
+    if let Some(parsed) = parsed_okuri {
+        let mut explicit_suffix_opt: Option<&str> = None;
         let key_opt = match parsed {
-            crate::okuri::OkuriMidashi::Simple { key, .. } => Some(key),
-            crate::okuri::OkuriMidashi::Compound { okuri_key, .. } => Some(okuri_key),
-            crate::okuri::OkuriMidashi::Explicit { suffix, .. } => {
-                let mut full_word = String::with_capacity(clean.len() + suffix.len());
-                full_word.push_str(clean);
-                full_word.push_str(suffix);
-                if check_word(&full_word) {
-                    return (true, false);
-                }
+            OkuriMidashi::Simple { key, .. } => Some(*key),
+            OkuriMidashi::Compound { okuri_key, .. } => Some(*okuri_key),
+            OkuriMidashi::Explicit { suffix, .. } => {
+                explicit_suffix_opt = Some(*suffix);
                 suffix.chars().next().and_then(crate::okuri::kana_to_okuri_key)
             }
         };
 
+        let mut full_word = String::with_capacity(clean.len() + 12);
+        full_word.push_str(clean);
+        let base_len = full_word.len();
+
+        if let Some(explicit_suffix) = explicit_suffix_opt {
+            full_word.push_str(explicit_suffix);
+            if check_word(&full_word) {
+                return (true, false);
+            }
+            full_word.truncate(base_len);
+        }
+
         if let Some(key) = key_opt {
             let suffixes = crate::okuri::okuri_key_to_dict_suffixes(key);
             for &suffix in suffixes {
-                let mut full_word = String::with_capacity(clean.len() + suffix.len());
-                full_word.push_str(clean);
                 full_word.push_str(suffix);
                 if check_word(&full_word) {
                     return (true, false);
                 }
+                full_word.truncate(base_len);
             }
         }
     }
@@ -492,7 +586,67 @@ pub fn is_annotated_or_in_dict_fast(
     is_annotated_or_in_dict_budgeted(candidate, midashi, allow_cold_ffi, None).0
 }
 
-/// 予算制限により本番リクエスト中にスキップされた候補群をバックグラウンドでシステム辞書キャッシュへ先行登録する。
+struct PrewarmState {
+    queue: Mutex<VecDeque<(String, Option<String>)>>,
+    cvar: Condvar,
+}
+
+fn global_prewarm_queue() -> &'static Arc<PrewarmState> {
+    static QUEUE: OnceLock<Arc<PrewarmState>> = OnceLock::new();
+    QUEUE.get_or_init(|| {
+        let state = Arc::new(PrewarmState {
+            queue: Mutex::new(VecDeque::with_capacity(64)),
+            cvar: Condvar::new(),
+        });
+        let worker_state = Arc::clone(&state);
+        let _ = std::thread::Builder::new()
+            .name("ruskkserv-prewarm".to_string())
+            .spawn(move || {
+                loop {
+                    let item = {
+                        let mut guard = worker_state.queue.lock().unwrap_or_else(|e| e.into_inner());
+                        while guard.is_empty() {
+                            guard = worker_state.cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
+                        }
+                        guard.pop_front()
+                    };
+                    if let Some((candidate, midashi)) = item {
+                        let mut waited = 0u8;
+                        while FOREGROUND_FFI_WAITERS.load(Ordering::Acquire) > 0 && waited < 50 {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            waited += 1;
+                        }
+                        let parsed = midashi.as_deref().and_then(parse_okuri_midashi_extended);
+                        let _ = is_annotated_or_in_dict_impl(
+                            &candidate,
+                            parsed.as_ref(),
+                            true,
+                            None,
+                            false,
+                        );
+                    }
+                }
+            });
+        state
+    })
+}
+
+/// 予算制限により本番リクエスト中にスキップされた候補群や起動時代表語を、
+/// 単一の有界バックグラウンドワーカースレッド（最大 256 件）へ投入して先行登録する。
+/// ワーカーはフォアグラウンド変換中の場合一時譲歩し、ユーザー入力をブロックしない。
+pub fn enqueue_prewarm(entries: impl IntoIterator<Item = (String, Option<String>)>) {
+    let state = global_prewarm_queue();
+    let mut guard = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+    for entry in entries {
+        if guard.len() >= MAX_PREWARM_QUEUE {
+            break;
+        }
+        guard.push_back(entry);
+    }
+    state.cvar.notify_one();
+}
+
+/// 予算制限により本番リクエスト中にスキップされた候補群を同期的にシステム辞書キャッシュへ先行登録する。
 /// フォアグラウンド変換が FFI を待機・実行中の場合は一時譲歩し、ユーザー入力をブロックしない。
 pub fn prewarm_entries(entries: &[(String, Option<String>)]) {
     for (candidate, midashi) in entries {
@@ -501,7 +655,8 @@ pub fn prewarm_entries(entries: &[(String, Option<String>)]) {
             std::thread::sleep(std::time::Duration::from_millis(10));
             waited += 1;
         }
-        let _ = is_annotated_or_in_dict_impl(candidate, midashi.as_deref(), true, None, false);
+        let parsed = midashi.as_deref().and_then(parse_okuri_midashi_extended);
+        let _ = is_annotated_or_in_dict_impl(candidate, parsed.as_ref(), true, None, false);
     }
 }
 
@@ -592,6 +747,17 @@ mod tests {
             "コンピュータ",
             "コンピューター 3computer"
         ));
+        assert!(matches_dict_headword(
+            "問い合せ",
+            "とい・あわせ 0【問い（合）わせ】"
+        ));
+        assert!(matches_dict_headword(
+            "問い合わせ",
+            "とい・あわせ 0【問（い）合わせ】"
+        ));
+        // 漢字違いや異文字の 3 文字語（先頭・末尾だけ一致）が誤ヒットしないこと
+        assert!(!matches_dict_headword("貸しす", "かし・だす 0【貸し出す】"));
+        assert!(!matches_dict_headword("切らる", "きり・とる 0【切り取る】"));
     }
 
     #[cfg(target_os = "macos")]

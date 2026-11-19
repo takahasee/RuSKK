@@ -9,11 +9,11 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::encoding::response_euc_to_utf8;
+use crate::encoding::decode_euc_response_to_utf8;
 use crate::protocol::{Request, encode_request, encode_request_for_encoding};
 
 const MAX_BACKEND_RESPONSE_BYTES: usize = 65536; // 64KB
-const DEFAULT_MAX_POOL_SIZE: usize = 8;
+const DEFAULT_MAX_POOL_SIZE: usize = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamEncoding {
@@ -27,7 +27,7 @@ pub enum UpstreamEncoding {
 
 #[derive(Debug, Clone)]
 pub struct Backend {
-    pub name: String,
+    pub name: Arc<str>,
     pub addr: SocketAddr,
     pub encoding: UpstreamEncoding,
     pub timeout: Duration,
@@ -55,7 +55,7 @@ pub enum BackendError {
 
 impl Backend {
     pub fn new(
-        name: impl Into<String>,
+        name: impl Into<Arc<str>>,
         addr: SocketAddr,
         encoding: UpstreamEncoding,
         timeout: Duration,
@@ -78,7 +78,7 @@ impl Backend {
                 Ok(BufReader::new(stream))
             }
             Err(source) => Err(BackendError::Connect {
-                backend: self.name.clone(),
+                backend: self.name.to_string(),
                 source,
             }),
         }
@@ -96,8 +96,17 @@ impl Backend {
         self.connect_fresh().await.map(|s| (s, false))
     }
 
-    /// 正常終了した接続をプールに返却する
+    /// 正常終了した接続をプールに返却する。
+    /// BufReader に未読の余剰データが残っている場合は、次回以降の応答デシンクを防ぐため破棄する。
     async fn release_conn(&self, stream: BufReader<TcpStream>) {
+        if !stream.buffer().is_empty() {
+            warn!(
+                backend = %self.name,
+                buffered = stream.buffer().len(),
+                "discarding connection with unread trailing bytes"
+            );
+            return;
+        }
         let mut guard = self.pool.lock().await;
         if guard.len() < self.max_pool_size {
             guard.push(stream);
@@ -141,7 +150,9 @@ impl Backend {
                     UpstreamEncoding::Utf8 | UpstreamEncoding::EucJpRequestUtf8Response => {
                         ensure_trailing_newline(raw)
                     }
-                    UpstreamEncoding::EucJp => ensure_trailing_newline(response_euc_to_utf8(&raw)),
+                    UpstreamEncoding::EucJp => {
+                        ensure_trailing_newline(decode_euc_response_to_utf8(&raw))
+                    }
                 };
                 debug!(
                     backend = %self.name,
@@ -180,19 +191,21 @@ impl Backend {
                     }
                     Err((err, false)) => return Err(err),
                     Err((err, true)) => {
-                        if from_pool {
-                            // スリープや再起動でプール内の複数ソケットが同時に失効している可能性があるため、
-                            // プールを一括破棄し、再試行は必ず新規接続で行う
-                            self.clear_pool().await;
-                            force_fresh = true;
+                        if !from_pool {
+                            // 最初から新規接続で失敗した場合は無駄な 2 回目リトライを行わず即返す
+                            return Err(err);
                         }
+                        // スリープや再起動でプール内の複数ソケットが同時に失効している可能性があるため、
+                        // プールを一括破棄し、再試行は必ず新規接続で行う
+                        self.clear_pool().await;
+                        force_fresh = true;
                         last_err = Some(err);
                     }
                 }
             }
 
             Err(last_err.unwrap_or_else(|| BackendError::EmptyResponse {
-                backend: self.name.clone(),
+                backend: self.name.to_string(),
             }))
         })
         .await;
@@ -200,7 +213,7 @@ impl Backend {
         match res {
             Ok(inner) => inner,
             Err(_) => Err(BackendError::Timeout {
-                backend: self.name.clone(),
+                backend: self.name.to_string(),
                 timeout: timeout_duration,
             }),
         }
@@ -216,7 +229,7 @@ impl Backend {
             debug!(backend = %self.name, attempt, error = %source, "write failed on connection, resetting");
             return Err((
                 BackendError::Io {
-                    backend: self.name.clone(),
+                    backend: self.name.to_string(),
                     source,
                 },
                 true,
@@ -226,7 +239,7 @@ impl Backend {
             debug!(backend = %self.name, attempt, error = %source, "flush failed on connection, resetting");
             return Err((
                 BackendError::Io {
-                    backend: self.name.clone(),
+                    backend: self.name.to_string(),
                     source,
                 },
                 true,
@@ -241,7 +254,7 @@ impl Backend {
                     warn!(backend = %self.name, len = buf.len(), "backend response exceeds max bytes");
                     return Err((
                         BackendError::EmptyResponse {
-                            backend: self.name.clone(),
+                            backend: self.name.to_string(),
                         },
                         false,
                     ));
@@ -250,7 +263,7 @@ impl Backend {
                     debug!(backend = %self.name, attempt, len = buf.len(), "backend response missing newline (EOF), resetting");
                     return Err((
                         BackendError::EmptyResponse {
-                            backend: self.name.clone(),
+                            backend: self.name.to_string(),
                         },
                         true,
                     ));
@@ -261,7 +274,7 @@ impl Backend {
                 debug!(backend = %self.name, attempt, "empty response on persistent connection, resetting");
                 Err((
                     BackendError::EmptyResponse {
-                        backend: self.name.clone(),
+                        backend: self.name.to_string(),
                     },
                     true,
                 ))
@@ -270,7 +283,7 @@ impl Backend {
                 debug!(backend = %self.name, attempt, error = %source, "read error on connection, resetting");
                 Err((
                     BackendError::Io {
-                        backend: self.name.clone(),
+                        backend: self.name.to_string(),
                         source,
                     },
                     true,

@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use ruskkserv::backend::{Backend, UpstreamEncoding};
+use ruskkserv::config::BackendOrder;
 use ruskkserv::frequency::{FrequencyPredictor, SharedPredictor};
 use ruskkserv::proxy::Proxy;
 
@@ -56,18 +57,19 @@ async fn test_proxy_ranks_by_seed_frequency() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor.clone(),
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -135,18 +137,19 @@ async fn test_proxy_basic_lookup_passthrough() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -222,18 +225,19 @@ async fn test_proxy_forwards_completion() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -300,18 +304,19 @@ async fn test_proxy_single_char_lookup_works_immediately() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -378,18 +383,19 @@ async fn test_proxy_okuri_expansion_resolves_verb() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true, // 送り復元有効
@@ -459,18 +465,19 @@ async fn test_proxy_okuri_expansion_resolves_compound_mazegaki() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -560,18 +567,19 @@ async fn test_proxy_okuri_expansion_resolves_compound_toiawase() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -648,18 +656,19 @@ async fn test_proxy_okuri_expansion_resolves_compound_kakiokosi() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -740,18 +749,19 @@ async fn test_proxy_okuri_expansion_resolves_compound_neage() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -820,18 +830,19 @@ async fn test_proxy_okuri_expansion_disabled_fallback() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false, // 送り復元無効（従来動作）
@@ -929,18 +940,19 @@ async fn test_proxy_context_ranking_promotes_candidates() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1069,18 +1081,19 @@ async fn test_proxy_context_ranking_disabled() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1176,18 +1189,19 @@ async fn test_proxy_context_protected_against_completion_burst() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1276,18 +1290,19 @@ async fn test_proxy_okuri_expansion_resolves_sokuon_omot() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1354,18 +1369,19 @@ async fn test_proxy_okuri_expansion_resolves_youon_warac() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1430,18 +1446,19 @@ async fn test_proxy_okuri_expansion_resolves_youon_tabey() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1509,18 +1526,19 @@ async fn test_proxy_okuri_expansion_resolves_tsukae() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "azookey-mock",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1589,18 +1607,19 @@ async fn test_proxy_annotation_priority() {
     // 1. annotation_priority = true のプロキシ
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback",
             upstream_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor.clone(),
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -1676,18 +1695,19 @@ async fn test_proxy_respects_fallback_timeout() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary-miss",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(200),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback-hang",
             fallback_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(120), // 850ms より十分短い 120ms を指定
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -1796,18 +1816,19 @@ async fn test_proxy_okuri_nashi_demotes_fragments_and_merges_fallback() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(200),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback",
             fallback_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(200),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -1928,18 +1949,19 @@ async fn test_proxy_prefix_and_suffix_routing() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(200),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback",
             fallback_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(200),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: true,
@@ -2042,18 +2064,19 @@ async fn test_proxy_lookup_cache_hits_and_avoids_upstream() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-primary",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_secs(1),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Arc::clone(&lookup_cache),
         okuri_expansion: false,
@@ -2165,18 +2188,19 @@ async fn test_proxy_hedged_fallback_resolves_slow_first_conversion_within_deadli
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-slow-primary",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(600),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-slow-fallback",
             fallback_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(850),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -2251,18 +2275,19 @@ async fn test_proxy_caps_cold_ffi_within_overall_deadline() {
 
     let proxy = Proxy {
         listen: proxy_addr.to_string(),
-        primary: Backend::new(
+        azookey: Backend::new(
             "mock-near-deadline-primary",
             primary_addr,
             UpstreamEncoding::Utf8,
             Duration::from_millis(850),
         ),
-        fallback: Backend::new(
+        yaskkserv2: Backend::new(
             "mock-fallback-down",
             "127.0.0.1:1".parse().unwrap(),
             UpstreamEncoding::Utf8,
             Duration::from_millis(50),
         ),
+        backend_order: BackendOrder::AzookeyFirst,
         predictor: shared_predictor,
         lookup_cache: Default::default(),
         okuri_expansion: false,
@@ -2297,4 +2322,772 @@ async fn test_proxy_caps_cold_ffi_within_overall_deadline() {
     drop(client);
     proxy_handle.abort();
     primary_handle.abort();
+}
+
+/// 空見出し（`1 \n`）では接続を維持したまま `4\n` を返し、
+/// リクエストスマグリング（`1foo 1bar \n`）は不正リクエストとして拒否・切断することを検証するテスト。
+#[tokio::test]
+async fn test_proxy_rejects_smuggling_and_handles_empty_midashi() {
+    let primary_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary_listener.local_addr().unwrap();
+
+    let primary_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = primary_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1にほん ".as_bytes()) {
+                        let _ = stream.write_all("1/日本/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-primary",
+            primary_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-fallback-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        backend_order: BackendOrder::AzookeyFirst,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 空見出し（`1 \n`）は即座に 4\n が返り、接続は維持されること
+    client.write_all(b"1 \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(&buf[..n], b"4\n");
+
+    // 2. 後続の正規リクエストが同一接続で正常に処理されること
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/日本/\n");
+
+    // 3. リクエストスマグリング（内部スペースを含む `1foo 1bar \n`）は拒否され切断（EOF）になること
+    client.write_all(b"1foo 1bar \n").await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(n, 0, "smuggling request must close client connection");
+
+    drop(client);
+    proxy_handle.abort();
+    primary_handle.abort();
+}
+
+/// `Yaskkserv2First`（新デフォルト）で、yaskkserv2 ヒット時は azooKey へ照会せず yaskkserv2 の候補を返し、
+/// yaskkserv2 ミス時のみ azooKey へフォールバックすることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_prefers_yaskkserv2_and_falls_back_to_azookey() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1にほん ".as_bytes()) {
+                        let _ = stream.write_all("1/日本/二本/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let azoo_nihon_hits = Arc::new(AtomicUsize::new(0));
+    let azoo_nihon_hits_srv = Arc::clone(&azoo_nihon_hits);
+    let azoo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let azoo_addr = azoo_listener.local_addr().unwrap();
+    let azoo_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = azoo_listener.accept().await {
+            let hits = Arc::clone(&azoo_nihon_hits_srv);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1にほん ".as_bytes()) {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all("1/azoo日本/\n".as_bytes()).await;
+                    } else if req.starts_with("1あずー専用 ".as_bytes()) {
+                        let _ = stream.write_all("1/azoo専用/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey",
+            azoo_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. yaskkserv2 がヒットするため、azooKey へは一切照会されず yaskkserv2 候補が返ること
+    client.write_all("1にほん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/日本/二本/\n");
+    assert_eq!(azoo_nihon_hits.load(Ordering::SeqCst), 0);
+
+    // 2. yaskkserv2 ミス時のみ azooKey へフォールバックすること
+    client.write_all("1あずー専用 \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/azoo専用/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+    azoo_handle.abort();
+}
+
+/// `Yaskkserv2First` で yaskkserv2 の送りあり角括弧ブロック（例: `/[れ/切/]/[る/伐;木を伐る/着/` や `/[っ/思/]/重/想;注釈/`）が
+/// 展開され、文脈共起（肉→切、服→着、木→伐）およびシステム辞書優先（`おもt` で `思` が維持）で整列されることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_unpacks_bracket_block_and_ranks_with_context() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1にく ".as_bytes()) {
+                        let _ = stream.write_all("1/肉/\n".as_bytes()).await;
+                    } else if req.starts_with("1ふく ".as_bytes()) {
+                        let _ = stream.write_all("1/服/\n".as_bytes()).await;
+                    } else if req.starts_with("1き ".as_bytes()) {
+                        let _ = stream.write_all("1/木/\n".as_bytes()).await;
+                    } else if req.starts_with("1きr ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/[れ/切/]/[る/伐;木を伐る/着/斬;人を斬る/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1おもt ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/[っ/思/]/重/想;注釈/\n".as_bytes())
+                            .await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.frequencies.insert("きr".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着".to_string(), 3);
+        m.insert("切".to_string(), 2);
+        m.insert("伐".to_string(), 1);
+        m
+    });
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("服".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("木".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("伐る".to_string(), 10);
+        m
+    });
+    predictor.expand_aliases();
+
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: true,
+        annotation_priority: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // CoreServices DictionaryServices の初回フレームワーク初期化を無関係な語で済ませる
+    let _ = ruskkserv::system_dict::is_annotated_or_in_dict("日本", None);
+
+    // 1. 「おもt」: 角括弧ブロック `[っ/思/]` が展開され、「思う」がシステム辞書にヒットするため
+    //    「想;注釈」に追い越されず「思」が第1候補を維持すること
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1おもt \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("1/思/"), "expected 思 first, got: {resp}");
+        assert!(!resp.contains("[っ"), "brackets should be unpacked: {resp}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 2. 文脈「肉」 -> 「きr」は「切」が第1候補
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1にく \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("1/切/"), "expected 切 after 肉, got: {resp}");
+        assert!(!resp.contains("[れ"), "brackets should be unpacked: {resp}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 3. 文脈「服」 -> 「きr」は「着」が第1候補
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        client.write_all("1ふく \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(resp.starts_with("1/着/"), "expected 着 after 服, got: {resp}");
+    }
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // 4. 文脈「木」 -> 「きr」は「伐;木を伐る」が第1候補
+    {
+        let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+        let mut buf = [0u8; 512];
+        for _ in 0..3 {
+            client.write_all("1き \n".as_bytes()).await.unwrap();
+            let n = client.read(&mut buf).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/木/\n");
+            tokio::time::sleep(Duration::from_millis(80)).await;
+        }
+        client.write_all("1きr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        let resp = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            resp.starts_with("1/伐;木を伐る/"),
+            "expected 伐 after 木, got: {resp}"
+        );
+    }
+
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}
+
+/// `Yaskkserv2First` で yaskkserv2 が送りあり見出しでミスした場合、
+/// azooKey 側の送りあり活用展開・語幹抽出がそのまま動作することを検証するテスト。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_okuri_fallback_uses_azookey_expansion() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let _ = stream.write_all(b"4\n").await;
+                }
+            });
+        }
+    });
+
+    let azoo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let azoo_addr = azoo_listener.local_addr().unwrap();
+    let azoo_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = azoo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1かく ".as_bytes()) {
+                        let _ = stream.write_all("1/書く/各/描く/\n".as_bytes()).await;
+                    } else if req.starts_with("1まぜがき ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/交ぜ書き/混ぜ書き/\n".as_bytes())
+                            .await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey",
+            azoo_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(500),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1かk \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/書/描/\n");
+
+    client.write_all("1まぜがk \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/交ぜ書/混ぜ書/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+    azoo_handle.abort();
+}
+
+/// `Yaskkserv2First` においても接頭語・接尾語の判定と、補完の `yaskkserv2` 先 → ミス時 `azookey` が
+/// 正しく動作することを検証するテスト。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_preserves_affix_and_completion_order() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1さい> ".as_bytes()) {
+                        let _ = stream.write_all("1/再/最/歳;?/\n".as_bytes()).await;
+                    } else if req.starts_with("1>せい ".as_bytes()) {
+                        let _ = stream.write_all("1/性/制/\n".as_bytes()).await;
+                    } else if req.starts_with("1>わたs ".as_bytes()) {
+                        let _ = stream.write_all("1/渡/[す/渡/]/\n".as_bytes()).await;
+                    } else if req.starts_with("4>せ ".as_bytes()) {
+                        let _ = stream.write_all("1/>せい/\n".as_bytes()).await;
+                    } else if req.starts_with("4にほ ".as_bytes()) {
+                        let _ = stream.write_all("1/にほ/にほん/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let azoo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let azoo_addr = azoo_listener.local_addr().unwrap();
+    let azoo_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = azoo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1さい> ".as_bytes()) {
+                        let _ = stream.write_all("1/際>/\n".as_bytes()).await;
+                    } else if req.starts_with("1みとうろく ".as_bytes()) {
+                        let _ = stream.write_all("1/未登録/\n".as_bytes()).await;
+                    } else if req.starts_with("4にほ ".as_bytes()) {
+                        let _ = stream.write_all("1/azooにほん/\n".as_bytes()).await;
+                    } else if req.starts_with("4あずー ".as_bytes()) {
+                        let _ = stream.write_all("1/あずー補完/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey",
+            azoo_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1さい> \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/再/最/歳;?/\n");
+
+    client.write_all("1>せい \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/性/制/\n");
+
+    client.write_all("1>わたs \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/渡/\n");
+
+    // yaskkserv2 にない接尾語は > を除去して azooKey へフォールバックする
+    client.write_all("1>みとうろく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/未登録/\n");
+
+    // 接尾語補完 4>せ は yaskkserv2 直接
+    client.write_all("4>せ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/>せい/\n");
+
+    // 通常補完も yaskkserv2 先 -> ミス時 azooKey
+    client.write_all("4にほ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/にほ/にほん/\n");
+
+    client.write_all("4あずー \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/あずー補完/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+    azoo_handle.abort();
+}
+
+/// 記号見出しで単体の `[` / `]` が候補に含まれる場合（`1/「/」/[/]/\n`）、
+/// 送り仮名ブロックと誤認せず `[` / `]` がそのまま保持されることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_preserves_literal_bracket_symbols() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1きごう ".as_bytes()) {
+                        let _ = stream.write_all("1/「/」/[/]/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: false,
+        annotation_priority: true,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let _ = ruskkserv::system_dict::is_annotated_or_in_dict("日本", None);
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    client.write_all("1きごう \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf[..n]);
+    assert!(resp.contains("/「/"), "missing 「 in {resp}");
+    assert!(resp.contains("/」/"), "missing 」 in {resp}");
+    assert!(resp.contains("/[/"), "literal [ must be preserved: {resp}");
+    assert!(resp.contains("/]/"), "literal ] must be preserved: {resp}");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}
+
+/// `Yaskkserv2First` で yaskkserv2 が 350ms 遅延してミスを返し、azooKey が 520ms かかる場合でも、
+/// 200ms 経過時点でのヘッジ並列起動により overall_deadline (850ms) 内に初回変換が成功することを検証する。
+#[tokio::test]
+async fn test_proxy_yaskkserv2_first_hedges_slow_yaskkserv2_to_azookey() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    tokio::time::sleep(Duration::from_millis(350)).await;
+                    if req.contains("おそいかち") {
+                        let _ = stream.write_all("1/yaskk遅い勝ち/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let azoo_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let azoo_addr = azoo_listener.local_addr().unwrap();
+    let azoo_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = azoo_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]).into_owned();
+                    if req.contains("おそいかち") {
+                        let _ = stream.write_all("1/azoo側/\n".as_bytes()).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(520)).await;
+                        let _ = stream.write_all("1/azooバックアップ/\n".as_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor =
+        Arc::new(std::sync::RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-slow-azookey",
+            azoo_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(850),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-slow-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(600),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    let start = tokio::time::Instant::now();
+    client.write_all("1あずーへっじ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    let elapsed = start.elapsed();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/azooバックアップ/\n");
+    assert!(
+        elapsed < Duration::from_millis(840),
+        "hedged azookey fallback should finish within overall_deadline, took {:?}",
+        elapsed
+    );
+
+    // yaskkserv2 が 350ms でヒットすれば azooKey より勝つこと
+    client.write_all("1おそいかち \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/yaskk遅い勝ち/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+    azoo_handle.abort();
 }

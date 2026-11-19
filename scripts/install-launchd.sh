@@ -55,6 +55,8 @@ load_config() {
   RUSKKSERV_OKURI_EXPANSION="${RUSKKSERV_OKURI_EXPANSION:-1}"
   RUSKKSERV_CONTEXT_RANKING="${RUSKKSERV_CONTEXT_RANKING:-1}"
   RUSKKSERV_ANNOTATION_PRIORITY="${RUSKKSERV_ANNOTATION_PRIORITY:-1}"
+  RUSKKSERV_BACKEND_ORDER="${RUSKKSERV_BACKEND_ORDER:-yaskkserv2-first}"
+  RUSKKSERV_LOG_LEVEL="${RUSKKSERV_LOG_LEVEL:-info}"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
     MACSKK_USER_DICT_PATH="$(expand_path "$MACSKK_USER_DICT_PATH")"
@@ -74,22 +76,51 @@ check_binaries() {
   fi
 }
 
+# XML および sed 置換文字列のメタ文字を安全な順序でエスケープする
+escape_plist_sed() {
+  printf '%s' "$1" | sed \
+    -e 's/\\/\\\\/g' \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' \
+    -e "s/'/\\&apos;/g" \
+    -e 's/&/\\&/g' \
+    -e 's/|/\\|/g'
+}
+
 render_plist() {
   template="$1"
   dest="$2"
+  esc_ruskkserv_bin="$(escape_plist_sed "$RUSKKSERV_BIN")"
+  esc_yaskkserv2_bin="$(escape_plist_sed "$YASKKSERV2_BIN")"
+  esc_yaskkserv2_dict="$(escape_plist_sed "$YASKKSERV2_DICTIONARY")"
+  esc_yaskkserv2_cache="$(escape_plist_sed "$YASKKSERV2_GOOGLE_CACHE")"
+  esc_wait_script="$(escape_plist_sed "$WAIT_SCRIPT")"
+  esc_importer_app_bin="$(escape_plist_sed "$IMPORTER_APP_BIN")"
+  esc_log_dir="$(escape_plist_sed "$LOG_DIR")"
+  esc_okuri="$(escape_plist_sed "$RUSKKSERV_OKURI_EXPANSION")"
+  esc_context="$(escape_plist_sed "$RUSKKSERV_CONTEXT_RANKING")"
+  esc_annotation="$(escape_plist_sed "$RUSKKSERV_ANNOTATION_PRIORITY")"
+  esc_backend_order="$(escape_plist_sed "$RUSKKSERV_BACKEND_ORDER")"
+  esc_log_level="$(escape_plist_sed "$RUSKKSERV_LOG_LEVEL")"
+  esc_user_dict="$(escape_plist_sed "${MACSKK_USER_DICT_PATH:-}")"
+
   sed \
-    -e "s|@RUSKKSERV_BIN@|${RUSKKSERV_BIN}|g" \
-    -e "s|@SKK_PROXY_BIN@|${RUSKKSERV_BIN}|g" \
-    -e "s|@YASKKSERV2_BIN@|${YASKKSERV2_BIN}|g" \
-    -e "s|@YASKKSERV2_DICTIONARY@|${YASKKSERV2_DICTIONARY}|g" \
-    -e "s|@YASKKSERV2_GOOGLE_CACHE@|${YASKKSERV2_GOOGLE_CACHE}|g" \
-    -e "s|@WAIT_SCRIPT@|${WAIT_SCRIPT}|g" \
-    -e "s|@IMPORTER_APP_BIN@|${IMPORTER_APP_BIN}|g" \
-    -e "s|@LOG_DIR@|${LOG_DIR}|g" \
-    -e "s|@RUSKKSERV_OKURI_EXPANSION@|${RUSKKSERV_OKURI_EXPANSION}|g" \
-    -e "s|@RUSKKSERV_CONTEXT_RANKING@|${RUSKKSERV_CONTEXT_RANKING}|g" \
-    -e "s|@RUSKKSERV_ANNOTATION_PRIORITY@|${RUSKKSERV_ANNOTATION_PRIORITY}|g" \
-    -e "s|@MACSKK_USER_DICT_PATH@|${MACSKK_USER_DICT_PATH:-}|g" \
+    -e "s|@RUSKKSERV_BIN@|${esc_ruskkserv_bin}|g" \
+    -e "s|@SKK_PROXY_BIN@|${esc_ruskkserv_bin}|g" \
+    -e "s|@YASKKSERV2_BIN@|${esc_yaskkserv2_bin}|g" \
+    -e "s|@YASKKSERV2_DICTIONARY@|${esc_yaskkserv2_dict}|g" \
+    -e "s|@YASKKSERV2_GOOGLE_CACHE@|${esc_yaskkserv2_cache}|g" \
+    -e "s|@WAIT_SCRIPT@|${esc_wait_script}|g" \
+    -e "s|@IMPORTER_APP_BIN@|${esc_importer_app_bin}|g" \
+    -e "s|@LOG_DIR@|${esc_log_dir}|g" \
+    -e "s|@RUSKKSERV_OKURI_EXPANSION@|${esc_okuri}|g" \
+    -e "s|@RUSKKSERV_CONTEXT_RANKING@|${esc_context}|g" \
+    -e "s|@RUSKKSERV_ANNOTATION_PRIORITY@|${esc_annotation}|g" \
+    -e "s|@RUSKKSERV_BACKEND_ORDER@|${esc_backend_order}|g" \
+    -e "s|@RUSKKSERV_LOG_LEVEL@|${esc_log_level}|g" \
+    -e "s|@MACSKK_USER_DICT_PATH@|${esc_user_dict}|g" \
     "$template" >"$dest"
 }
 
@@ -105,7 +136,9 @@ do_install() {
   load_config
   check_binaries
 
-  mkdir -p "$LAUNCH_AGENTS" "$LOG_DIR"
+  mkdir -p "$LAUNCH_AGENTS"
+  mkdir -p -m 700 "$LOG_DIR"
+  chmod 700 "$LOG_DIR"
   mkdir -p -m 700 "$(dirname "$YASKKSERV2_GOOGLE_CACHE")"
   chmod +x "$WAIT_SCRIPT" "${ROOT}/scripts/build-importer-app.sh"
 
@@ -121,8 +154,16 @@ do_install() {
     "${LAUNCH_AGENTS}/com.ruskkserv.skkserv.plist"
 
   bootout_if_loaded "com.ruskkserv.yaskkserv2"
-  # yaskkserv2 は自身でデーモン化するため、旧設定を掴み続けないよう既存プロセスも停止する
-  pkill -x yaskkserv2 2>/dev/null || true
+  # 旧デーモン化プロセスが残っている場合のみ自 UID 限定で停止し、ポート解放を待機する
+  /usr/bin/pkill -u "$(id -u)" -x yaskkserv2 2>/dev/null || true
+  wait_tries=0
+  while [ "$wait_tries" -lt 10 ]; do
+    if ! /usr/bin/pgrep -u "$(id -u)" -x yaskkserv2 >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.2
+    wait_tries=$((wait_tries + 1))
+  done
   bootout_if_loaded "com.ruskkserv.skkserv"
 
   launchctl enable "$DOMAIN/com.ruskkserv.yaskkserv2" 2>/dev/null || true
