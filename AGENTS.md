@@ -10,7 +10,7 @@
 - **バイナリ / クレート名**: `ruskkserv`
 - **リポジトリ**: [GitHub: takahasee/RuSKKserv](https://github.com/takahasee/RuSKKserv)
 - **目的**: macSKK 向けの高速・インテリジェントな skkserv プロキシサーバー。
-  - **Primary (デフォルト / `--backend-order=yaskkserv2-first`)**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, Google Suggest 連携)
+  - **Primary (デフォルト / `--backend-order=yaskkserv2-first`)**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, ローカル統合辞書; LaunchAgent 既定は `--google-japanese-input disable` で未登録語・連文節を `azoo-key-skkserv` へフォールバック)
   - **Fallback (`--backend-order=azookey-first` 指定時は Primary へ切替可能)**: `azoo-key-skkserv` (`127.0.0.1:1180`, EUC-JP request / UTF-8 response)
   - **Listen**: `127.0.0.1:1178` (UTF-8)
 
@@ -155,6 +155,7 @@
 - **バックエンド参照順の変更と切替スイッチ (`src/config.rs`, `src/proxy.rs`, `launchd/`)**:
   - デフォルト参照順を `BackendOrder::Yaskkserv2First`（`yaskkserv2` 先 → ミス・失敗時 `azoo-key-skkserv`、200ms 超過時はヘッジ並列起動）へ変更し、`--backend-order=azookey-first` / `RUSKKSERV_BACKEND_ORDER=azookey-first` で従来順へ即座に戻せる構成とした。補完 (`opcode 4`) も同一参照順へ統一（接頭語・接尾語は `yaskkserv2` 先、ミス時 `>` 除去して `azoo-key-skkserv` を維持）。
   - `yaskkserv2` 優先時も送りあり角括弧ブロック（`contains_okuri_bracket_block` で単体記号 `[` / `]` と区別）を展開し、文脈共起・頻度・システム辞書優先で整列する。`okuri_key_to_dict_suffixes` に `'t'`→`["う", "る"]`、`'k'`→`["い"]` を追加し、フォールバック先の `azoo-key-skkserv` でも送りあり展開・送りなし断片判定を維持。
+  - LaunchAgent テンプレート（`launchd/com.ruskkserv.yaskkserv2.plist`）は `yaskkserv2` の既定動作（`--google-japanese-input notfound`）および `--google-suggest` による連文節・未登録語の横取りを防ぐため、`--google-japanese-input disable`（`launchd/config.env` の `YASKKSERV2_GOOGLE_JAPANESE_INPUT`、既定 `disable`）で起動し、ローカル辞書ミスを確実に `azoo-key-skkserv` へフォールバックさせる構成とした（`disable` と `--google-suggest` の併用時は `yaskkserv2 0.1.7` がヘルプ終了するため `--google-suggest` を削除）。
 - **セキュリティ・堅牢性強化 (`launchd/`, `scripts/`, `src/`)**:
   - `yaskkserv2` plist に `--listen-address 127.0.0.1 --no-daemonize` を追加し全 I/F 公開と 10 秒リスポーンループを解消。本番 `RUST_LOG` 既定を `info` 化し入力本文ログは `trace!` + `?` エスケープに変更、`LOG_DIR` (`0700`)・ログと seed ファイル (`0600` アトミック保存 `save()`)・`/usr/bin/pkill -u <uid>`・`escape_plist_sed`・同時接続上限 `64` / 無通信タイムアウト `600s`・リクエストスマグリング拒否 & `BufReader` 余剰バイト破棄・`saturating_*` を導入。
 - **パフォーマンス／冗長処理削減**:

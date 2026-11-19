@@ -48,6 +48,14 @@ load_config() {
   YASKKSERV2_BIN="$(expand_path "$YASKKSERV2_BIN")"
   YASKKSERV2_DICTIONARY="$(expand_path "$YASKKSERV2_DICTIONARY")"
   YASKKSERV2_GOOGLE_CACHE="$(expand_path "${YASKKSERV2_GOOGLE_CACHE:-${HOME}/Library/Caches/ruskkserv/yaskkserv2-google.cache}")"
+  YASKKSERV2_GOOGLE_JAPANESE_INPUT="${YASKKSERV2_GOOGLE_JAPANESE_INPUT:-disable}"
+  case "$YASKKSERV2_GOOGLE_JAPANESE_INPUT" in
+    disable|notfound|last|first) ;;
+    *)
+      echo "error: YASKKSERV2_GOOGLE_JAPANESE_INPUT は disable|notfound|last|first のいずれかを指定してください: ${YASKKSERV2_GOOGLE_JAPANESE_INPUT}" >&2
+      exit 1
+      ;;
+  esac
   LOG_DIR="$(expand_path "${LOG_DIR:-${HOME}/Library/Logs/ruskkserv}")"
   WAIT_SCRIPT="${ROOT}/scripts/wait-and-run-ruskkserv.sh"
   IMPORTER_APP="${HOME}/Applications/RuSKKservImporter.app"
@@ -96,6 +104,7 @@ render_plist() {
   esc_yaskkserv2_bin="$(escape_plist_sed "$YASKKSERV2_BIN")"
   esc_yaskkserv2_dict="$(escape_plist_sed "$YASKKSERV2_DICTIONARY")"
   esc_yaskkserv2_cache="$(escape_plist_sed "$YASKKSERV2_GOOGLE_CACHE")"
+  esc_yaskkserv2_google_input="$(escape_plist_sed "$YASKKSERV2_GOOGLE_JAPANESE_INPUT")"
   esc_wait_script="$(escape_plist_sed "$WAIT_SCRIPT")"
   esc_importer_app_bin="$(escape_plist_sed "$IMPORTER_APP_BIN")"
   esc_log_dir="$(escape_plist_sed "$LOG_DIR")"
@@ -112,6 +121,7 @@ render_plist() {
     -e "s|@YASKKSERV2_BIN@|${esc_yaskkserv2_bin}|g" \
     -e "s|@YASKKSERV2_DICTIONARY@|${esc_yaskkserv2_dict}|g" \
     -e "s|@YASKKSERV2_GOOGLE_CACHE@|${esc_yaskkserv2_cache}|g" \
+    -e "s|@YASKKSERV2_GOOGLE_JAPANESE_INPUT@|${esc_yaskkserv2_google_input}|g" \
     -e "s|@WAIT_SCRIPT@|${esc_wait_script}|g" \
     -e "s|@IMPORTER_APP_BIN@|${esc_importer_app_bin}|g" \
     -e "s|@LOG_DIR@|${esc_log_dir}|g" \

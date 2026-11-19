@@ -12,7 +12,8 @@
         <string>127.0.0.1</string>
         <string>--port</string>
         <string>1179</string>
-        <string>--google-suggest</string>
+        <string>--google-japanese-input</string>
+        <string>@YASKKSERV2_GOOGLE_JAPANESE_INPUT@</string>
         <string>--google-cache-filename</string>
         <string>@YASKKSERV2_GOOGLE_CACHE@</string>
         <string>@YASKKSERV2_DICTIONARY@</string>

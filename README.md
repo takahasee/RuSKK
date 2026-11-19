@@ -1,7 +1,7 @@
 # RuSKKserv
 
 macSKK 向けの高速・インテリジェントな skkserv プロキシサーバーです。  
-[yaskkserv2](https://github.com/wachikun/yaskkserv2)（Google Suggest 連携・統合辞書）を最優先し、見つからない・応答遅延（200ms 超過時ヘッジ）や失敗時のみ [azooKey SKKServ](https://github.com/gitusp/azoo-key-skkserv) へフォールバックします（`--backend-order=azookey-first` / `RUSKKSERV_BACKEND_ORDER=azookey-first` で従来の azooKey 優先順へ即座に切り替え可能）。
+[yaskkserv2](https://github.com/wachikun/yaskkserv2)（ローカル統合辞書・既定では Google 日本語入力無効で未登録語や連文節を azooKey へ即フォールバック）を最優先し、見つからない・応答遅延（200ms 超過時ヘッジ）や失敗時のみ [azooKey SKKServ](https://github.com/gitusp/azoo-key-skkserv) へフォールバックします（`--backend-order=azookey-first` / `RUSKKSERV_BACKEND_ORDER=azookey-first` で従来の azooKey 優先順へ即座に切り替え可能）。
 
 ```text
 macSKK  →  RuSKKserv (:1178, UTF-8)  →  yaskkserv2 (:1179, デフォルト優先)
@@ -68,6 +68,8 @@ cp launchd/config.env.example launchd/config.env
 # 稼働ステータス確認
 ./scripts/install-launchd.sh status
 ```
+
+> **連文節変換・Google 日本語入力連携について**: LaunchAgent 経由の `yaskkserv2` は既定で `YASKKSERV2_GOOGLE_JAPANESE_INPUT="disable"`（Google 日本語入力無効）として起動し、ローカル辞書に無い連文節フレーズや未登録語を高速に `azoo-key-skkserv`（Zenzai）へフォールバックします。`yaskkserv2` 側の Google 日本語入力を再有効化したい場合は `launchd/config.env` で `YASKKSERV2_GOOGLE_JAPANESE_INPUT="notfound"` 等を指定して `./scripts/install-launchd.sh install` を実行してください。
 
 ### 3. macSKK の推奨設定（プラン A: 誤爆ゼロ・王道構成）
 macSKK のローカル履歴保存による文脈上書きと、補完タイマーによる誤爆を根絶します。
