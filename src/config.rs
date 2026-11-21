@@ -91,6 +91,27 @@ pub enum Command {
         /// Overwrite completely with presets instead of merging with existing data
         #[arg(long, short)]
         force: bool,
+        /// fastText .vec file path to automatically expand context co-occurrence pairs
+        #[arg(long)]
+        fasttext: Option<std::path::PathBuf>,
+        /// Optional SKK dictionary path (UTF-8 / EUC-JP) used to filter valid words and homophone groups
+        #[arg(long)]
+        dict: Option<std::path::PathBuf>,
+        /// Minimum cosine similarity threshold for fastText expansion
+        #[arg(long, default_value_t = 0.58)]
+        min_similarity: f32,
+        /// Minimum margin between top homophone targets for fastText expansion
+        #[arg(long, default_value_t = 0.04)]
+        min_margin: f32,
+        /// Maximum number of new context words added per target candidate
+        #[arg(long, default_value_t = 50)]
+        max_per_target: usize,
+        /// Output seed JSON path (defaults to ~/.ruskkserv-frequency.json)
+        #[arg(long, short)]
+        output: Option<std::path::PathBuf>,
+        /// Send SIGHUP to running ruskkserv process after updating the seed file
+        #[arg(long, default_value_t = false)]
+        send_reload: bool,
     },
 }
 
@@ -238,5 +259,80 @@ mod tests {
             yaskk_first.resolved_backend_order(),
             BackendOrder::Yaskkserv2First
         );
+    }
+
+    #[test]
+    fn test_init_seed_subcommand_args() {
+        let minimal = Args::try_parse_from(["ruskkserv", "init-seed"]).unwrap();
+        match minimal.command {
+            Some(Command::InitSeed {
+                force,
+                fasttext,
+                dict,
+                min_similarity,
+                min_margin,
+                max_per_target,
+                output,
+                send_reload,
+            }) => {
+                assert!(!force);
+                assert!(fasttext.is_none());
+                assert!(dict.is_none());
+                assert!((min_similarity - 0.58).abs() < f32::EPSILON);
+                assert!((min_margin - 0.04).abs() < f32::EPSILON);
+                assert_eq!(max_per_target, 50);
+                assert!(output.is_none());
+                assert!(!send_reload);
+            }
+            _ => panic!("expected InitSeed command"),
+        }
+
+        let full = Args::try_parse_from([
+            "ruskkserv",
+            "init-seed",
+            "--force",
+            "--fasttext",
+            "/tmp/cc.ja.300.vec",
+            "--dict",
+            "/tmp/SKK-JISYO.L",
+            "--min-similarity",
+            "0.62",
+            "--min-margin",
+            "0.06",
+            "--max-per-target",
+            "30",
+            "--output",
+            "/tmp/out.json",
+            "--send-reload",
+        ])
+        .unwrap();
+        match full.command {
+            Some(Command::InitSeed {
+                force,
+                fasttext,
+                dict,
+                min_similarity,
+                min_margin,
+                max_per_target,
+                output,
+                send_reload,
+            }) => {
+                assert!(force);
+                assert_eq!(
+                    fasttext.as_deref(),
+                    Some(std::path::Path::new("/tmp/cc.ja.300.vec"))
+                );
+                assert_eq!(
+                    dict.as_deref(),
+                    Some(std::path::Path::new("/tmp/SKK-JISYO.L"))
+                );
+                assert!((min_similarity - 0.62).abs() < 1e-6);
+                assert!((min_margin - 0.06).abs() < 1e-6);
+                assert_eq!(max_per_target, 30);
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("/tmp/out.json")));
+                assert!(send_reload);
+            }
+            _ => panic!("expected InitSeed command"),
+        }
     }
 }

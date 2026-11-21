@@ -187,11 +187,17 @@ RuSKKserv は自動学習を行わず、ユーザーが手動で編集・確認�
 ```
 
 ### 文脈共起プリセットの導入 (`init-seed`)
-日常会話・ビジネス・IT・医療・料理など幅広い分野を網羅したプリセット（基本421キー / 478ペア、送り仮名語幹展開後441キー）を安全にマージ・導入できます。
+日常会話・ビジネス・IT・医療・料理・自然・文化など幅広い分野の同音異義語グループを網羅した高カバレッジプリセット（基本 1,484 キー / 1,676 ペア、送り仮名語幹展開後 1,514 キー）を安全にマージ・導入できます。
 
 ```sh
 # 既存の個人頻度データを保持したまま、文脈プリセットをマージ
 ruskkserv init-seed
+
+# 既存の個人頻度データを保持したままマージし、稼働中プロセスに即座に反映
+ruskkserv init-seed --send-reload
+
+# 手元の fastText ベクトル (.vec) と SKK 辞書から独自の文脈共起語彙をさらに自動拡張
+ruskkserv init-seed --fasttext cc.ja.300.vec --dict SKK-JISYO.L --send-reload
 
 # 完全にプリセットの初期状態に戻す場合
 ruskkserv init-seed --force
@@ -297,8 +303,15 @@ Subcommand: init-seed
 Usage: ruskkserv init-seed [OPTIONS]
 
 Options:
-  -f, --force  Overwrite completely with presets instead of merging with existing data
-  -h, --help   Print help
+  -f, --force                            Overwrite completely with presets instead of merging with existing data
+      --fasttext <FASTTEXT>              fastText .vec file path to automatically expand context co-occurrence pairs
+      --dict <DICT>                      Optional SKK dictionary path (UTF-8 / EUC-JP) used to filter valid words and homophone groups
+      --min-similarity <MIN_SIMILARITY>  Minimum cosine similarity threshold for fastText expansion [default: 0.58]
+      --min-margin <MIN_MARGIN>          Minimum margin between top homophone targets for fastText expansion [default: 0.04]
+      --max-per-target <MAX_PER_TARGET>  Maximum number of new context words added per target candidate [default: 50]
+  -o, --output <OUTPUT>                  Output seed JSON path (defaults to ~/.ruskkserv-frequency.json)
+      --send-reload                      Send SIGHUP to running ruskkserv process after updating the seed file
+  -h, --help                             Print help
 ```
 
 ---

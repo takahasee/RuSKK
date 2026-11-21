@@ -171,6 +171,17 @@ impl FrequencyPredictor {
     /// seed ファイル（~/.ruskkserv-frequency.json）を初期化またはマージして保存する。
     /// force が true の場合はプリセットで完全上書きし、false の場合は既存データを保持したままマージする。
     pub fn init_seed(&mut self, force: bool) -> anyhow::Result<()> {
+        self.init_seed_with_fasttext(force, None)?;
+        Ok(())
+    }
+
+    /// seed ファイル（~/.ruskkserv-frequency.json）を初期化またはマージし、
+    /// `fasttext_opts` が指定されていれば fastText `.vec` による文脈共起拡張を適用して保存する。
+    pub fn init_seed_with_fasttext(
+        &mut self,
+        force: bool,
+        fasttext_opts: Option<&crate::fasttext::FastTextExpandOptions>,
+    ) -> anyhow::Result<Option<crate::fasttext::FastTextExpandStats>> {
         if force {
             let preset = Self::default_preset_data()?;
             self.frequencies = preset.frequencies;
@@ -179,9 +190,19 @@ impl FrequencyPredictor {
             self.reload_raw_if_exists()?;
             self.merge_default_presets_raw()?;
         }
+
+        let stats = if let Some(opts) = fasttext_opts {
+            Some(crate::fasttext::expand_context_with_fasttext(
+                &mut self.context_frequencies,
+                opts,
+            )?)
+        } else {
+            None
+        };
+
         self.save()?;
         self.expand_aliases();
-        Ok(())
+        Ok(stats)
     }
 
     /// macSKK などのユーザー辞書 (skk-jisyo.utf8) をパースし、
@@ -890,6 +911,34 @@ mod tests {
                 .unwrap_or(0),
             10
         );
+        // fastText 拡張済みの高カバレッジプリセット（1,400+ キー）および新規同音グループが含まれること
+        assert!(raw_saved.context_frequencies.len() >= 1400);
+        assert_eq!(
+            reloaded
+                .context_frequencies
+                .get("切手")
+                .and_then(|m| m.get("貼"))
+                .copied(),
+            Some(10)
+        );
+        assert!(
+            reloaded
+                .context_frequencies
+                .get("カーディガン")
+                .and_then(|m| m.get("着"))
+                .copied()
+                .unwrap_or(0)
+                >= 5
+        );
+        assert!(
+            reloaded
+                .context_frequencies
+                .get("革靴")
+                .and_then(|m| m.get("履"))
+                .copied()
+                .unwrap_or(0)
+                >= 5
+        );
     }
 
     #[test]
@@ -1187,5 +1236,63 @@ mod tests {
             true,
         );
         assert_eq!(ranked[0], "テスト");
+    }
+
+    #[test]
+    fn test_init_seed_with_fasttext_preserves_existing_frequencies_and_merges() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut vec_file = NamedTempFile::new().unwrap();
+        writeln!(vec_file, "6 4").unwrap();
+        writeln!(vec_file, "服 1.0 0.0 0.0 0.0").unwrap();
+        writeln!(vec_file, "シャツ 0.98 0.0 0.0 0.1").unwrap();
+        writeln!(vec_file, "カーディガン 0.95 0.0 0.0 0.2").unwrap();
+        writeln!(vec_file, "肉 0.0 1.0 0.0 0.0").unwrap();
+        writeln!(vec_file, "紙 0.0 0.98 0.0 0.1").unwrap();
+        writeln!(vec_file, "段ボール 0.0 0.94 0.0 0.2").unwrap();
+
+        let json_file = NamedTempFile::new().unwrap();
+        let mut predictor = FrequencyPredictor::new_unloaded(Some(json_file.path().to_path_buf()));
+        predictor.frequencies.insert("てすと".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("テスト".to_string(), 5);
+            m
+        });
+        predictor.save().unwrap();
+
+        let opts = crate::fasttext::FastTextExpandOptions {
+            vec_path: vec_file.path().to_path_buf(),
+            dict_path: None,
+            min_similarity: 0.58,
+            min_margin: 0.04,
+            max_per_target: 20,
+        };
+
+        let stats = predictor
+            .init_seed_with_fasttext(false, Some(&opts))
+            .unwrap()
+            .expect("expected stats");
+        assert!(stats.added_pairs >= 2);
+
+        // 既存の frequencies が維持されていること
+        assert_eq!(
+            predictor.frequencies.get("てすと").and_then(|m| m.get("テスト")).copied(),
+            Some(5)
+        );
+        // fastText で拡張されたペアと語幹エイリアス（「着る」->「着」）が効くこと
+        let ranked = predictor.rank_candidates(
+            &["カーディガン".to_string()],
+            "きr",
+            &["切".to_string(), "着".to_string(), "伐".to_string()],
+        );
+        assert_eq!(ranked[0], "着");
+
+        let ranked_cut = predictor.rank_candidates(
+            &["段ボール".to_string()],
+            "きr",
+            &["着".to_string(), "切".to_string(), "伐".to_string()],
+        );
+        assert_eq!(ranked_cut[0], "切");
     }
 }
