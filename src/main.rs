@@ -52,6 +52,17 @@ async fn main() -> anyhow::Result<()> {
             output,
             send_reload,
         }) => {
+            let writes_runtime_seed = match (&output, &history_path) {
+                (None, Some(_)) => true,
+                (Some(out), Some(hist)) => {
+                    out == hist
+                        || matches!(
+                            (std::fs::canonicalize(out), std::fs::canonicalize(hist)),
+                            (Ok(a), Ok(b)) if a == b
+                        )
+                }
+                _ => false,
+            };
             let target_path = output.or(history_path);
             let mut predictor = FrequencyPredictor::new_unloaded(target_path.clone());
             let fasttext_opts = fasttext.map(|vec_path| ruskkserv::fasttext::FastTextExpandOptions {
@@ -89,7 +100,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if send_reload {
-                send_sighup_to_ruskkserv();
+                if writes_runtime_seed {
+                    send_sighup_to_ruskkserv();
+                } else {
+                    tracing::warn!(
+                        path = ?target_path,
+                        "--send-reload skipped because --output does not target ~/.ruskkserv-frequency.json"
+                    );
+                }
             }
             return Ok(());
         }

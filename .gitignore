@@ -3,6 +3,8 @@
 .DS_Store
 ._*
 *.log
+*.vec
+*.vec.gz
 .vscode/
 .idea/
 backup/

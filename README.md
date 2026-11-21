@@ -187,7 +187,7 @@ RuSKKserv は自動学習を行わず、ユーザーが手動で編集・確認�
 ```
 
 ### 文脈共起プリセットの導入 (`init-seed`)
-日常会話・ビジネス・IT・医療・料理・自然・文化など幅広い分野の同音異義語グループを網羅した高カバレッジプリセット（基本 1,484 キー / 1,676 ペア、送り仮名語幹展開後 1,514 キー）を安全にマージ・導入できます。
+日常会話・ビジネス・IT・医療・料理・自然・文化など幅広い分野の同音異義語グループを網羅した高カバレッジプリセット（基本 1,475 キー / 1,662 ペア、送り仮名語幹展開後 1,505 キー）を安全にマージ・導入できます。
 
 ```sh
 # 既存の個人頻度データを保持したまま、文脈プリセットをマージ
@@ -197,7 +197,8 @@ ruskkserv init-seed
 ruskkserv init-seed --send-reload
 
 # 手元の fastText ベクトル (.vec) と SKK 辞書から独自の文脈共起語彙をさらに自動拡張
-ruskkserv init-seed --fasttext cc.ja.300.vec --dict SKK-JISYO.L --send-reload
+# （既定値は --min-similarity 0.58 --max-per-target 50 の保守的設定。同梱プリセット生成時は 0.52 / 12 を使用）
+ruskkserv init-seed --fasttext cc.ja.300.vec --dict SKK-JISYO.L --min-similarity 0.52 --max-per-target 12 --send-reload
 
 # 完全にプリセットの初期状態に戻す場合
 ruskkserv init-seed --force
