@@ -381,9 +381,11 @@ fn collect_needed_vectors(
 
     while let Some(within_limit) = read_bounded_line(&mut reader, &mut line_buf)? {
         if !within_limit {
+            is_first_nonempty = false;
             continue;
         }
         let Ok(line_str) = std::str::from_utf8(&line_buf) else {
+            is_first_nonempty = false;
             continue;
         };
         let trimmed = line_str.trim_end_matches('\r');
@@ -453,9 +455,11 @@ fn score_candidates_pass2(
 
     while let Some(within_limit) = read_bounded_line(&mut reader, &mut line_buf)? {
         if !within_limit {
+            is_first_nonempty = false;
             continue;
         }
         let Ok(line_str) = std::str::from_utf8(&line_buf) else {
+            is_first_nonempty = false;
             continue;
         };
         let trimmed = line_str.trim_end_matches('\r');
@@ -574,8 +578,13 @@ fn score_candidates_pass2(
     Ok((scanned_words, per_target_heaps))
 }
 
+#[inline]
+fn is_ascii_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// fastText `.vec` 先頭ヘッダ行（`<num_words> <dim>`）であれば次元数を返す。
-/// 次元数が `0` または `MAX_VECTOR_DIM` を超える不正なヘッダはエラーを返す。
+/// 次元数が `0`・`MAX_VECTOR_DIM` 超過・`usize` オーバーフローの不正確ヘッダはエラーを返す。
 fn try_parse_vec_header(line: &str) -> anyhow::Result<Option<usize>> {
     let mut parts = line.split_ascii_whitespace();
     let Some(first) = parts.next() else {
@@ -587,17 +596,18 @@ fn try_parse_vec_header(line: &str) -> anyhow::Result<Option<usize>> {
     if parts.next().is_some() {
         return Ok(None);
     }
-    let Ok(_count) = first.parse::<usize>() else {
+    if !is_ascii_digits(first) || !is_ascii_digits(second) {
         return Ok(None);
-    };
-    let Ok(dim) = second.parse::<usize>() else {
-        return Ok(None);
-    };
-    if dim == 0 || dim > MAX_VECTOR_DIM {
-        anyhow::bail!(
-            "fastText vector dimension {dim} is out of supported range (1..={MAX_VECTOR_DIM})"
-        );
     }
+    let Some(dim) = second
+        .parse::<usize>()
+        .ok()
+        .filter(|&d| (1..=MAX_VECTOR_DIM).contains(&d))
+    else {
+        anyhow::bail!(
+            "fastText vector dimension {second} is out of supported range (1..={MAX_VECTOR_DIM})"
+        );
+    };
     Ok(Some(dim))
 }
 
@@ -787,7 +797,10 @@ fn load_skk_dict_vocab_and_groups(
     dict_path: &Path,
     known_targets: &HashSet<String>,
 ) -> anyhow::Result<(HashSet<String>, HashMap<String, String>)> {
-    let bytes = std::fs::read(dict_path)?;
+    let bytes = crate::frequency::read_file_with_limit(
+        dict_path,
+        crate::frequency::MAX_DICT_FILE_BYTES,
+    )?;
     let content = match std::str::from_utf8(&bytes) {
         Ok(s) => std::borrow::Cow::Borrowed(s),
         Err(_) => {
@@ -813,20 +826,18 @@ fn load_skk_dict_vocab_and_groups(
 
         let candidates = crate::frequency::parse_dict_line_candidates(cands_part);
         let mut matched_targets: Vec<String> = Vec::new();
-        let okuri_suffix = trailing_okuri_suffix(midashi);
 
         for cand in candidates {
-            if is_valid_context_word(&cand) {
-                vocab.insert(cand.clone());
-            }
             if known_targets.contains(&cand) {
                 matched_targets.push(cand.clone());
             }
-            if okuri_suffix.is_some()
-                && let Some(expanded) = reconstruct_target_from_okuri_stem(&cand, cands_part, known_targets)
-            {
-                matched_targets.push(expanded);
+            if is_valid_context_word(&cand) {
+                vocab.insert(cand);
             }
+        }
+
+        if is_okuri_ari_midashi(midashi) && cands_part.contains('[') {
+            collect_okuri_targets(cands_part, known_targets, &mut matched_targets);
         }
 
         if matched_targets.len() >= 2 {
@@ -844,53 +855,53 @@ fn load_skk_dict_vocab_and_groups(
     Ok((vocab, dict_groups))
 }
 
-/// 送りあり見出し語（末尾が ASCII 英字）から送りキーを取得する。
-fn trailing_okuri_suffix(midashi: &str) -> Option<char> {
-    let last = midashi.chars().next_back()?;
-    if last.is_ascii_alphabetic() && midashi.chars().count() >= 2 {
-        Some(last.to_ascii_lowercase())
-    } else {
-        None
-    }
+/// 送りあり見出し語（長さ 2 文字以上で末尾が ASCII 英字）かを判定する。
+fn is_okuri_ari_midashi(midashi: &str) -> bool {
+    let mut chars = midashi.chars();
+    let Some(last) = chars.next_back() else {
+        return false;
+    };
+    last.is_ascii_alphabetic() && chars.next().is_some()
 }
 
-/// 送りブロック内に含まれる送り仮名と語幹候補から既知ターゲット終止形を照合する。
-fn reconstruct_target_from_okuri_stem(
-    stem: &str,
+/// 送りありエントリ内のブロック（`[送り仮名/候補/...]`）を 1 パスで走査し、
+/// 語幹と送り仮名を結合して `known_targets` に一致する終止形を `matched_targets` に追加する。
+fn collect_okuri_targets(
     cands_part: &str,
     known_targets: &HashSet<String>,
-) -> Option<String> {
+    matched_targets: &mut Vec<String>,
+) {
     let trimmed = cands_part.trim_matches('/');
     let mut current_okuri: Option<&str> = None;
     for part in trimmed.split('/') {
-        let mut p = part;
-        let starts = p.starts_with('[');
-        let ends = p.ends_with(']');
+        let starts = part.starts_with('[');
+        let ends = part.ends_with(']');
         if starts {
-            p = &p[1..];
-            if ends && p.len() >= 2 {
-                p = &p[..p.len() - 1];
-            }
-            current_okuri = Some(p);
-        } else if let Some(okuri) = current_okuri {
-            let candidate_text = if ends {
-                current_okuri = None;
-                &p[..p.len() - 1]
+            let inner = part.strip_prefix('[').unwrap_or(part);
+            current_okuri = if ends || inner.is_empty() {
+                None
             } else {
-                p
+                Some(inner)
             };
-            if crate::frequency::clean_candidate(candidate_text) == stem {
-                let full = format!("{stem}{okuri}");
-                if known_targets.contains(&full) {
-                    return Some(full);
-                }
-            }
+            continue;
         }
-        if ends && !starts {
+        let Some(okuri) = current_okuri else {
+            continue;
+        };
+        let candidate_part = if ends {
             current_okuri = None;
+            part.strip_suffix(']').unwrap_or(part)
+        } else {
+            part
+        };
+        let stem = crate::frequency::clean_candidate(candidate_part);
+        if !stem.is_empty() {
+            let full = format!("{stem}{okuri}");
+            if known_targets.contains(&full) {
+                matched_targets.push(full);
+            }
         }
     }
-    None
 }
 
 #[cfg(test)]
@@ -1006,34 +1017,41 @@ mod tests {
 
     #[test]
     fn test_fasttext_expansion_with_skk_dict_filter() {
+        // 組み込み homophone_group_key に無いペア（「染める」/「占める」）が
+        // SKK 辞書の送りありエントリ（`しm /[める/染/占/]/`）から同音グループとして補完され、
+        // 曖昧境界語がマージン不足で除外されることも併せて検証する
         let entries: &[(&str, &[f32])] = &[
-            ("服", &[1.0, 0.0, 0.0]),
-            ("シャツ", &[0.98, 0.0, 0.1]),
-            ("パーカー", &[0.96, 0.0, 0.1]),
-            ("非辞書造語", &[0.99, 0.0, 0.05]), // SKK 辞書に未登録のため除外される
-            ("肉", &[0.0, 1.0, 0.0]),
-            ("紙", &[0.0, 0.98, 0.1]),
+            ("服", &[1.0, 0.0, 0.0, 0.0]),
+            ("シャツ", &[0.98, 0.0, 0.1, 0.0]),
+            ("パーカー", &[0.96, 0.0, 0.1, 0.0]),
+            ("非辞書造語", &[0.99, 0.0, 0.05, 0.0]), // SKK 辞書に未登録のため除外される
+            ("肉", &[0.0, 1.0, 0.0, 0.0]),
+            ("紙", &[0.0, 0.98, 0.1, 0.0]),
+            ("布地", &[0.0, 0.0, 1.0, 0.0]),
+            ("染料", &[0.0, 0.0, 0.98, 0.05]),
+            ("割合", &[0.0, 0.0, 0.0, 1.0]),
+            ("比率", &[0.0, 0.0, 0.05, 0.98]),
+            ("曖昧語", &[0.0, 0.0, 0.70, 0.69]),
         ];
         let vec_file = write_vec_file(true, entries);
 
         let mut dict_file = NamedTempFile::new().unwrap();
+        writeln!(dict_file, ";; okuri-ari entries.").unwrap();
+        writeln!(dict_file, "しm /[める/染/占/]/").unwrap();
         writeln!(dict_file, ";; okuri-nasi entries.").unwrap();
         writeln!(dict_file, "ぱーかー /パーカー/").unwrap();
+        writeln!(dict_file, "あいまいご /曖昧語/").unwrap();
         writeln!(dict_file, "ふく /服/").unwrap();
 
         let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
-        ctx.entry("服".to_string())
-            .or_default()
-            .insert("着る".to_string(), 10);
-        ctx.entry("シャツ".to_string())
-            .or_default()
-            .insert("着る".to_string(), 10);
-        ctx.entry("肉".to_string())
-            .or_default()
-            .insert("切る".to_string(), 10);
-        ctx.entry("紙".to_string())
-            .or_default()
-            .insert("切る".to_string(), 10);
+        ctx.entry("服".to_string()).or_default().insert("着る".to_string(), 10);
+        ctx.entry("シャツ".to_string()).or_default().insert("着る".to_string(), 10);
+        ctx.entry("肉".to_string()).or_default().insert("切る".to_string(), 10);
+        ctx.entry("紙".to_string()).or_default().insert("切る".to_string(), 10);
+        ctx.entry("布地".to_string()).or_default().insert("染める".to_string(), 10);
+        ctx.entry("染料".to_string()).or_default().insert("染める".to_string(), 10);
+        ctx.entry("割合".to_string()).or_default().insert("占める".to_string(), 10);
+        ctx.entry("比率".to_string()).or_default().insert("占める".to_string(), 10);
 
         let opts = FastTextExpandOptions {
             vec_path: vec_file.path().to_path_buf(),
@@ -1046,6 +1064,8 @@ mod tests {
         let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
         assert!(ctx.contains_key("パーカー"));
         assert!(!ctx.contains_key("非辞書造語"));
+        // 送りありエントリ由来で「染める」と「占める」が同音競合グループ化され、「曖昧語」が除外されること
+        assert!(!ctx.contains_key("曖昧語"));
         assert_eq!(stats.added_pairs, 1);
     }
 
@@ -1142,23 +1162,26 @@ mod tests {
 
     #[test]
     fn test_rejects_huge_header_dimension_and_invalid_options() {
-        // 1. 巨大な次元数ヘッダでも panic せずエラーを返すこと
-        let mut huge_file = NamedTempFile::new().unwrap();
-        writeln!(huge_file, "1 4611686018427387903").unwrap();
-        writeln!(huge_file, "服 1.0 0.0").unwrap();
+        // 1. 巨大な次元数ヘッダ（usize 範囲内・usize オーバーフロー両パターン）でも panic せずエラーを返すこと
+        for huge_header in ["1 4611686018427387903", "1 99999999999999999999999999999", "1 0"] {
+            let mut huge_file = NamedTempFile::new().unwrap();
+            writeln!(huge_file, "{huge_header}").unwrap();
+            writeln!(huge_file, "服 1.0 0.0").unwrap();
 
-        let mut ctx = seed_anchor_context();
-        let huge_opts = FastTextExpandOptions {
-            vec_path: huge_file.path().to_path_buf(),
-            dict_path: None,
-            min_similarity: 0.58,
-            min_margin: 0.04,
-            max_per_target: 10,
-        };
-        let err = expand_context_with_fasttext(&mut ctx, &huge_opts).unwrap_err();
-        assert!(err.to_string().contains("out of supported range"));
+            let mut ctx = seed_anchor_context();
+            let huge_opts = FastTextExpandOptions {
+                vec_path: huge_file.path().to_path_buf(),
+                dict_path: None,
+                min_similarity: 0.58,
+                min_margin: 0.04,
+                max_per_target: 10,
+            };
+            let err = expand_context_with_fasttext(&mut ctx, &huge_opts).unwrap_err();
+            assert!(err.to_string().contains("out of supported range"));
+        }
 
         // 2. 範囲外の min_similarity / min_margin / max_per_target を拒否すること
+        let mut ctx = seed_anchor_context();
         let valid_vec = write_vec_file(true, &[("服", &[1.0, 0.0])]);
         for bad_sim in [-0.1_f32, 1.1_f32, f32::NAN, f32::INFINITY] {
             let bad = FastTextExpandOptions {

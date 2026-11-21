@@ -211,7 +211,8 @@ impl FrequencyPredictor {
     /// `"[る"` や `"]"` などの不要記号の混入を完全に防止する。
     /// context_frequencies が空の場合はデフォルトプリセットも自動注入する。
     pub fn import_from_skk_dict<P: AsRef<Path>>(&mut self, dict_path: P) -> anyhow::Result<()> {
-        let content = fs::read_to_string(dict_path)?;
+        let bytes = read_file_with_limit(dict_path.as_ref(), MAX_DICT_FILE_BYTES)?;
+        let content = String::from_utf8(bytes)?;
         self.reload_raw_if_exists()?;
 
         for line in content.lines() {
@@ -467,6 +468,34 @@ impl FrequencyPredictor {
         expand_map_aliases(&mut self.frequencies);
         expand_context_map_aliases(&mut self.context_frequencies);
     }
+}
+
+/// 辞書ファイル読込の最大許容サイズ（128 MiB）。
+pub(crate) const MAX_DICT_FILE_BYTES: u64 = 128 * 1024 * 1024;
+
+/// サイズ上限付きでファイルをバイト列として読み込む（巨大ファイルによる OOM 防止）。
+pub(crate) fn read_file_with_limit(path: &Path, max_bytes: u64) -> anyhow::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let file = fs::File::open(path)?;
+    if let Ok(meta) = file.metadata()
+        && meta.len() > max_bytes
+    {
+        anyhow::bail!(
+            "file exceeds maximum supported size ({max_bytes} bytes): {}",
+            path.display()
+        );
+    }
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if (buf.len() as u64) > max_bytes {
+        anyhow::bail!(
+            "file exceeds maximum supported size ({max_bytes} bytes): {}",
+            path.display()
+        );
+    }
+    Ok(buf)
 }
 
 /// マップからスコアを取得する。
@@ -1302,5 +1331,17 @@ mod tests {
             &["着".to_string(), "切".to_string(), "伐".to_string()],
         );
         assert_eq!(ranked_cut[0], "切");
+    }
+
+    #[test]
+    fn test_read_file_with_limit_rejects_oversized_file() {
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(b"0123456789").unwrap();
+
+        assert_eq!(read_file_with_limit(file.path(), 10).unwrap(), b"0123456789");
+        assert!(read_file_with_limit(file.path(), 9).is_err());
     }
 }

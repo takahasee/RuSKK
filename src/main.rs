@@ -52,18 +52,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             send_reload,
         }) => {
-            let writes_runtime_seed = match (&output, &history_path) {
-                (None, Some(_)) => true,
-                (Some(out), Some(hist)) => {
-                    out == hist
-                        || matches!(
-                            (std::fs::canonicalize(out), std::fs::canonicalize(hist)),
-                            (Ok(a), Ok(b)) if a == b
-                        )
-                }
-                _ => false,
-            };
-            let target_path = output.or(history_path);
+            let target_path = output.clone().or_else(|| history_path.clone());
             let mut predictor = FrequencyPredictor::new_unloaded(target_path.clone());
             let fasttext_opts = fasttext.map(|vec_path| ruskkserv::fasttext::FastTextExpandOptions {
                 vec_path,
@@ -100,6 +89,18 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             if send_reload {
+                // ファイル保存完了後に同一実体判定（新規作成した相対パスでも canonicalize できるよう保存後に評価）
+                let writes_runtime_seed = match (&output, &history_path) {
+                    (None, Some(_)) => true,
+                    (Some(out), Some(hist)) => {
+                        out == hist
+                            || matches!(
+                                (std::fs::canonicalize(out), std::fs::canonicalize(hist)),
+                                (Ok(a), Ok(b)) if a == b
+                            )
+                    }
+                    _ => false,
+                };
                 if writes_runtime_seed {
                     send_sighup_to_ruskkserv();
                 } else {
