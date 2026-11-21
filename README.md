@@ -29,7 +29,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  yaskkserv2 (:1179, デフォルト�
    - 送りあり動詞の語幹エイリアス展開（`切る` ↔ `切`）のみを行い、漢字・カタカナ名詞の途中スライスによる接頭断片混入を完全排除。
 3. **直前確定単語に基づく文脈連動候補昇格（Context Ranking）**:
    - 「肉」確定後の `きr` → 「切る（切）」、「服」確定後なら「着る（着）」、「木」確定後なら「伐る（伐）」を第1候補に自動昇格。
-   - 「時間」→「計る」、「体重」→「量る」、「距離」→「測る」など、478組の文脈共起ペア（基本421キー、送り仮名語幹展開後441キー）を標準サポート。
+   - 「時間」→「計る」、「体重」→「量る」、「距離」→「測る」など、850組の手動キュレーション済み文脈共起ペア（基本751キー、送り仮名語幹展開後783キー）を標準サポート。
    - **macSKK 特有の挙動対策**: ▽ モード開始時の過渡的 1 文字 Lookup やキー連射、接頭語・接尾語入力による文脈汚染を自動防御。
 4. **macOS システム辞書（大辞林等）・SKK 注釈優先と送りなし断片降格（Annotation Priority）**:
    - 国語辞典の見出し語と一致する標準的な単語や注釈付き単語を優先し、動詞活用断片や助詞混じり断片（`がそ`→`貸そ`、`みぎや`→`右や`、`げそ`→`解そ` 等）を後方に降格（`t` → `う`/`る`、`k` → `い` の終止形復元により促音便・形容詞語幹も確実に保護）。`azookey-first` モードで azooKey が辞書未掲載の誤結合（`せつびご`→`設備後` 等）を返した際も yaskkserv2 候補を自動補完。
@@ -137,7 +137,7 @@ macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ 通常見出し: 参照順�
 * **補完連射ガード**:
   macSKK がキー入力中に送信する 50ms 未満の機械的スキャンは文脈登録から自動除外されます。
 * **組み込みプリセットへの自動フォールバック**:
-  seed ファイル未作成時やデータ不在時でも、バイナリ組み込みの共起プリセット（基本421キー / 478組、送り仮名語幹展開後441キー）がメモリ上で自動適用されます。
+  seed ファイル未作成時やデータ不在時でも、バイナリ組み込みの共起プリセット（基本751キー / 850組、送り仮名語幹展開後783キー）がメモリ上で自動適用されます。
 
 > **ロールバック**: 文脈連動を無効化したい場合は、CLI 引数 `--context-ranking=false` または環境変数 `RUSKKSERV_CONTEXT_RANKING=0` で即座に切り替えられます（CLI 引数が優先されます）。
 
@@ -187,15 +187,24 @@ RuSKKserv は自動学習を行わず、ユーザーが手動で編集・確認�
 ```
 
 ### 文脈共起プリセットの導入 (`init-seed`)
-日常会話・ビジネス・IT・医療・料理など幅広い分野を網羅したプリセット（基本421キー / 478ペア、送り仮名語幹展開後441キー）を安全にマージ・導入できます。
+日常会話・ビジネス・IT・医療・料理・自然・文化など幅広い分野の同音異義語グループを網羅した手動アンカープリセット（基本 751 キー / 850 ペア、送り仮名語幹展開後 783 キー）を安全にマージ・導入できます。
 
 ```sh
 # 既存の個人頻度データを保持したまま、文脈プリセットをマージ
 ruskkserv init-seed
 
+# 既存の個人頻度データを保持したままマージし、稼働中プロセスに即座に反映
+ruskkserv init-seed --send-reload
+
+# 各自で別途取得した fastText ベクトル (.vec) や SKK 辞書からローカル環境の共起語彙をさらに自動拡張する場合（任意）
+# （既定値: --min-similarity 0.58 --min-margin 0.04 --max-per-target 50）
+ruskkserv init-seed --fasttext cc.ja.300.vec --dict SKK-JISYO.L --min-similarity 0.52 --max-per-target 12 --send-reload
+
 # 完全にプリセットの初期状態に戻す場合
 ruskkserv init-seed --force
 ```
+
+> **Note (外部データのライセンスについて)**: 本リポジトリに同梱している `data/default-seed.json` は手動作成アンカーのみ（MIT License）で構成されており、外部の学習済みモデルや辞書データに由来するエントリは含みません。`--fasttext` や `--dict` オプションを用いて各自ローカル環境で拡張する場合、代表的な外部データのうち fastText の学習済み日本語モデル（`cc.ja.300.vec` 等）は **CC BY-SA 3.0**、`SKK-JISYO.L` は **GNU GPL v2 or later** で配布されています。手元の個人利用に加えて、これら外部データから拡張した seed ファイルを第三者へ再配布・公開する場合は、各配布元のライセンス条件に従ってください。
 
 ### SIGHUP によるホットリロード
 RuSKKserv プロセスは `SIGHUP` を受信すると、接続を切断することなく最新の `~/.ruskkserv-frequency.json` をメモリ上へ即座に再読み込みします。
@@ -297,8 +306,15 @@ Subcommand: init-seed
 Usage: ruskkserv init-seed [OPTIONS]
 
 Options:
-  -f, --force  Overwrite completely with presets instead of merging with existing data
-  -h, --help   Print help
+  -f, --force                            Overwrite completely with presets instead of merging with existing data
+      --fasttext <FASTTEXT>              fastText .vec file path to automatically expand context co-occurrence pairs
+      --dict <DICT>                      Optional SKK dictionary path (UTF-8 / EUC-JP) used to filter valid words and homophone groups
+      --min-similarity <MIN_SIMILARITY>  Minimum cosine similarity threshold for fastText expansion [default: 0.58]
+      --min-margin <MIN_MARGIN>          Minimum margin between top homophone targets for fastText expansion [default: 0.04]
+      --max-per-target <MAX_PER_TARGET>  Maximum number of new context words added per target candidate [default: 50]
+  -o, --output <OUTPUT>                  Output seed JSON path (defaults to ~/.ruskkserv-frequency.json)
+      --send-reload                      Send SIGHUP to running ruskkserv process after updating the seed file
+  -h, --help                             Print help
 ```
 
 ---
@@ -318,3 +334,5 @@ Options:
 ## ライセンス
 
 [MIT License](LICENSE)
+
+本リポジトリのソースコードおよび同梱プリセット（`data/default-seed.json`）は MIT License で提供されています。`ruskkserv init-seed --fasttext` / `--dict` オプションで使用する外部の学習済みモデル（例: fastText `cc.ja.300.vec` の CC BY-SA 3.0）および SKK 辞書（例: `SKK-JISYO.L` の GNU GPL v2 or later）には、各配布元のライセンスが適用されます。

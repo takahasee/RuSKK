@@ -42,17 +42,55 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Some(ruskkserv::config::Command::InitSeed { force }) => {
-            let mut predictor = FrequencyPredictor::new_unloaded(history_path.clone());
-            if let Err(e) = predictor.init_seed(force) {
-                tracing::error!("Failed to initialize seed file: {}", e);
-                std::process::exit(1);
+        Some(ruskkserv::config::Command::InitSeed {
+            force,
+            fasttext,
+            dict,
+            min_similarity,
+            min_margin,
+            max_per_target,
+            output,
+            send_reload,
+        }) => {
+            let target_path = output.or(history_path);
+            let mut predictor = FrequencyPredictor::new_unloaded(target_path.clone());
+            let fasttext_opts = fasttext.map(|vec_path| ruskkserv::fasttext::FastTextExpandOptions {
+                vec_path,
+                dict_path: dict,
+                min_similarity,
+                min_margin,
+                max_per_target,
+            });
+            match predictor.init_seed_with_fasttext(force, fasttext_opts.as_ref()) {
+                Ok(stats) => {
+                    if let Some(s) = stats {
+                        info!(
+                            path = ?target_path,
+                            force = force,
+                            dimension = s.dimension,
+                            matched_anchors = s.matched_anchors,
+                            active_targets = s.active_targets,
+                            scanned_words = s.scanned_words,
+                            added_pairs = s.added_pairs,
+                            added_context_keys = s.added_context_keys,
+                            "Successfully initialized/merged presets and expanded with fastText!"
+                        );
+                    } else {
+                        info!(
+                            path = ?target_path,
+                            force = force,
+                            "Successfully initialized/merged default context presets into seed file!"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Failed to initialize seed file: {}", e);
+                    std::process::exit(1);
+                }
             }
-            info!(
-                path = ?history_path,
-                force = force,
-                "Successfully initialized/merged default context presets into seed file!"
-            );
+            if send_reload {
+                send_sighup_to_ruskkserv();
+            }
             return Ok(());
         }
         None => {}

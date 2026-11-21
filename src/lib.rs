@@ -2,6 +2,7 @@ pub mod backend;
 pub mod cache;
 pub mod config;
 pub mod encoding;
+pub mod fasttext;
 pub mod frequency;
 pub mod okuri;
 pub mod protocol;
