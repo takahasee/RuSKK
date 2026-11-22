@@ -51,10 +51,12 @@ impl FrequencyPredictor {
     }
 
     pub fn load<P: AsRef<Path>>(&mut self, path: P) -> anyhow::Result<()> {
-        if !path.as_ref().exists() {
+        let path = path.as_ref();
+        if !path.exists() {
             return Ok(());
         }
-        let data = fs::read_to_string(path)?;
+        let bytes = read_file_with_limit(path, MAX_DICT_FILE_BYTES)?;
+        let data = String::from_utf8(bytes)?;
         let loaded: FrequencyPredictor = serde_json::from_str(&data)?;
         self.frequencies = loaded.frequencies;
         self.context_frequencies = loaded.context_frequencies;
@@ -69,7 +71,8 @@ impl FrequencyPredictor {
         if let Some(ref path) = self.storage_path
             && path.exists()
         {
-            let data = fs::read_to_string(path)?;
+            let bytes = read_file_with_limit(path, MAX_DICT_FILE_BYTES)?;
+            let data = String::from_utf8(bytes)?;
             if !data.trim().is_empty() {
                 let loaded: FrequencyPredictor = serde_json::from_str(&data)?;
                 self.frequencies = loaded.frequencies;
@@ -269,6 +272,12 @@ impl FrequencyPredictor {
     /// expand_aliases() によりロード時にエイリアスが展開済みのため、O(1) の HashMap::get のみで完結する。
     fn get_context_map<'a>(&'a self, ctx: &str) -> Option<&'a HashMap<String, u64>> {
         self.context_frequencies.get(ctx)
+    }
+
+    /// 指定した直前確定単語 `ctx` に対する文脈共起ルールが存在するか返す。
+    #[inline]
+    pub fn has_context_rules(&self, ctx: &str) -> bool {
+        self.get_context_map(ctx).is_some()
     }
 
     /// frequencies から見出し語マップを取得する。
@@ -1343,5 +1352,28 @@ mod tests {
 
         assert_eq!(read_file_with_limit(file.path(), 10).unwrap(), b"0123456789");
         assert!(read_file_with_limit(file.path(), 9).is_err());
+    }
+
+    #[test]
+    fn test_has_context_rules() {
+        let mut predictor = FrequencyPredictor::new(None);
+        assert!(!predictor.has_context_rules("服"));
+        assert!(!predictor.has_context_rules("未登録語"));
+
+        predictor.context_frequencies.insert("服".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("着る".to_string(), 10);
+            m
+        });
+        predictor.context_frequencies.insert("確認する".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("事項".to_string(), 10);
+            m
+        });
+        predictor.expand_aliases();
+
+        assert!(predictor.has_context_rules("服"));
+        assert!(predictor.has_context_rules("確認"));
+        assert!(!predictor.has_context_rules("未登録語"));
     }
 }

@@ -134,14 +134,6 @@ impl Args {
         )
     }
 
-    pub fn primary(&self) -> Backend {
-        self.azookey()
-    }
-
-    pub fn fallback(&self) -> Backend {
-        self.yaskkserv2()
-    }
-
     pub fn resolved_backend_order(&self) -> BackendOrder {
         if let Some(order) = self.backend_order {
             return order;

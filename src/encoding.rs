@@ -109,6 +109,7 @@ pub fn has_multiple_candidates(response: &[u8]) -> bool {
 /// レスポンスバイト列に角括弧ブロック（例: `/[っ/思/]/`）が含まれているかを判定する。
 /// 角括弧ブロックを含むレスポンスに対して単純なスラッシュ分割ソートを行うとブロック構造が破壊されるため、
 /// この判定を用いて並び替えを安全にスキップする。
+#[cfg(test)]
 #[inline]
 pub fn contains_bracket_block(response: &[u8]) -> bool {
     memchr::memchr2(b'[', b']', response).is_some()
@@ -162,6 +163,7 @@ pub fn parse_candidates_borrowed(response: &[u8]) -> Vec<&str> {
 /// レスポンスバイト列から候補リストをパースする。
 /// SKKの送りあり辞書エントリ（例: `1/[っ/思/]/重/御持/想;注釈/`）に含まれる
 /// 角括弧ブロック `[送り仮名/候補...]` も適切に展開し、語幹候補を抽出する。
+#[cfg(test)]
 pub fn parse_candidates_unpacked(response: &[u8]) -> Vec<String> {
     parse_candidates_unpacked_borrowed(response)
         .into_iter()

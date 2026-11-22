@@ -22,6 +22,8 @@ const MAX_LINE_BYTES: u64 = 8192;
 const MAX_CONCURRENT_CLIENTS: usize = 64;
 /// クライアント接続の無通信アイドルタイムアウト
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// クライアントへの応答書き込みタイムアウト（スローリーダーによる接続枠枯渇防止）
+const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// 1 回の Lookup / Completion 全体に許容する上限（macSKK の 1.0 秒制限に安全マージンを持たせる）
 const OVERALL_LOOKUP_DEADLINE: Duration = Duration::from_millis(850);
 /// 同期システム辞書 FFI 照会に許すデッドライン手前の安全マージン
@@ -312,17 +314,17 @@ async fn handle_client(
             Request::Version => {
                 const VERSION_RESP: &[u8] =
                     concat!("ruskkserv/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
-                writer.write_all(VERSION_RESP).await?;
+                write_client_response(&mut writer, VERSION_RESP).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Host => {
                 let host = format!("ruskkserv/{}: ", proxy.listen);
-                writer.write_all(host.as_bytes()).await?;
+                write_client_response(&mut writer, host.as_bytes()).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Lookup(midashi) => {
                 if midashi.is_empty() {
-                    writer.write_all(b"4\n").await?;
+                    write_client_response(&mut writer, b"4\n").await?;
                     conn_last_response_time = Some(Instant::now());
                     continue;
                 }
@@ -352,12 +354,20 @@ async fn handle_client(
                     }
                 };
 
-                let ctx_ref = if proxy.context_ranking && !is_affix {
-                    if let Some(ref c) = session_ctx_snapshot {
-                        std::slice::from_ref(c)
-                    } else {
-                        &[]
-                    }
+                // 文脈共起ルールが存在しない直前語は None に正規化し、LookupCache の重複登録・ミスを防ぐ
+                let has_ctx_rules = if proxy.context_ranking
+                    && !is_affix
+                    && let Some(ref c) = session_ctx_snapshot
+                {
+                    let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                    guard.has_context_rules(c)
+                } else {
+                    false
+                };
+                let ctx_ref = if has_ctx_rules
+                    && let Some(ref c) = session_ctx_snapshot
+                {
+                    std::slice::from_ref(c)
                 } else {
                     &[]
                 };
@@ -374,14 +384,10 @@ async fn handle_client(
                         && !is_completion_burst
                         && let Some(ref top) = cached.top_candidate
                     {
-                        let clean = crate::frequency::clean_candidate(top);
-                        if contains_kanji(clean) {
-                            let mut ctx =
-                                shared_context.lock().unwrap_or_else(|e| e.into_inner());
-                            ctx.on_lookup_result(&midashi_str, Arc::from(clean), now);
-                        }
+                        let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
+                        ctx.on_lookup_result(&midashi_str, Arc::clone(top), now);
                     }
-                    writer.write_all(&cached.response).await?;
+                    write_client_response(&mut writer, &cached.response).await?;
                     conn_last_response_time = Some(Instant::now());
                     continue;
                 }
@@ -412,7 +418,7 @@ async fn handle_client(
                             },
                         );
                     }
-                    writer.write_all(&resp_arc).await?;
+                    write_client_response(&mut writer, &resp_arc).await?;
                     conn_last_response_time = Some(Instant::now());
                     continue;
                 }
@@ -448,11 +454,8 @@ async fn handle_client(
                     && !is_completion_burst
                     && let Some(ref top) = outcome.top_candidate
                 {
-                    let clean = crate::frequency::clean_candidate(top);
-                    if contains_kanji(clean) {
-                        let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
-                        ctx.on_lookup_result(&midashi_str, Arc::from(clean), now);
-                    }
+                    let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
+                    ctx.on_lookup_result(&midashi_str, Arc::clone(top), now);
                 }
 
                 let resp_arc: Arc<[u8]> = Arc::from(outcome.response);
@@ -461,18 +464,18 @@ async fn handle_client(
                         crate::cache::LookupKey::new(ctx_key, &midashi_str),
                         crate::cache::CachedLookup {
                             response: Arc::clone(&resp_arc),
-                            top_candidate: outcome.top_candidate.map(Arc::from),
+                            top_candidate: outcome.top_candidate,
                         },
                     );
                 }
 
                 trace!(?peer, resp = ?String::from_utf8_lossy(&resp_arc), "sending response to client");
-                writer.write_all(&resp_arc).await?;
+                write_client_response(&mut writer, &resp_arc).await?;
                 conn_last_response_time = Some(Instant::now());
             }
             Request::Completion(prefix) => {
                 if prefix.is_empty() {
-                    writer.write_all(b"4\n").await?;
+                    write_client_response(&mut writer, b"4\n").await?;
                     conn_last_response_time = Some(Instant::now());
                     continue;
                 }
@@ -511,7 +514,7 @@ async fn handle_client(
                     }
                 };
                 trace!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
-                writer.write_all(&response).await?;
+                write_client_response(&mut writer, &response).await?;
                 conn_last_response_time = Some(Instant::now());
             }
         }
@@ -520,10 +523,31 @@ async fn handle_client(
     Ok(())
 }
 
+async fn write_client_response(
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    data: &[u8],
+) -> anyhow::Result<()> {
+    match tokio::time::timeout(CLIENT_WRITE_TIMEOUT, writer.write_all(data)).await {
+        Ok(res) => Ok(res?),
+        Err(_) => anyhow::bail!("client write timed out after {CLIENT_WRITE_TIMEOUT:?}"),
+    }
+}
+
 struct LookupOutcome {
     response: Vec<u8>,
-    top_candidate: Option<String>,
+    /// クレンジング済みかつ漢字を含む第1候補（文脈追跡およびキャッシュ共有用）
+    top_candidate: Option<Arc<str>>,
     skip_cache: bool,
+}
+
+#[inline]
+fn extract_kanji_top_candidate(top: Option<&str>) -> Option<Arc<str>> {
+    let clean = crate::frequency::clean_candidate(top?);
+    if contains_kanji(clean) {
+        Some(Arc::from(clean))
+    } else {
+        None
+    }
 }
 
 /// 候補スライスに対し、必要に応じてシステム辞書／頻度／文脈共起による並び替えとキャッシュ前登録を行い、レスポンスを生成する。
@@ -564,7 +588,7 @@ fn rank_candidates_to_response(
             proxy.annotation_priority,
             ffi_deadline,
         );
-        let top_candidate = ranked.first().map(|&t| t.to_string());
+        let top_candidate = extract_kanji_top_candidate(ranked.first().copied());
         LookupOutcome {
             response: format_candidates_response_str(&ranked),
             top_candidate,
@@ -580,7 +604,7 @@ fn rank_candidates_to_response(
                 Some(rank_midashi.to_string()),
             )]);
         }
-        let top_candidate = cands.first().map(|&t| t.to_string());
+        let top_candidate = extract_kanji_top_candidate(cands.first().copied());
         LookupOutcome {
             response: format_candidates_response_str(cands),
             top_candidate,
@@ -658,7 +682,7 @@ fn finalize_raw_response(
             Some(rank_midashi.to_string()),
         )]);
     }
-    let top_candidate = extract_first_candidate(&response).map(|s| s.to_string());
+    let top_candidate = extract_kanji_top_candidate(extract_first_candidate(&response));
     LookupOutcome {
         response,
         top_candidate,
@@ -690,20 +714,21 @@ async fn expand_azookey_okuri(
     }
 
     // azoo-key-skkserv のコネクションプールを活用し、全活用形を完全並行照会
-    let mut handles = Vec::with_capacity(variations.len());
+    // JoinSet により、ヘッジタイムアウト等でこの Future がドロップされても配下タスクを自動 abort する
+    let mut join_set = tokio::task::JoinSet::new();
     for (idx, var) in variations.into_iter().enumerate() {
         let backend = azookey.clone();
-        handles.push(tokio::spawn(async move {
+        join_set.spawn(async move {
             let okuri_req = Request::Lookup(var.query_midashi.as_bytes());
             let res = backend.query_with_timeout(&okuri_req, okuri_timeout).await;
             (idx, res, var)
-        }));
+        });
     }
 
-    let mut query_results = Vec::with_capacity(handles.len());
-    for handle in handles {
-        if let Ok(res) = handle.await {
-            query_results.push(res);
+    let mut query_results = Vec::with_capacity(join_set.len());
+    while let Some(res) = join_set.join_next().await {
+        if let Ok(item) = res {
+            query_results.push(item);
         }
     }
     // 活用の優先順位（order_suffixes_for_stem）を保持するため、元のインデックス順に整列
@@ -911,7 +936,7 @@ async fn handle_lookup_yaskkserv2_first(
     overall_deadline: Duration,
 ) -> LookupOutcome {
     let is_okuri_candidate =
-        proxy.okuri_expansion && !crate::okuri::expand_okuri_variations(midashi_str).is_empty();
+        proxy.okuri_expansion && crate::okuri::has_okuri_variations(midashi_str);
 
     let (response, okuri_stems_opt, hit) = lookup_yaskkserv2_then_azookey(
         proxy,
@@ -969,9 +994,7 @@ async fn handle_lookup_azookey_first(
     is_completion_burst: bool,
 ) -> LookupOutcome {
     // 送りあり見出し（例: "かk" -> "かく", "交ぜGk" -> "交ぜがき"）の活用復元試行
-    if proxy.okuri_expansion
-        && !crate::okuri::expand_okuri_variations(midashi_str).is_empty()
-    {
+    if proxy.okuri_expansion && crate::okuri::has_okuri_variations(midashi_str) {
         let remaining_overall = overall_deadline.saturating_sub(lookup_start.elapsed());
         let fb_timeout = proxy
             .yaskkserv2

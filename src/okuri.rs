@@ -504,6 +504,20 @@ fn order_suffixes_for_stem(
     }
 }
 
+/// 送りあり見出しから展開可能な活用バリエーションが存在するかをゼロアロケーションで判定する。
+/// `!expand_okuri_variations(midashi).is_empty()` と等価だが、判定のみで `Vec`/`String` を確保しない。
+#[inline]
+pub fn has_okuri_variations(midashi: &str) -> bool {
+    match parse_okuri_midashi_extended(midashi) {
+        Some(OkuriMidashi::Explicit { .. }) => true,
+        Some(OkuriMidashi::Compound {
+            romaji, okuri_key, ..
+        }) => romaji_to_hiragana(romaji).is_some() && !okuri_key_to_suffixes(okuri_key).is_empty(),
+        Some(OkuriMidashi::Simple { key, .. }) => !okuri_key_to_suffixes(key).is_empty(),
+        None => false,
+    }
+}
+
 /// 送りあり見出しから、azooKey に照会すべき平仮名・語幹バリエーションを展開する。
 /// 例: "といあわs" -> [("といあわす", "す"), ("といあわし", "し"), ("といあわせ", "せ")]
 /// 例: "交ぜGak"   -> [("交ぜがき", "き"), ("交ぜがく", "く"), ("交ぜがけ", "け")]
@@ -1003,5 +1017,34 @@ mod tests {
         // 接頭語・接尾語は通常の送りあり動詞展開対象から除外されること
         assert_eq!(parse_okuri_midashi_extended(">わたs"), None);
         assert_eq!(parse_okuri_midashi_extended("さい>"), None);
+    }
+
+    #[test]
+    fn test_has_okuri_variations_matches_expand_okuri_variations() {
+        let samples = [
+            "かk",
+            "きr",
+            "まt",
+            "おもu",
+            "交ぜGk",
+            "交ぜGak",
+            "ねあ*げ",
+            "まぜ*がk",
+            "あい",
+            "とうきょう",
+            "さい>",
+            ">わたs",
+            "->",
+            "かz",
+            "交ぜXk",
+            "",
+        ];
+        for midashi in samples {
+            assert_eq!(
+                has_okuri_variations(midashi),
+                !expand_okuri_variations(midashi).is_empty(),
+                "mismatch for midashi={midashi:?}"
+            );
+        }
     }
 }

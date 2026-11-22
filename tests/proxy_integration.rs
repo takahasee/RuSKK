@@ -3091,3 +3091,124 @@ async fn test_proxy_yaskkserv2_first_hedges_slow_yaskkserv2_to_azookey() {
     yaskk_handle.abort();
     azoo_handle.abort();
 }
+
+#[tokio::test]
+async fn test_proxy_lookup_cache_normalizes_unregistered_context_keys() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let kir_backend_count = Arc::new(AtomicUsize::new(0));
+    let kir_count_clone = Arc::clone(&kir_backend_count);
+
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            let kir_count = Arc::clone(&kir_count_clone);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("やまだ") {
+                        let _ = stream.write_all("1/山田/\n".as_bytes()).await;
+                    } else if req.contains("たなか") {
+                        let _ = stream.write_all("1/田中/\n".as_bytes()).await;
+                    } else if req.contains("ふく") {
+                        let _ = stream.write_all("1/服/\n".as_bytes()).await;
+                    } else if req.contains("きr") {
+                        kir_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all("1/切/着/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.context_frequencies.insert("服".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 10);
+        m
+    });
+    predictor.expand_aliases();
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(500),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Arc::clone(&lookup_cache),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 未登録語「山田」を入力後、「きr」を変換 -> 初回なのでバックエンドを 1 回呼ぶ
+    client.write_all("1やまだ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/山田/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/切/着/\n");
+    assert_eq!(kir_backend_count.load(Ordering::SeqCst), 1);
+
+    // 2. 別の未登録語「田中」を入力後、再度「きr」を変換 -> 文脈キーが None に正規化されキャッシュヒットし、バックエンド呼び出しは増えないこと
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1たなか \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/田中/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/切/着/\n");
+    assert_eq!(kir_backend_count.load(Ordering::SeqCst), 1);
+
+    // 3. 登録済み文脈語「服」を入力後、「きr」を変換 -> 文脈ルールありのためキャッシュキーが (Some("服"), "きr") となり「着」が先頭に昇格すること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1ふく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/着/切/\n");
+    assert_eq!(kir_backend_count.load(Ordering::SeqCst), 2);
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}

@@ -394,15 +394,6 @@ impl SystemDictCache {
         Self::default()
     }
 
-    /// キャッシュに既に存在するか確認する（FFI照会を行わないゼロレイテンシパス）
-    pub fn has_cached_definition(&self, word: &str) -> Option<bool> {
-        if word.is_empty() {
-            return Some(false);
-        }
-        let guard = self.cache.read().ok()?;
-        guard.map.get(word).copied()
-    }
-
     /// 単語がシステム辞書に存在するか、1 回の read ロック参照＋予算期限制御で判定する。
     /// キャッシュミス時、`allow_cold_ffi == false` または予算超過で FFI を開始できない場合は `None` を返す。
     pub(crate) fn lookup_with_budget(
@@ -445,23 +436,6 @@ impl SystemDictCache {
 
         Some(res)
     }
-
-    /// 単語がシステム辞書に存在するか、予算期限・キャッシュ付きで判定する。
-    /// ロック競合等で期限内に FFI を開始できなかった場合は `None` を返す（キャッシュには書き込まない）。
-    pub(crate) fn has_definition_with_deadline(
-        &self,
-        word: &str,
-        ffi_deadline: Option<std::time::Instant>,
-        track_foreground: bool,
-    ) -> Option<bool> {
-        self.lookup_with_budget(word, true, ffi_deadline, track_foreground)
-    }
-
-    /// 単語がシステム辞書に存在するか、キャッシュ付きで高速判定する。
-    pub fn has_definition(&self, word: &str) -> bool {
-        self.has_definition_with_deadline(word, None, false)
-            .unwrap_or(false)
-    }
 }
 
 /// グローバルなシステム辞書キャッシュのシングルトン
@@ -474,6 +448,7 @@ fn global_dict_cache() -> &'static SystemDictCache {
 /// 送りあり見出し（例: "かk", "すばらしi"）が渡された場合、語幹＋終止形（例: "書く", "素晴らしい"）でも判定する。
 /// `allow_cold_ffi` が false または `ffi_deadline` を超過した場合はインメモリキャッシュのみを参照し、
 /// 未キャッシュの重い FFI 照会をスキップする。戻り値は `(辞書掲載/注釈ありか, 予算超過/禁止により未キャッシュ FFI をスキップしたか)`。
+#[cfg(test)]
 pub fn is_annotated_or_in_dict_budgeted(
     candidate: &str,
     midashi: Option<&str>,
@@ -574,18 +549,6 @@ fn is_annotated_or_in_dict_impl(
     }
 }
 
-/// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する（annotationが引ける）」か判定する。
-/// `allow_cold_ffi` が false の場合、インメモリキャッシュに存在する結果のみを使用し、
-/// 未キャッシュ時の重い FFI 照会をスキップする。
-#[inline]
-pub fn is_annotated_or_in_dict_fast(
-    candidate: &str,
-    midashi: Option<&str>,
-    allow_cold_ffi: bool,
-) -> bool {
-    is_annotated_or_in_dict_budgeted(candidate, midashi, allow_cold_ffi, None).0
-}
-
 struct PrewarmState {
     queue: Mutex<VecDeque<(String, Option<String>)>>,
     cvar: Condvar,
@@ -633,37 +596,31 @@ fn global_prewarm_queue() -> &'static Arc<PrewarmState> {
 
 /// 予算制限により本番リクエスト中にスキップされた候補群や起動時代表語を、
 /// 単一の有界バックグラウンドワーカースレッド（最大 256 件）へ投入して先行登録する。
+/// キュー内に既に同一エントリが存在する場合は重複投入を抑止する。
 /// ワーカーはフォアグラウンド変換中の場合一時譲歩し、ユーザー入力をブロックしない。
 pub fn enqueue_prewarm(entries: impl IntoIterator<Item = (String, Option<String>)>) {
     let state = global_prewarm_queue();
     let mut guard = state.queue.lock().unwrap_or_else(|e| e.into_inner());
+    let mut added = false;
     for entry in entries {
         if guard.len() >= MAX_PREWARM_QUEUE {
             break;
         }
-        guard.push_back(entry);
-    }
-    state.cvar.notify_one();
-}
-
-/// 予算制限により本番リクエスト中にスキップされた候補群を同期的にシステム辞書キャッシュへ先行登録する。
-/// フォアグラウンド変換が FFI を待機・実行中の場合は一時譲歩し、ユーザー入力をブロックしない。
-pub fn prewarm_entries(entries: &[(String, Option<String>)]) {
-    for (candidate, midashi) in entries {
-        let mut waited = 0u8;
-        while FOREGROUND_FFI_WAITERS.load(Ordering::Acquire) > 0 && waited < 50 {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            waited += 1;
+        if !guard.iter().any(|existing| existing == &entry) {
+            guard.push_back(entry);
+            added = true;
         }
-        let parsed = midashi.as_deref().and_then(parse_okuri_midashi_extended);
-        let _ = is_annotated_or_in_dict_impl(candidate, parsed.as_ref(), true, None, false);
+    }
+    if added {
+        state.cvar.notify_one();
     }
 }
 
 /// 候補単語が「SKK注釈付き」または「システム辞書に項目が存在する」か判定する（標準判定）。
 #[inline]
 pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
-    is_annotated_or_in_dict_fast(candidate, midashi, true)
+    let parsed_okuri = midashi.and_then(parse_okuri_midashi_extended);
+    is_annotated_or_in_dict_impl(candidate, parsed_okuri.as_ref(), true, None, true).0
 }
 
 #[cfg(test)]
