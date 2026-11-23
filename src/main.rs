@@ -49,6 +49,7 @@ async fn main() -> anyhow::Result<()> {
             min_similarity,
             min_margin,
             max_per_target,
+            include_non_competing,
             output,
             send_reload,
         }) => {
@@ -60,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
                 min_similarity,
                 min_margin,
                 max_per_target,
+                include_non_competing,
             });
             match predictor.init_seed_with_fasttext(force, fasttext_opts.as_ref()) {
                 Ok(stats) => {

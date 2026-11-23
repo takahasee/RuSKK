@@ -1313,6 +1313,7 @@ mod tests {
             min_similarity: 0.58,
             min_margin: 0.04,
             max_per_target: 20,
+            include_non_competing: false,
         };
 
         let stats = predictor

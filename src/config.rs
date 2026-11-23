@@ -106,6 +106,9 @@ pub enum Command {
         /// Maximum number of new context words added per target candidate
         #[arg(long, default_value_t = 50)]
         max_per_target: usize,
+        /// Also expand non-competing single-target entries (by default only homophone competing groups are expanded)
+        #[arg(long, default_value_t = false)]
+        include_non_competing: bool,
         /// Output seed JSON path (defaults to ~/.ruskkserv-frequency.json)
         #[arg(long, short)]
         output: Option<std::path::PathBuf>,
@@ -264,6 +267,7 @@ mod tests {
                 min_similarity,
                 min_margin,
                 max_per_target,
+                include_non_competing,
                 output,
                 send_reload,
             }) => {
@@ -273,6 +277,7 @@ mod tests {
                 assert!((min_similarity - 0.58).abs() < f32::EPSILON);
                 assert!((min_margin - 0.04).abs() < f32::EPSILON);
                 assert_eq!(max_per_target, 50);
+                assert!(!include_non_competing);
                 assert!(output.is_none());
                 assert!(!send_reload);
             }
@@ -293,6 +298,7 @@ mod tests {
             "0.06",
             "--max-per-target",
             "30",
+            "--include-non-competing",
             "--output",
             "/tmp/out.json",
             "--send-reload",
@@ -306,6 +312,7 @@ mod tests {
                 min_similarity,
                 min_margin,
                 max_per_target,
+                include_non_competing,
                 output,
                 send_reload,
             }) => {
@@ -321,6 +328,7 @@ mod tests {
                 assert!((min_similarity - 0.62).abs() < 1e-6);
                 assert!((min_margin - 0.06).abs() < 1e-6);
                 assert_eq!(max_per_target, 30);
+                assert!(include_non_competing);
                 assert_eq!(output.as_deref(), Some(std::path::Path::new("/tmp/out.json")));
                 assert!(send_reload);
             }

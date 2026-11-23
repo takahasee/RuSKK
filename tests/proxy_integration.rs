@@ -3212,3 +3212,125 @@ async fn test_proxy_lookup_cache_normalizes_unregistered_context_keys() {
     proxy_handle.abort();
     yaskk_handle.abort();
 }
+
+#[tokio::test]
+async fn test_proxy_context_ranking_tracks_registered_non_kanji_context() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("かーでぃがん") {
+                        let _ = stream.write_all("1/カーディガン/\n".as_bytes()).await;
+                    } else if req.contains("きr") {
+                        let _ = stream.write_all("1/切/着/\n".as_bytes()).await;
+                    } else if req.contains("ゆーえすびー") {
+                        let _ = stream.write_all("1/USB/\n".as_bytes()).await;
+                    } else if req.contains("さs") {
+                        let _ = stream.write_all("1/指/挿/\n".as_bytes()).await;
+                    } else if req.contains("みとうろく") {
+                        let _ = stream.write_all("1/ミトウロク/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.context_frequencies.insert("カーディガン".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 6);
+        m
+    });
+    predictor.context_frequencies.insert("USB".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("挿す".to_string(), 10);
+        m
+    });
+    predictor.expand_aliases();
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(50),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(500),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 登録済みカタカナ文脈語「カーディガン」を確定後、「きr」で「着」が先頭に昇格すること
+    client.write_all("1かーでぃがん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/カーディガン/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/着/切/\n");
+
+    // 2. 再度「カーディガン」→ 未登録カタカナ「ミトウロク」を挟んでも、未登録語は文脈を上書きせず直前の「カーディガン」が維持されること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1かーでぃがん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/カーディガン/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1みとうろく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/ミトウロク/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/着/切/\n");
+
+    // 3. 登録済み英字文脈語「USB」を確定後、「さs」で「挿」が先頭に昇格すること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1ゆーえすびー \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/USB/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1さs \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/挿/指/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}

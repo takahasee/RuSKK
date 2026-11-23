@@ -130,7 +130,7 @@ macSKK (入力) ─┬─ [opcode 4 (補完)] ─→ 通常見出し: 参照順�
 
 ### ② 直前確定単語に基づく文脈連動候補昇格（Context Ranking）
 
-直前に確定した単語（漢字を含む単語のみ）を記憶（複数 TCP セッション間で共有・有効期限 60 秒）し、共起辞書に基づいて候補スコアを加算（$\text{Context Score} \times 10$）して第1候補へ昇格させます。
+直前に確定した単語（漢字を含む単語、および `context_frequencies` に登録済みのカタカナ・ひらがな・英字等の文脈語）を記憶（複数 TCP セッション間で共有・有効期限 60 秒）し、共起辞書に基づいて候補スコアを加算（$\text{Context Score} \times 10$）して第1候補へ昇格させます。
 
 * **macSKK の機械的 1 文字 Lookup 対策**:
   macSKK は ▽ 入力開始時に先頭 1 文字（例: `き`, `さ`）を自動照会します。RuSKKserv は新しい見出し語が保留中見出しの前方一致伸長（`き`→`きr`、`に`→`にく`、`さ`→`さい`）かつ未確定の場合、入力途中の伸長とみなして**文脈昇格せずに安全に破棄**し、真の確定文脈のみを保持します。また、接頭語・接尾語は直前確定文脈を上書きしません。
@@ -312,6 +312,7 @@ Options:
       --min-similarity <MIN_SIMILARITY>  Minimum cosine similarity threshold for fastText expansion [default: 0.58]
       --min-margin <MIN_MARGIN>          Minimum margin between top homophone targets for fastText expansion [default: 0.04]
       --max-per-target <MAX_PER_TARGET>  Maximum number of new context words added per target candidate [default: 50]
+      --include-non-competing            Also expand non-competing single-target entries (by default only homophone competing groups are expanded)
   -o, --output <OUTPUT>                  Output seed JSON path (defaults to ~/.ruskkserv-frequency.json)
       --send-reload                      Send SIGHUP to running ruskkserv process after updating the seed file
   -h, --help                             Print help

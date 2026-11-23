@@ -32,6 +32,9 @@ pub struct FastTextExpandOptions {
     pub min_margin: f32,
     /// 1 ターゲット候補あたりに追加する最大文脈語数（0〜10,000）
     pub max_per_target: usize,
+    /// 同音異義の競合相手を持たない単独ターゲット（例: 「耕す」「確認する」）も拡張対象に含めるか
+    /// （既定 `false`: 2 候補以上が競合する同音異義グループのみを優先拡張）
+    pub include_non_competing: bool,
 }
 
 /// fastText 拡張処理の実行統計。
@@ -250,6 +253,14 @@ pub fn expand_context_with_fasttext(
             centroid,
             self_vec,
         });
+    }
+
+    if !opts.include_non_competing {
+        let mut group_counts: HashMap<String, usize> = HashMap::new();
+        for proto in &prototypes {
+            *group_counts.entry(proto.group.clone()).or_insert(0) += 1;
+        }
+        prototypes.retain(|proto| group_counts.get(&proto.group).copied().unwrap_or(0) >= 2);
     }
 
     let matched_anchors = unique_anchors.len();
@@ -509,17 +520,21 @@ fn score_candidates_pass2(
                     max2 = s;
                 }
             }
-            let top_anchor_sim = if proto.anchor_indices.len() >= 2 {
-                0.60 * max1 + 0.40 * max2
+            let centroid_sim = dot_product(&buf, &proto.centroid);
+            let base_sim = if proto.anchor_indices.len() >= 2 {
+                // 多義・多ドメイン動詞でも該当サブクラスタの近傍語を拾えるよう、
+                // 最近傍アンカー max1 を主軸とし、局所2番目 max2 と全体重心 centroid_sim の高い方を裏付けに使う
+                let support = max2.max(centroid_sim);
+                0.65 * max1 + 0.35 * support
             } else {
                 max1
             };
-            let centroid_sim = dot_product(&buf, &proto.centroid);
             let combined = if let Some(ref self_vec) = proto.self_vec {
                 let self_sim = dot_product(&buf, self_vec).max(0.0);
-                0.55 * top_anchor_sim + 0.30 * centroid_sim + 0.15 * self_sim
+                // 動詞自身との類似度は過度なスコア圧縮を避けつつ同音異義弁別の補助に使う
+                0.92 * base_sim + 0.08 * self_sim
             } else {
-                0.65 * top_anchor_sim + 0.35 * centroid_sim
+                0.92 * base_sim + 0.08 * centroid_sim.max(0.0)
             };
             scores[idx] = combined;
             if combined > global_max {
@@ -531,7 +546,6 @@ fn score_candidates_pass2(
             continue;
         }
 
-        let inter_group_margin = (min_margin * 3.0).max(0.12);
         let mut group_winners: Vec<(usize, f32)> = Vec::new();
         for &members in groups {
             let mut best_idx = members[0];
@@ -555,9 +569,7 @@ fn score_candidates_pass2(
             if members.len() > 1 && (best_score - second_score) < min_margin {
                 continue;
             }
-            if best_score >= global_max - inter_group_margin {
-                group_winners.push((best_idx, best_score));
-            }
+            group_winners.push((best_idx, best_score));
         }
 
         if group_winners.is_empty() {
@@ -742,7 +754,8 @@ fn homophone_group_key(target: &str) -> Option<&'static str> {
         "指す" | "刺す" | "差す" | "挿す" => "さす",
         "引く" | "弾く" | "挽く" | "轢く" => "ひく",
         "張る" | "貼る" => "はる",
-        "点ける" | "付ける" | "着ける" | "漬ける" | "就く" | "着く" | "突く" => "つける",
+        "点ける" | "付ける" | "着ける" | "漬ける" => "つける",
+        "就く" | "着く" | "突く" | "付く" => "つく",
         "打つ" | "撃つ" | "討つ" => "うつ",
         "泣く" | "鳴く" => "なく",
         "咲く" | "裂く" | "割く" => "さく",
@@ -787,6 +800,22 @@ fn homophone_group_key(target: &str) -> Option<&'static str> {
         "登る" | "上る" | "昇る" => "のぼる",
         "増やす" | "殖やす" => "ふやす",
         "許す" | "赦す" => "ゆるす",
+        "刈る" | "狩る" | "駆る" => "かる",
+        "受ける" | "請ける" => "うける",
+        "拭く" | "吹く" | "噴く" => "ふく",
+        "渡る" | "亘る" | "亙る" => "わたる",
+        "下げる" | "提げる" => "さげる",
+        "下す" | "降す" => "くだす",
+        "組む" | "汲む" => "くむ",
+        "歌う" | "謳う" => "うたう",
+        "決める" | "極める" => "きめる",
+        "残す" | "遺す" => "のこす",
+        "通す" | "徹す" => "とおす",
+        "備える" | "供える" => "そなえる",
+        "持つ" | "保つ" => "もつ",
+        "起こす" | "興す" => "おこす",
+        "飲む" | "呑む" => "のむ",
+        "焼く" | "妬く" => "やく",
         _ => return None,
     };
     Some(key)
@@ -986,6 +1015,7 @@ mod tests {
                 min_similarity: 0.58,
                 min_margin: 0.04,
                 max_per_target: 50,
+                include_non_competing: false,
             };
 
             let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
@@ -1059,6 +1089,7 @@ mod tests {
             min_similarity: 0.58,
             min_margin: 0.04,
             max_per_target: 10,
+            include_non_competing: false,
         };
 
         let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
@@ -1111,6 +1142,7 @@ mod tests {
             min_similarity: 0.70,
             min_margin: 0.04,
             max_per_target: 10,
+            include_non_competing: true,
         };
 
         let s1 = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
@@ -1152,6 +1184,7 @@ mod tests {
             min_similarity: 0.58,
             min_margin: 0.04,
             max_per_target: 10,
+            include_non_competing: true,
         };
 
         let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
@@ -1175,6 +1208,7 @@ mod tests {
                 min_similarity: 0.58,
                 min_margin: 0.04,
                 max_per_target: 10,
+                include_non_competing: false,
             };
             let err = expand_context_with_fasttext(&mut ctx, &huge_opts).unwrap_err();
             assert!(err.to_string().contains("out of supported range"));
@@ -1190,6 +1224,7 @@ mod tests {
                 min_similarity: bad_sim,
                 min_margin: 0.04,
                 max_per_target: 10,
+                include_non_competing: false,
             };
             assert!(expand_context_with_fasttext(&mut ctx, &bad).is_err());
         }
@@ -1200,6 +1235,7 @@ mod tests {
                 min_similarity: 0.58,
                 min_margin: bad_margin,
                 max_per_target: 10,
+                include_non_competing: false,
             };
             assert!(expand_context_with_fasttext(&mut ctx, &bad).is_err());
         }
@@ -1209,6 +1245,7 @@ mod tests {
             min_similarity: 0.58,
             min_margin: 0.04,
             max_per_target: MAX_PER_TARGET_LIMIT + 1,
+            include_non_competing: false,
         };
         assert!(expand_context_with_fasttext(&mut ctx, &too_many).is_err());
     }
@@ -1234,6 +1271,7 @@ mod tests {
             min_similarity: 0.50,
             min_margin: 0.04,
             max_per_target: 2,
+            include_non_competing: true,
         };
 
         let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
@@ -1242,5 +1280,204 @@ mod tests {
         assert!(ctx.contains_key("候補高"));
         assert!(!ctx.contains_key("候補中"));
         assert!(!ctx.contains_key("候補低"));
+    }
+
+    #[test]
+    fn test_homophone_groups_separate_tsukeru_and_tsuku() {
+        assert_eq!(homophone_group_key("点ける"), Some("つける"));
+        assert_eq!(homophone_group_key("付ける"), Some("つける"));
+        assert_eq!(homophone_group_key("就く"), Some("つく"));
+        assert_eq!(homophone_group_key("着く"), Some("つく"));
+        assert_eq!(homophone_group_key("突く"), Some("つく"));
+        assert_ne!(homophone_group_key("点ける"), homophone_group_key("就く"));
+
+        let entries: &[(&str, &[f32])] = &[
+            ("電気", &[1.0, 0.0, 0.0]),
+            ("ランプ", &[0.99, 0.05, 0.0]),
+            ("印", &[0.0, 1.0, 0.0]),
+            ("値段", &[0.0, 0.99, 0.05]),
+            ("王位", &[0.99, 0.0, 0.05]),
+            ("職業", &[0.98, 0.0, 0.10]),
+            ("駅", &[0.0, 0.0, 1.0]),
+            ("港", &[0.05, 0.0, 0.99]),
+            // 「点ける」と「就く」の双方に高類似度（差 < 0.04）でも別グループなので共存すること
+            ("灯火", &[0.99, 0.0, 0.03]),
+        ];
+        let vec_file = write_vec_file(true, entries);
+        let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (noun, verb) in [
+            ("電気", "点ける"),
+            ("ランプ", "点ける"),
+            ("印", "付ける"),
+            ("値段", "付ける"),
+            ("王位", "就く"),
+            ("職業", "就く"),
+            ("駅", "着く"),
+            ("港", "着く"),
+        ] {
+            ctx.entry(noun.to_string())
+                .or_default()
+                .insert(verb.to_string(), 10);
+        }
+
+        let opts = FastTextExpandOptions {
+            vec_path: vec_file.path().to_path_buf(),
+            dict_path: None,
+            min_similarity: 0.58,
+            min_margin: 0.04,
+            max_per_target: 10,
+            include_non_competing: false,
+        };
+
+        let stats = expand_context_with_fasttext(&mut ctx, &opts).unwrap();
+        assert_eq!(stats.active_targets, 4);
+        assert!(ctx["灯火"].get("点ける").copied().unwrap_or(0) >= 5);
+        assert!(ctx["灯火"].get("就く").copied().unwrap_or(0) >= 5);
+    }
+
+    #[test]
+    fn test_polysemous_target_retains_subcluster_matches() {
+        // 3つの直交サブクラスタに分散した多義動詞「引く」（+ 名詞から遠い自己ベクトル）と、
+        // 競合動詞「弾く」を用意し、高めの min_similarity でも両サブクラスタ近傍が拾えることを検証する
+        let entries: &[(&str, &[f32])] = &[
+            ("引く", &[0.1, 0.1, 0.1, 0.0, 0.98]),
+            ("風邪", &[1.0, 0.0, 0.0, 0.0, 0.0]),
+            ("咳", &[0.99, 0.05, 0.0, 0.0, 0.0]),
+            ("辞書", &[0.0, 1.0, 0.0, 0.0, 0.0]),
+            ("事典", &[0.05, 0.99, 0.0, 0.0, 0.0]),
+            ("境界", &[0.0, 0.0, 1.0, 0.0, 0.0]),
+            ("線分", &[0.0, 0.05, 0.99, 0.0, 0.0]),
+            ("ギター", &[0.0, 0.0, 0.0, 1.0, 0.0]),
+            ("ピアノ", &[0.0, 0.0, 0.0, 0.99, 0.05]),
+            ("鼻風邪", &[0.98, 0.0, 0.0, 0.0, 0.15]),
+            ("漢和辞典", &[0.0, 0.98, 0.0, 0.0, 0.15]),
+        ];
+        let vec_file = write_vec_file(true, entries);
+        let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (noun, verb) in [
+            ("風邪", "引く"),
+            ("咳", "引く"),
+            ("辞書", "引く"),
+            ("事典", "引く"),
+            ("境界", "引く"),
+            ("線分", "引く"),
+            ("ギター", "弾く"),
+            ("ピアノ", "弾く"),
+        ] {
+            ctx.entry(noun.to_string())
+                .or_default()
+                .insert(verb.to_string(), 10);
+        }
+
+        let opts = FastTextExpandOptions {
+            vec_path: vec_file.path().to_path_buf(),
+            dict_path: None,
+            min_similarity: 0.80,
+            min_margin: 0.04,
+            max_per_target: 10,
+            include_non_competing: false,
+        };
+
+        expand_context_with_fasttext(&mut ctx, &opts).unwrap();
+        assert!(ctx["鼻風邪"].get("引く").copied().unwrap_or(0) >= 8);
+        assert!(ctx["漢和辞典"].get("引く").copied().unwrap_or(0) >= 8);
+    }
+
+    #[test]
+    fn test_non_competing_targets_skipped_by_default_and_included_when_opted_in() {
+        let entries: &[(&str, &[f32])] = &[
+            ("服", &[1.0, 0.0, 0.0]),
+            ("シャツ", &[0.98, 0.05, 0.0]),
+            ("パーカー", &[0.95, 0.05, 0.0]),
+            ("肉", &[0.0, 1.0, 0.0]),
+            ("紙", &[0.0, 0.98, 0.05]),
+            // 単独ターゲット（競合相手なし）: 「耕す」
+            ("畑", &[0.0, 0.0, 1.0]),
+            ("水田", &[0.0, 0.05, 0.98]),
+            ("田圃", &[0.0, 0.05, 0.95]),
+        ];
+        let vec_file = write_vec_file(true, entries);
+        let base_ctx = || {
+            let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
+            for (noun, verb) in [
+                ("服", "着る"),
+                ("シャツ", "着る"),
+                ("肉", "切る"),
+                ("紙", "切る"),
+                ("畑", "耕す"),
+                ("水田", "耕す"),
+            ] {
+                ctx.entry(noun.to_string())
+                    .or_default()
+                    .insert(verb.to_string(), 10);
+            }
+            ctx
+        };
+
+        // 既定 (include_non_competing: false): 競合グループ（着る/切る）のみ拡張し、単独語「耕す」は除外
+        let mut ctx_default = base_ctx();
+        let stats_default = expand_context_with_fasttext(
+            &mut ctx_default,
+            &FastTextExpandOptions {
+                vec_path: vec_file.path().to_path_buf(),
+                dict_path: None,
+                min_similarity: 0.58,
+                min_margin: 0.04,
+                max_per_target: 10,
+                include_non_competing: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats_default.active_targets, 2);
+        assert!(ctx_default.contains_key("パーカー"));
+        assert!(!ctx_default.contains_key("田圃"));
+
+        // include_non_competing: true で単独ターゲットも拡張対象になること
+        let mut ctx_all = base_ctx();
+        let stats_all = expand_context_with_fasttext(
+            &mut ctx_all,
+            &FastTextExpandOptions {
+                vec_path: vec_file.path().to_path_buf(),
+                dict_path: None,
+                min_similarity: 0.58,
+                min_margin: 0.04,
+                max_per_target: 10,
+                include_non_competing: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats_all.active_targets, 3);
+        assert!(ctx_all.contains_key("パーカー"));
+        assert!(ctx_all["田圃"].get("耕す").copied().unwrap_or(0) >= 5);
+    }
+
+    #[test]
+    fn test_unrelated_homophone_groups_do_not_suppress_each_other() {
+        // 異なる読みの同音グループ（「きる」と「たてる」）はスコア差 > 0.12 でも互いに足切りしないこと
+        let entries: &[(&str, &[f32])] = &[
+            ("服", &[1.0, 0.0, 0.0, 0.0]),
+            ("シャツ", &[0.99, 0.0, 0.0, 0.05]),
+            ("肉", &[0.0, 1.0, 0.0, 0.0]),
+            ("紙", &[0.0, 0.99, 0.0, 0.05]),
+            ("家", &[0.0, 0.0, 1.0, 0.0]),
+            ("ビル", &[0.0, 0.0, 0.99, 0.05]),
+            ("計画", &[0.0, 0.0, 0.0, 1.0]),
+            // 「建てる」(~0.78) と「着る」(~0.62) の両方に結びつく語（差 0.16 > 0.12）
+            ("複合施設", &[0.62, 0.0, 0.78, 0.0]),
+        ];
+        let vec_file = write_vec_file(true, entries);
+        let mut ctx = seed_anchor_context();
+        let opts = FastTextExpandOptions {
+            vec_path: vec_file.path().to_path_buf(),
+            dict_path: None,
+            min_similarity: 0.55,
+            min_margin: 0.04,
+            max_per_target: 10,
+            include_non_competing: false,
+        };
+
+        expand_context_with_fasttext(&mut ctx, &opts).unwrap();
+        assert!(ctx["複合施設"].get("建てる").copied().unwrap_or(0) >= 5);
+        assert!(ctx["複合施設"].get("着る").copied().unwrap_or(0) >= 5);
     }
 }

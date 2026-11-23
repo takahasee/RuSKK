@@ -535,15 +535,25 @@ async fn write_client_response(
 
 struct LookupOutcome {
     response: Vec<u8>,
-    /// クレンジング済みかつ漢字を含む第1候補（文脈追跡およびキャッシュ共有用）
+    /// クレンジング済み文脈対象候補（漢字を含む語、または `context_frequencies` 登録済みの非漢字語）
     top_candidate: Option<Arc<str>>,
     skip_cache: bool,
 }
 
 #[inline]
-fn extract_kanji_top_candidate(top: Option<&str>) -> Option<Arc<str>> {
+fn extract_context_top_candidate(
+    top: Option<&str>,
+    predictor: &SharedPredictor,
+) -> Option<Arc<str>> {
     let clean = crate::frequency::clean_candidate(top?);
     if contains_kanji(clean) {
+        return Some(Arc::from(clean));
+    }
+    // 漢字を含まない語（カタカナ・ひらがな・英字など、例: "カーディガン", "USB", "うさぎ"）も、
+    // context_frequencies に登録済みの文脈語であれば文脈候補として追跡する。
+    // 未登録の 1 文字仮名・記号等は記録せず文脈汚染を防止する。
+    let guard = predictor.read().unwrap_or_else(|e| e.into_inner());
+    if guard.has_context_rules(clean) {
         Some(Arc::from(clean))
     } else {
         None
@@ -588,7 +598,7 @@ fn rank_candidates_to_response(
             proxy.annotation_priority,
             ffi_deadline,
         );
-        let top_candidate = extract_kanji_top_candidate(ranked.first().copied());
+        let top_candidate = extract_context_top_candidate(ranked.first().copied(), &proxy.predictor);
         LookupOutcome {
             response: format_candidates_response_str(&ranked),
             top_candidate,
@@ -604,7 +614,7 @@ fn rank_candidates_to_response(
                 Some(rank_midashi.to_string()),
             )]);
         }
-        let top_candidate = extract_kanji_top_candidate(cands.first().copied());
+        let top_candidate = extract_context_top_candidate(cands.first().copied(), &proxy.predictor);
         LookupOutcome {
             response: format_candidates_response_str(cands),
             top_candidate,
@@ -682,7 +692,10 @@ fn finalize_raw_response(
             Some(rank_midashi.to_string()),
         )]);
     }
-    let top_candidate = extract_kanji_top_candidate(extract_first_candidate(&response));
+    let top_candidate = extract_context_top_candidate(
+        extract_first_candidate(&response),
+        &proxy.predictor,
+    );
     LookupOutcome {
         response,
         top_candidate,
@@ -1557,7 +1570,8 @@ async fn lookup_yaskkserv2_first(
 }
 
 /// 文字列にCJK漢字が含まれているかを判定する。
-/// 文脈候補（session_context / pending_context）には漢字を含む単語のみを積む。
+/// 文脈候補（session_context / pending_context）には漢字を含む単語、
+/// または `context_frequencies` に登録済みの単語を積む。
 fn contains_kanji(s: &str) -> bool {
     s.chars().any(crate::okuri::is_kanji)
 }
