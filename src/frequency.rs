@@ -191,6 +191,11 @@ impl FrequencyPredictor {
             self.context_frequencies = preset.context_frequencies;
         } else {
             self.reload_raw_if_exists()?;
+            if fasttext_opts.is_some() {
+                // 個人の frequencies と手動アンカー（score >= MIN_ANCHOR_SCORE）を保持したまま、
+                // 過去の自動生成エントリ（score < MIN_ANCHOR_SCORE）を除去して最新設定で再生成する
+                self.prune_generated_context_entries();
+            }
             self.merge_default_presets_raw()?;
         }
 
@@ -206,6 +211,15 @@ impl FrequencyPredictor {
         self.save()?;
         self.expand_aliases();
         Ok(stats)
+    }
+
+    /// context_frequencies から fastText 自動生成スコア（`MIN_ANCHOR_SCORE` 未満）を除去し、
+    /// 空になった文脈キーを削除する。手動アンカー（`>= MIN_ANCHOR_SCORE`）と `frequencies` は保持される。
+    pub(crate) fn prune_generated_context_entries(&mut self) {
+        self.context_frequencies.retain(|_, targets| {
+            targets.retain(|_, &mut score| score >= crate::fasttext::MIN_ANCHOR_SCORE);
+            !targets.is_empty()
+        });
     }
 
     /// macSKK などのユーザー辞書 (skk-jisyo.utf8) をパースし、
@@ -523,7 +537,7 @@ fn is_hiragana_char(c: char) -> bool {
 /// 送り仮名付きの単語（末尾が平仮名で、かつ非平仮名の語幹を含む語、例: "切る", "確認する", "受け入れる"）から、
 /// SKK の送りあり変換で用いられる語幹エイリアス（平仮名の直前で切り出したプレフィックス、例: "切", "確認", "受け入れ", "受"）を抽出する。
 /// 純粋な漢字熟語やカタカナ語（例: "漁港", "時間", "包丁", "ヘリコプター"）からは一切プレフィックスを生成しない。
-fn okuri_stem_aliases(word: &str) -> Vec<&str> {
+pub(crate) fn okuri_stem_aliases(word: &str) -> Vec<&str> {
     let mut chars = word.chars();
     let Some(last_char) = chars.next_back() else {
         return Vec::new();
@@ -1341,6 +1355,50 @@ mod tests {
             &["着".to_string(), "切".to_string(), "伐".to_string()],
         );
         assert_eq!(ranked_cut[0], "切");
+
+        // 2回目実行時: 古い自動生成スコア (< 10) を掃除しつつ、frequencies と手動アンカー (>= 10) は保持されること
+        let mut vec_file2 = NamedTempFile::new().unwrap();
+        writeln!(vec_file2, "4 4").unwrap();
+        writeln!(vec_file2, "服 1.0 0.0 0.0 0.0").unwrap();
+        writeln!(vec_file2, "シャツ 0.98 0.0 0.0 0.1").unwrap();
+        writeln!(vec_file2, "肉 0.0 1.0 0.0 0.0").unwrap();
+        writeln!(vec_file2, "紙 0.0 0.98 0.0 0.1").unwrap();
+        // 手動アンカーを追加
+        let mut reload_pred = FrequencyPredictor::new_unloaded(Some(json_file.path().to_path_buf()));
+        reload_pred.reload_raw_if_exists().unwrap();
+        reload_pred
+            .context_frequencies
+            .entry("手動語".to_string())
+            .or_default()
+            .insert("着る".to_string(), 10);
+        reload_pred.save().unwrap();
+
+        let opts2 = crate::fasttext::FastTextExpandOptions {
+            vec_path: vec_file2.path().to_path_buf(),
+            dict_path: None,
+            min_similarity: 0.58,
+            min_margin: 0.04,
+            max_per_target: 20,
+            include_non_competing: false,
+        };
+        reload_pred.init_seed_with_fasttext(false, Some(&opts2)).unwrap();
+        // frequencies は保持
+        assert_eq!(
+            reload_pred.frequencies.get("てすと").and_then(|m| m.get("テスト")).copied(),
+            Some(5)
+        );
+        // 手動アンカー (score == 10) は保持
+        assert_eq!(
+            reload_pred
+                .context_frequencies
+                .get("手動語")
+                .and_then(|m| m.get("着る"))
+                .copied(),
+            Some(10)
+        );
+        // 今回の .vec から消えた旧自動生成エントリ (カーディガン / 段ボール, score < 10) は掃除されていること
+        assert!(!reload_pred.context_frequencies.contains_key("カーディガン"));
+        assert!(!reload_pred.context_frequencies.contains_key("段ボール"));
     }
 
     #[test]

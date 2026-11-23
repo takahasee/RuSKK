@@ -11,7 +11,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 /// アンカー（拡張の種）として扱う最小スコア。自動生成された低スコア（5〜9）の再帰的ドリフトを防ぐ。
-const MIN_ANCHOR_SCORE: u64 = 10;
+pub(crate) const MIN_ANCHOR_SCORE: u64 = 10;
 /// 受け入れるベクトル次元数の上限（巨大ヘッダによる capacity overflow / OOM 防止）。
 const MAX_VECTOR_DIM: usize = 4096;
 /// `.vec` ファイル 1 行あたりに許容する最大バイト長（改行なし巨大行による OOM 防止）。
@@ -821,6 +821,35 @@ fn homophone_group_key(target: &str) -> Option<&'static str> {
     Some(key)
 }
 
+/// 平仮名を含む非接辞・送りなしの日本語見出し語かを判定する。
+/// `cardigan` 等の英語見出しや `>` 接頭辞・接尾辞見出しを除外するために用いる。
+#[inline]
+fn is_japanese_okuri_nashi_midashi(midashi: &str) -> bool {
+    matches!(
+        crate::okuri::classify_midashi(midashi),
+        crate::okuri::MidashiKind::Normal(_)
+    ) && !is_okuri_ari_midashi(midashi)
+        && midashi.chars().any(|c| ('\u{3041}'..='\u{3096}').contains(&c))
+}
+
+/// 2 候補以上が揃った同音ターゲット群を `dict_groups` へ登録する。
+fn register_dict_group(
+    dict_groups: &mut HashMap<String, String>,
+    group_name: String,
+    mut targets: Vec<String>,
+) {
+    if targets.len() < 2 {
+        return;
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.len() >= 2 {
+        for t in targets {
+            dict_groups.entry(t).or_insert_with(|| group_name.clone());
+        }
+    }
+}
+
 /// SKK 辞書（UTF-8 / EUC-JP）を読み込み、語彙セットおよび同音見出しによるターゲット競合グループを構築する。
 fn load_skk_dict_vocab_and_groups(
     dict_path: &Path,
@@ -838,6 +867,27 @@ fn load_skk_dict_vocab_and_groups(
         }
     };
 
+    // `[...]` を持たない標準 SKK-JISYO 送りあり行（例: `しm /染/占/`）からも同音グループを抽出できるよう、
+    // ターゲットの `(語幹, 送りキー) -> [(送り仮名尾部, 終止形ターゲット)]` 索引を事前構築する
+    let mut stem_to_targets: HashMap<(String, char), Vec<(String, String)>> = HashMap::new();
+    for target in known_targets {
+        for stem in crate::frequency::okuri_stem_aliases(target) {
+            let Some(okuri_tail) = target.strip_prefix(stem) else {
+                continue;
+            };
+            let Some(first_kana) = okuri_tail.chars().next() else {
+                continue;
+            };
+            let Some(okuri_key) = crate::okuri::kana_to_okuri_key(first_kana) else {
+                continue;
+            };
+            stem_to_targets
+                .entry((stem.to_string(), okuri_key))
+                .or_default()
+                .push((okuri_tail.to_string(), target.clone()));
+        }
+    }
+
     let mut vocab = HashSet::new();
     let mut dict_groups: HashMap<String, String> = HashMap::new();
 
@@ -853,31 +903,51 @@ fn load_skk_dict_vocab_and_groups(
             continue;
         }
 
+        let jp_okuri_nashi = is_japanese_okuri_nashi_midashi(midashi);
+        let okuri_key = if is_okuri_ari_midashi(midashi) {
+            midashi.chars().last().map(|c| c.to_ascii_lowercase())
+        } else {
+            None
+        };
+
         let candidates = crate::frequency::parse_dict_line_candidates(cands_part);
         let mut matched_targets: Vec<String> = Vec::new();
+        let mut matched_by_suffix: HashMap<&str, Vec<String>> = HashMap::new();
 
-        for cand in candidates {
+        for (idx, cand) in candidates.into_iter().enumerate() {
             if known_targets.contains(&cand) {
                 matched_targets.push(cand.clone());
             }
-            if is_valid_context_word(&cand) {
+            if let Some(key) = okuri_key {
+                let lookup_key = if key == 'w' { 'u' } else { key };
+                if let Some(hits) = stem_to_targets.get(&(cand.clone(), lookup_key)) {
+                    for (okuri_tail, target) in hits {
+                        matched_by_suffix
+                            .entry(okuri_tail.as_str())
+                            .or_default()
+                            .push(target.clone());
+                    }
+                }
+            }
+            let has_kanji = cand.chars().any(crate::okuri::is_kanji);
+            // 英語見出しや第2候補以下の純カタカナ語は実入力で発動しにくいため除外し、
+            // 日本語見出しの漢字候補または第1候補の語彙のみを文脈語候補に含める
+            if jp_okuri_nashi && (idx == 0 || has_kanji) && is_valid_context_word(&cand) {
                 vocab.insert(cand);
             }
         }
 
-        if is_okuri_ari_midashi(midashi) && cands_part.contains('[') {
+        if okuri_key.is_some() && cands_part.contains('[') {
             collect_okuri_targets(cands_part, known_targets, &mut matched_targets);
         }
 
-        if matched_targets.len() >= 2 {
-            matched_targets.sort();
-            matched_targets.dedup();
-            if matched_targets.len() >= 2 {
-                let group_name = format!("dict:{midashi}");
-                for t in matched_targets {
-                    dict_groups.entry(t).or_insert_with(|| group_name.clone());
-                }
-            }
+        register_dict_group(&mut dict_groups, format!("dict:{midashi}"), matched_targets);
+        for (okuri_tail, group_targets) in matched_by_suffix {
+            register_dict_group(
+                &mut dict_groups,
+                format!("dict:{midashi}:{okuri_tail}"),
+                group_targets,
+            );
         }
     }
 
@@ -1479,5 +1549,71 @@ mod tests {
         expand_context_with_fasttext(&mut ctx, &opts).unwrap();
         assert!(ctx["複合施設"].get("建てる").copied().unwrap_or(0) >= 5);
         assert!(ctx["複合施設"].get("着る").copied().unwrap_or(0) >= 5);
+    }
+
+    #[test]
+    fn test_dict_vocab_filters_english_midashi_and_extracts_bare_okuri_groups() {
+        // 1. 英単語見出し（cardigan /カーディガン/）と第2候補以下の純カタカナは vocab から除外されること
+        // 2. 日本語見出しの第1候補（ぱーかー /パーカー/）や漢字候補（ようふく /衣服/洋服/）は残ること
+        // 3. `[...]` を持たない標準 SKK-JISYO 送りあり行（`しm /染/占/`）から同音グループが抽出され、
+        //    異なる送り語尾（「染まる」vs「染める」等）が混線しないこと
+        let entries: &[(&str, &[f32])] = &[
+            ("服", &[1.0, 0.0, 0.0, 0.0]),
+            ("シャツ", &[0.98, 0.0, 0.1, 0.0]),
+            ("パーカー", &[0.96, 0.0, 0.05, 0.0]),
+            ("カーディガン", &[0.99, 0.0, 0.02, 0.0]), // 英語見出しにしかないため除外
+            ("カッター", &[0.97, 0.0, 0.02, 0.0]),     // 第2候補の純カタカナのため除外
+            ("衣服", &[0.95, 0.0, 0.05, 0.0]),         // 第2候補でも漢字ありなので保持
+            ("肉", &[0.0, 1.0, 0.0, 0.0]),
+            ("紙", &[0.0, 0.98, 0.1, 0.0]),
+            ("布地", &[0.0, 0.0, 1.0, 0.0]),
+            ("染料", &[0.0, 0.0, 0.98, 0.05]),
+            ("割合", &[0.0, 0.0, 0.0, 1.0]),
+            ("比率", &[0.0, 0.0, 0.05, 0.98]),
+            ("曖昧語", &[0.0, 0.0, 0.70, 0.69]), // `しm /染/占/` 由来の同音マージン不足で除外
+        ];
+        let vec_file = write_vec_file(true, entries);
+
+        let mut dict_file = NamedTempFile::new().unwrap();
+        writeln!(dict_file, ";; okuri-ari entries.").unwrap();
+        writeln!(dict_file, "しm /染/占/").unwrap();
+        writeln!(dict_file, ";; okuri-nasi entries.").unwrap();
+        writeln!(dict_file, "cardigan /カーディガン/").unwrap();
+        writeln!(dict_file, "ぱーかー /パーカー/").unwrap();
+        writeln!(dict_file, "しゃつ /シャツ/カッター/").unwrap();
+        writeln!(dict_file, "いふく /服/衣服/").unwrap();
+        writeln!(dict_file, "あいまいご /曖昧語/").unwrap();
+
+        let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        for (noun, verb) in [
+            ("服", "着る"),
+            ("シャツ", "着る"),
+            ("肉", "切る"),
+            ("紙", "切る"),
+            ("布地", "染める"),
+            ("染料", "染める"),
+            ("割合", "占める"),
+            ("比率", "占める"),
+        ] {
+            ctx.entry(noun.to_string())
+                .or_default()
+                .insert(verb.to_string(), 10);
+        }
+
+        let opts = FastTextExpandOptions {
+            vec_path: vec_file.path().to_path_buf(),
+            dict_path: Some(dict_file.path().to_path_buf()),
+            min_similarity: 0.58,
+            min_margin: 0.04,
+            max_per_target: 10,
+            include_non_competing: false,
+        };
+
+        expand_context_with_fasttext(&mut ctx, &opts).unwrap();
+        assert!(ctx.contains_key("パーカー"));
+        assert!(ctx.contains_key("衣服"));
+        assert!(!ctx.contains_key("カーディガン"));
+        assert!(!ctx.contains_key("カッター"));
+        assert!(!ctx.contains_key("曖昧語"));
     }
 }

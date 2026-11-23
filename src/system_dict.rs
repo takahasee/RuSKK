@@ -288,7 +288,7 @@ fn needs_bracket_normalization(entry: &str) -> bool {
     entry.chars().any(|c| {
         matches!(
             c,
-            '（' | '(' | '〔' | '[' | '）' | ')' | '〕' | ']' | '‐' | '-' | '・' | ' ' | '　'
+            '（' | '(' | '〔' | '[' | '）' | ')' | '〕' | ']' | '〈' | '〉' | '《' | '》' | '△' | '×' | '▽' | '‐' | '-' | '・' | ' ' | '　'
         )
     })
 }
@@ -339,7 +339,7 @@ fn matches_bracket_entry_variants(word: &str, entry: &str) -> bool {
             '）' | ')' | '〕' | ']' => {
                 depth = depth.saturating_sub(1);
             }
-            '‐' | '-' | '・' | ' ' | '　' => {}
+            '〈' | '〉' | '《' | '》' | '△' | '×' | '▽' | '‐' | '-' | '・' | ' ' | '　' => {}
             _ => {
                 if depth == 0 {
                     without_parens.push(c);
@@ -715,6 +715,12 @@ mod tests {
         // 漢字違いや異文字の 3 文字語（先頭・末尾だけ一致）が誤ヒットしないこと
         assert!(!matches_dict_headword("貸しす", "かし・だす 0【貸し出す】"));
         assert!(!matches_dict_headword("切らる", "きり・とる 0【切り取る】"));
+        // 大辞林の熟字訓・特殊読み記号（〈...〉, 《...》, △, ×, ▽）を正規化して照合できること
+        assert!(matches_dict_headword("親族", "うから 【〈親族〉 】"));
+        assert!(matches_dict_headword("友達", "ともだち 0【《友達》 】"));
+        assert!(matches_dict_headword("時計", "とけい 0【《時計》 ・土圭】"));
+        assert!(matches_dict_headword("梅雨", "つゆ 0【《梅雨》 ・〈黴雨〉 】"));
+        assert!(matches_dict_headword("黴雨", "つゆ 0【《梅雨》 ・〈黴雨〉 】"));
     }
 
     #[cfg(target_os = "macos")]
