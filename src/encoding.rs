@@ -35,6 +35,92 @@ pub fn encode_euc_jp(text: &str) -> Vec<u8> {
     encode_euc_jp_cow(text).into_owned()
 }
 
+#[inline]
+fn decode_hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[inline]
+fn decode_hex_byte(hi: u8, lo: u8) -> Option<u8> {
+    Some((decode_hex_nibble(hi)? << 4) | decode_hex_nibble(lo)?)
+}
+
+/// `yaskkserv2` が EUC 辞書モード時に EUC 非対応文字へ付与する `&#x<UTF-8バイト列hex>`
+/// （末尾セミコロンなし。例: `&#xf09f97be` → `🗾`）を通常の UTF-8 バイト列へ復元する。
+/// 通常の HTML/XML 数値参照（末尾 `;` 付き、例: `&#x1f5fe;`）や EUC 3 バイト列（`0x8F` 先頭）等はそのまま残す。
+fn unescape_yaskkserv2_utf8_hex(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if memchr::memchr(b'&', bytes).is_none() {
+        return Cow::Borrowed(bytes);
+    }
+
+    let mut out: Option<Vec<u8>> = None;
+    let mut copied_until = 0usize;
+    let mut i = 0usize;
+
+    while let Some(rel) = memchr::memchr(b'&', &bytes[i..]) {
+        let pos = i + rel;
+        if bytes[pos..].starts_with(b"&#x")
+            && let Some(&h0) = bytes.get(pos + 3)
+            && let Some(&h1) = bytes.get(pos + 4)
+            && let Some(b0) = decode_hex_byte(h0, h1)
+        {
+            let expected_len = match b0 {
+                0xC2..=0xDF => Some(2usize),
+                0xE0..=0xEF => Some(3usize),
+                0xF0..=0xF4 => Some(4usize),
+                _ => None,
+            };
+
+            if let Some(len) = expected_len {
+                let hex_start = pos + 3;
+                let hex_end = hex_start + len * 2;
+                if hex_end <= bytes.len() && bytes.get(hex_end) != Some(&b';') {
+                    let mut decoded = [0u8; 4];
+                    decoded[0] = b0;
+                    let mut valid_hex = true;
+                    for j in 1..len {
+                        let Some(b) =
+                            decode_hex_byte(bytes[hex_start + j * 2], bytes[hex_start + j * 2 + 1])
+                        else {
+                            valid_hex = false;
+                            break;
+                        };
+                        decoded[j] = b;
+                    }
+                    if valid_hex
+                        && let Ok(s) = std::str::from_utf8(&decoded[..len])
+                        && let Some(ch) = s.chars().next()
+                        && ch.len_utf8() == len
+                        && !ch.is_control()
+                        && ch != '\u{FFFD}'
+                    {
+                        let buf = out.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
+                        buf.extend_from_slice(&bytes[copied_until..pos]);
+                        buf.extend_from_slice(s.as_bytes());
+                        i = hex_end;
+                        copied_until = hex_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        i = pos + 1;
+    }
+
+    match out {
+        None => Cow::Borrowed(bytes),
+        Some(mut buf) => {
+            buf.extend_from_slice(&bytes[copied_until..]);
+            Cow::Owned(buf)
+        }
+    }
+}
+
 /// Convert an skkserv response body from EUC-JP to UTF-8 bytes.
 /// Protocol framing (`1`, `4`, `/`, spaces, newlines) is ASCII and preserved.
 pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
@@ -46,14 +132,17 @@ pub fn response_euc_to_utf8(response: &[u8]) -> Vec<u8> {
     if let Ok(s) = std::str::from_utf8(response)
         && is_genuine_utf8(s)
     {
-        return response.to_vec();
+        return unescape_yaskkserv2_utf8_hex(response).into_owned();
     }
     // EUC-JP のマルチバイトコード (0xA1..=0xFE) は ASCII 記号 (0x00..=0x7F: '/', '1', '4', '\n') と
     // バイト値が衝突しないため、一括デコードするだけで区切り文字を完全に維持した UTF-8 バイト列が得られる。
     let (cow, _, _) = EUC_JP.decode(response);
-    match cow {
-        Cow::Borrowed(s) => s.as_bytes().to_vec(),
-        Cow::Owned(s) => s.into_bytes(),
+    match unescape_yaskkserv2_utf8_hex(cow.as_bytes()) {
+        Cow::Borrowed(_) => match cow {
+            Cow::Borrowed(s) => s.as_bytes().to_vec(),
+            Cow::Owned(s) => s.into_bytes(),
+        },
+        Cow::Owned(unescaped) => unescaped,
     }
 }
 
@@ -65,12 +154,15 @@ pub fn decode_euc_response_to_utf8(response: &[u8]) -> Vec<u8> {
         return Vec::new();
     }
     if response.is_ascii() {
-        return response.to_vec();
+        return unescape_yaskkserv2_utf8_hex(response).into_owned();
     }
     let (cow, _, _) = EUC_JP.decode(response);
-    match cow {
-        Cow::Borrowed(s) => s.as_bytes().to_vec(),
-        Cow::Owned(s) => s.into_bytes(),
+    match unescape_yaskkserv2_utf8_hex(cow.as_bytes()) {
+        Cow::Borrowed(_) => match cow {
+            Cow::Borrowed(s) => s.as_bytes().to_vec(),
+            Cow::Owned(s) => s.into_bytes(),
+        },
+        Cow::Owned(unescaped) => unescaped,
     }
 }
 
@@ -391,5 +483,46 @@ mod tests {
         assert_eq!(decode_euc_or_utf8(&encode_euc_jp("的")), "的");
         assert_eq!(decode_euc_or_utf8(&encode_euc_jp("綻")), "綻");
         assert_eq!(decode_euc_or_utf8(&encode_euc_jp("比")), "比");
+    }
+
+    #[test]
+    fn test_decode_euc_unescapes_yaskkserv2_utf8_hex() {
+        // EUC-JP 本文（「日本」「二本」）と yaskkserv2 独自の `&#x<UTF-8バイト列hex>` が混在する場合に両方正しく復元されること
+        let mut mixed = b"1/".to_vec();
+        mixed.extend_from_slice(&encode_euc_jp("日本"));
+        mixed.extend_from_slice(b"/");
+        mixed.extend_from_slice(&encode_euc_jp("二本"));
+        mixed.extend_from_slice(b"/&#xf09f97be/&#xf09f87af&#xf09f87b5/\n");
+
+        assert_eq!(
+            String::from_utf8(decode_euc_response_to_utf8(&mixed)).unwrap(),
+            "1/日本/二本/🗾/🇯🇵/\n"
+        );
+        assert_eq!(
+            String::from_utf8(response_euc_to_utf8(&mixed)).unwrap(),
+            "1/日本/二本/🗾/🇯🇵/\n"
+        );
+
+        // 全体が純 ASCII（is_ascii() == true）のレスポンス内にある 2/3/4 バイト UTF-8 エスケープも復元されること
+        let ascii_only = b"1/&#xe29da4/0&#xe283a3/&#xc3a9/\n";
+        assert_eq!(
+            String::from_utf8(decode_euc_response_to_utf8(ascii_only)).unwrap(),
+            "1/❤/0⃣/é/\n"
+        );
+        assert_eq!(
+            String::from_utf8(response_euc_to_utf8(ascii_only)).unwrap(),
+            "1/❤/0⃣/é/\n"
+        );
+
+        // 境界ケースと非対象パターン保護:
+        // - 後続文字が直結していても 4 バイト分（8 hex 桁）のみ復元する
+        // - 末尾 `;` が付く通常 HTML 数値参照（`&#xe29da4;`, `&#x1f5fe;`）は破壊しない
+        // - EUC 3 バイト先頭（`0x8F`）、不正 hex、Lisp 式（`(concat "&excl\073")`）はそのまま維持する
+        let preserved =
+            b"1/&#xf09f97beabc/&#xe29da4;/&#x1f5fe;/&#x8feac3/(concat \"&excl\\073\")/\n";
+        assert_eq!(
+            String::from_utf8(decode_euc_response_to_utf8(preserved)).unwrap(),
+            "1/🗾abc/&#xe29da4;/&#x1f5fe;/&#x8feac3/(concat \"&excl\\073\")/\n"
+        );
     }
 }

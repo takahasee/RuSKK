@@ -10,7 +10,7 @@
 - **バイナリ / クレート名**: `ruskkserv`
 - **リポジトリ**: [GitHub: takahasee/RuSKKserv](https://github.com/takahasee/RuSKKserv)
 - **目的**: macSKK 向けの高速・インテリジェントな skkserv プロキシサーバー。
-  - **Primary (デフォルト / `--backend-order=yaskkserv2-first`)**: `yaskkserv2` (`127.0.0.1:1179`, EUC-JP, ローカル統合辞書; LaunchAgent 既定は `--google-japanese-input disable` で未登録語・連文節を `azoo-key-skkserv` へフォールバック)
+  - **Primary (デフォルト / `--backend-order=yaskkserv2-first`)**: `yaskkserv2` (`127.0.0.1:1179`, 既定 EUC-JP / `--yaskkserv2-encoding=utf8` 指定時は `--midashi-utf8` + `--utf8` 辞書で UTF-8 End-to-End 通信; LaunchAgent 既定は `--google-japanese-input disable` で未登録語・連文節を `azoo-key-skkserv` へフォールバック)
   - **Fallback (`--backend-order=azookey-first` 指定時は Primary へ切替可能)**: `azoo-key-skkserv` (`127.0.0.1:1180`, EUC-JP request / UTF-8 response)
   - **Listen**: `127.0.0.1:1178` (UTF-8)
 
@@ -21,8 +21,9 @@
 ### ① バックエンド仕様とエンコーディング
 - **Primary (`azoo-key-skkserv`, :1180)**:
   - macOS の `azooKey skkserv.app` は **リクエストに EUC-JP** を要求し、**レスポンスに UTF-8** を返す（`UpstreamEncoding::EucJpRequestUtf8Response`）。
-- **Fallback (`yaskkserv2`, :1179)**:
-  - 見出し語を EUC-JP にエンコードして送信、返却結果（EUC-JP）を UTF-8 にデコード（`UpstreamEncoding::EucJp`）。
+- **Fallback / Default Primary (`yaskkserv2`, :1179)**:
+  - `--yaskkserv2-encoding`（環境変数 `RUSKKSERV_YASKKSERV2_ENCODING`）で通信方式を選択可能（既定 `euc` = `UpstreamEncoding::EucJp`、`utf8` = `UpstreamEncoding::Utf8`、`euc-req-utf8-resp` = `UpstreamEncoding::EucJpRequestUtf8Response`）。
+  - EUC 辞書モード時に `yaskkserv2` が絵文字等へ出力する `&#x<UTF-8 hex>`（例: `&#xf09f97be`）は `unescape_yaskkserv2_utf8_hex` で防御的に UTF-8 へ復元する。一方、絵文字・EUC-JIS-2004 文字・異体字を欠損なく扱う完全解決としては `yaskkserv2_make_dictionary --utf8`（EUC ソース辞書は事前に `euc_jis_2004` → UTF-8 変換して `&#x8f...` 化を回避）＋ `yaskkserv2 --midashi-utf8` ＋ `RUSKKSERV_YASKKSERV2_ENCODING=utf8` を使用する。
 
 ### ② 手動単語頻度（`frequencies`）と文脈共起（`context_frequencies`）による候補整列
 - 候補の並び替えは、**手動で編集する seed ファイル (`~/.ruskkserv-frequency.json`)** に登録された単語頻度（`frequencies`）および文脈共起（`context_frequencies`）に基づいて行われます。
@@ -188,7 +189,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全100件合格）
+cargo test             # ユニットテスト & 結合テスト（全102件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

@@ -71,6 +71,8 @@ cp launchd/config.env.example launchd/config.env
 
 > **連文節変換・Google 日本語入力連携について**: LaunchAgent 経由の `yaskkserv2` は既定で `YASKKSERV2_GOOGLE_JAPANESE_INPUT="disable"`（Google 日本語入力無効）として起動し、ローカル辞書に無い連文節フレーズや未登録語を高速に `azoo-key-skkserv`（Zenzai）へフォールバックします。`yaskkserv2` 側の Google 日本語入力を再有効化したい場合は `launchd/config.env` で `YASKKSERV2_GOOGLE_JAPANESE_INPUT="notfound"` 等を指定して `./scripts/install-launchd.sh install` を実行してください。
 
+> **絵文字・JIS 第 2 水準文字の UTF-8 運用について**: EUC 形式の `yaskkserv2` 辞書では絵文字や一部の異体字が `&#xf09f97be` 等へ変換・文字化けします（RuSKKserv 側でも既知 UTF-8 hex の防御的復元を行いますが、EUC 非対応字形・`&#x8f...` 等までは再現できません）。完全な UTF-8 出力を行うには、ソース辞書を UTF-8 として `yaskkserv2_make_dictionary --utf8` でバイナリ辞書を生成し、`launchd/config.env` に `RUSKKSERV_YASKKSERV2_ENCODING="utf8"`（CLI では `--yaskkserv2-encoding=utf8`）を設定して `./scripts/install-launchd.sh install` を実行してください（LaunchAgent 側でも自動的に `--midashi-utf8` 付きで `yaskkserv2` を起動します）。
+
 ### 3. macSKK の推奨設定（プラン A: 誤爆ゼロ・王道構成）
 macSKK のローカル履歴保存による文脈上書きと、補完タイマーによる誤爆を根絶します。
 
@@ -162,7 +164,7 @@ macOS のシステム国語辞典（大辞林等）に項目が存在する単�
 
 - **ゼロコピー・ファストパス**: 単一候補やランキング対象外応答はパース・ヒープ確保を完全スキップして直結転送。`LookupCache` は `LookupKeyRef` 借用キー照合と `Arc<[u8]>` / `Arc<str>` 保持によりヒット時のキー確保とコピーをゼロ化。
 - **$O(1)$ 送り仮名語幹照合 & $O(N)$ 重複排除**: seed ロード時に文脈キー・候補の双方へ送りあり動詞・形容詞の語幹（「切る」→「切」、「確認する」→「確認」等）のみを事前展開。候補展開・マージ時は 16 件超で `HashSet` を併用するハイブリッド重複排除を使用。
-- **EUC-JP 一括 SIMD デコード & リクエスト構築**: `UpstreamEncoding::EucJp` 向けに `decode_euc_response_to_utf8` で走査を最小化しつつ 2 バイト UTF-8 衝突を回避し、`encode_euc_jp_cow` で送信時の中間バッファコピーを削減。
+- **EUC-JP / UTF-8 エンコーディング対応と防御的復元**: `UpstreamEncoding::EucJp` 向けに `decode_euc_response_to_utf8` で走査を最小化しつつ 2 バイト UTF-8 衝突回避および `yaskkserv2` 由来 `&#x<UTF-8 hex>` の自動復元を行い、`encode_euc_jp_cow` で送信時の中間バッファコピーを削減。さらに `--yaskkserv2-encoding=utf8`（`RUSKKSERV_YASKKSERV2_ENCODING=utf8`）により `yaskkserv2 --midashi-utf8` + `--utf8` 辞書と完全 UTF-8 通信が可能。
 - **PDQsort & Apple Silicon 最適化**: 候補整列に `sort_unstable_by` を採用。`SharedContextState` を 128 バイト境界に配置（`#[repr(align(128))]`）し、`memchr` NEON ベクトル走査、Full LTO、`mimalloc` を採用。
 - **プロトコル・接続・権限防御**: skkserv リクエスト内空白・制御文字の拒否（スマグリング防止）、`BufReader` 未読余剰バイト残留接続の破棄、同時接続上限（64）・無通信タイムアウト（600秒）、`--listen` の `SocketAddr` 検証、プライバシ保護ログ（既定 `info`・`LOG_DIR` `0700`・シード/ログ `0600`・アトミック保存）を実装。
 
@@ -275,6 +277,8 @@ Options:
           azoo-key-skkserv address [default: 127.0.0.1:1180]
       --yaskkserv2 <YASKKSERV2>
           yaskkserv2 address [default: 127.0.0.1:1179]
+      --yaskkserv2-encoding <YASKKSERV2_ENCODING>
+          yaskkserv2 との通信エンコーディング（euc [デフォルト] / utf8 / euc-req-utf8-resp; 環境変数 RUSKKSERV_YASKKSERV2_ENCODING でも制御可能） [possible values: euc, utf8, euc-req-utf8-resp]
       --backend-order <BACKEND_ORDER>
           バックエンドの参照順（yaskkserv2-first [デフォルト] / azookey-first; 環境変数 RUSKKSERV_BACKEND_ORDER でも制御可能） [possible values: yaskkserv2-first, azookey-first]
       --azookey-timeout-ms <AZOOKEY_TIMEOUT_MS>

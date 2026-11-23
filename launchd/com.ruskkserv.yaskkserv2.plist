@@ -16,6 +16,7 @@
         <string>@YASKKSERV2_GOOGLE_JAPANESE_INPUT@</string>
         <string>--google-cache-filename</string>
         <string>@YASKKSERV2_GOOGLE_CACHE@</string>
+@YASKKSERV2_MIDASHI_UTF8_LINE@
         <string>@YASKKSERV2_DICTIONARY@</string>
     </array>
     <key>RunAtLoad</key>

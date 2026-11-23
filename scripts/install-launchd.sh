@@ -64,6 +64,14 @@ load_config() {
   RUSKKSERV_CONTEXT_RANKING="${RUSKKSERV_CONTEXT_RANKING:-1}"
   RUSKKSERV_ANNOTATION_PRIORITY="${RUSKKSERV_ANNOTATION_PRIORITY:-1}"
   RUSKKSERV_BACKEND_ORDER="${RUSKKSERV_BACKEND_ORDER:-yaskkserv2-first}"
+  RUSKKSERV_YASKKSERV2_ENCODING="${RUSKKSERV_YASKKSERV2_ENCODING:-euc}"
+  case "$RUSKKSERV_YASKKSERV2_ENCODING" in
+    euc|utf8|euc-req-utf8-resp) ;;
+    *)
+      echo "error: RUSKKSERV_YASKKSERV2_ENCODING は euc|utf8|euc-req-utf8-resp のいずれかを指定してください: ${RUSKKSERV_YASKKSERV2_ENCODING}" >&2
+      exit 1
+      ;;
+  esac
   RUSKKSERV_LOG_LEVEL="${RUSKKSERV_LOG_LEVEL:-info}"
   MACSKK_USER_DICT_PATH="${MACSKK_USER_DICT_PATH:-}"
   if [ -n "$MACSKK_USER_DICT_PATH" ]; then
@@ -112,8 +120,15 @@ render_plist() {
   esc_context="$(escape_plist_sed "$RUSKKSERV_CONTEXT_RANKING")"
   esc_annotation="$(escape_plist_sed "$RUSKKSERV_ANNOTATION_PRIORITY")"
   esc_backend_order="$(escape_plist_sed "$RUSKKSERV_BACKEND_ORDER")"
+  esc_yaskkserv2_encoding="$(escape_plist_sed "$RUSKKSERV_YASKKSERV2_ENCODING")"
   esc_log_level="$(escape_plist_sed "$RUSKKSERV_LOG_LEVEL")"
   esc_user_dict="$(escape_plist_sed "${MACSKK_USER_DICT_PATH:-}")"
+
+  if [ "$RUSKKSERV_YASKKSERV2_ENCODING" = "utf8" ]; then
+    midashi_utf8_sed='s|@YASKKSERV2_MIDASHI_UTF8_LINE@|        <string>--midashi-utf8</string>|g'
+  else
+    midashi_utf8_sed='/@YASKKSERV2_MIDASHI_UTF8_LINE@/d'
+  fi
 
   sed \
     -e "s|@RUSKKSERV_BIN@|${esc_ruskkserv_bin}|g" \
@@ -122,6 +137,7 @@ render_plist() {
     -e "s|@YASKKSERV2_DICTIONARY@|${esc_yaskkserv2_dict}|g" \
     -e "s|@YASKKSERV2_GOOGLE_CACHE@|${esc_yaskkserv2_cache}|g" \
     -e "s|@YASKKSERV2_GOOGLE_JAPANESE_INPUT@|${esc_yaskkserv2_google_input}|g" \
+    -e "$midashi_utf8_sed" \
     -e "s|@WAIT_SCRIPT@|${esc_wait_script}|g" \
     -e "s|@IMPORTER_APP_BIN@|${esc_importer_app_bin}|g" \
     -e "s|@LOG_DIR@|${esc_log_dir}|g" \
@@ -129,6 +145,7 @@ render_plist() {
     -e "s|@RUSKKSERV_CONTEXT_RANKING@|${esc_context}|g" \
     -e "s|@RUSKKSERV_ANNOTATION_PRIORITY@|${esc_annotation}|g" \
     -e "s|@RUSKKSERV_BACKEND_ORDER@|${esc_backend_order}|g" \
+    -e "s|@RUSKKSERV_YASKKSERV2_ENCODING@|${esc_yaskkserv2_encoding}|g" \
     -e "s|@RUSKKSERV_LOG_LEVEL@|${esc_log_level}|g" \
     -e "s|@MACSKK_USER_DICT_PATH@|${esc_user_dict}|g" \
     "$template" >"$dest"

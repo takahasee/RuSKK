@@ -153,6 +153,7 @@ impl Proxy {
         info!(listen = %self.listen, backend_order = ?self.backend_order, "ruskkserv listening");
         info!(
             yaskkserv2_addr = %self.yaskkserv2.addr,
+            yaskkserv2_encoding = ?self.yaskkserv2.encoding,
             azookey_addr = %self.azookey.addr,
             "backends configured"
         );

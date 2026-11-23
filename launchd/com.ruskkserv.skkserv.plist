@@ -30,6 +30,8 @@
         <string>@RUSKKSERV_ANNOTATION_PRIORITY@</string>
         <key>RUSKKSERV_BACKEND_ORDER</key>
         <string>@RUSKKSERV_BACKEND_ORDER@</string>
+        <key>RUSKKSERV_YASKKSERV2_ENCODING</key>
+        <string>@RUSKKSERV_YASKKSERV2_ENCODING@</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

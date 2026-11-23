@@ -14,6 +14,17 @@ pub enum BackendOrder {
     AzookeyFirst,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+pub enum Yaskkserv2Encoding {
+    /// EUC-JP（標準の `yaskkserv2` 既定設定）
+    #[default]
+    Euc,
+    /// UTF-8（`yaskkserv2_make_dictionary --utf8` + `yaskkserv2 --midashi-utf8` 構成用）
+    Utf8,
+    /// リクエスト EUC-JP / レスポンス UTF-8（`--utf8` 辞書かつ `--midashi-utf8` なし構成用）
+    EucReqUtf8Resp,
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "ruskkserv",
@@ -32,6 +43,10 @@ pub struct Args {
     /// yaskkserv2 address
     #[arg(long, default_value = "127.0.0.1:1179")]
     pub yaskkserv2: SocketAddr,
+
+    /// yaskkserv2 との通信エンコーディング（euc [デフォルト] / utf8 / euc-req-utf8-resp; 環境変数 RUSKKSERV_YASKKSERV2_ENCODING でも制御可能）
+    #[arg(long, value_enum)]
+    pub yaskkserv2_encoding: Option<Yaskkserv2Encoding>,
 
     /// バックエンドの参照順（yaskkserv2-first [デフォルト] / azookey-first; 環境変数 RUSKKSERV_BACKEND_ORDER でも制御可能）
     #[arg(long, value_enum)]
@@ -129,12 +144,35 @@ impl Args {
     }
 
     pub fn yaskkserv2(&self) -> Backend {
+        let encoding = match self.resolved_yaskkserv2_encoding() {
+            Yaskkserv2Encoding::Euc => UpstreamEncoding::EucJp,
+            Yaskkserv2Encoding::Utf8 => UpstreamEncoding::Utf8,
+            Yaskkserv2Encoding::EucReqUtf8Resp => UpstreamEncoding::EucJpRequestUtf8Response,
+        };
         Backend::new(
             "yaskkserv2",
             self.yaskkserv2,
-            UpstreamEncoding::EucJp,
+            encoding,
             Duration::from_millis(self.yaskkserv2_timeout_ms),
         )
+    }
+
+    pub fn resolved_yaskkserv2_encoding(&self) -> Yaskkserv2Encoding {
+        if let Some(encoding) = self.yaskkserv2_encoding {
+            return encoding;
+        }
+        if let Ok(val) = std::env::var("RUSKKSERV_YASKKSERV2_ENCODING") {
+            let norm = val.trim().to_ascii_lowercase();
+            match norm.as_str() {
+                "utf8" | "utf-8" => return Yaskkserv2Encoding::Utf8,
+                "euc-req-utf8-resp" | "euc_req_utf8_resp" => {
+                    return Yaskkserv2Encoding::EucReqUtf8Resp;
+                }
+                "euc" | "euc-jp" | "euc_jp" => return Yaskkserv2Encoding::Euc,
+                _ => {}
+            }
+        }
+        Yaskkserv2Encoding::Euc
     }
 
     pub fn resolved_backend_order(&self) -> BackendOrder {
@@ -254,6 +292,48 @@ mod tests {
             yaskk_first.resolved_backend_order(),
             BackendOrder::Yaskkserv2First
         );
+    }
+
+    #[test]
+    fn test_yaskkserv2_encoding_cli_options() {
+        let default_args = Args::try_parse_from(["ruskkserv"]).unwrap();
+        assert_eq!(default_args.yaskkserv2_encoding, None);
+        assert_eq!(
+            default_args.resolved_yaskkserv2_encoding(),
+            Yaskkserv2Encoding::Euc
+        );
+        assert_eq!(default_args.yaskkserv2().encoding, UpstreamEncoding::EucJp);
+
+        let utf8_args =
+            Args::try_parse_from(["ruskkserv", "--yaskkserv2-encoding=utf8"]).unwrap();
+        assert_eq!(utf8_args.yaskkserv2_encoding, Some(Yaskkserv2Encoding::Utf8));
+        assert_eq!(
+            utf8_args.resolved_yaskkserv2_encoding(),
+            Yaskkserv2Encoding::Utf8
+        );
+        assert_eq!(utf8_args.yaskkserv2().encoding, UpstreamEncoding::Utf8);
+
+        let hybrid_args =
+            Args::try_parse_from(["ruskkserv", "--yaskkserv2-encoding=euc-req-utf8-resp"]).unwrap();
+        assert_eq!(
+            hybrid_args.yaskkserv2_encoding,
+            Some(Yaskkserv2Encoding::EucReqUtf8Resp)
+        );
+        assert_eq!(
+            hybrid_args.resolved_yaskkserv2_encoding(),
+            Yaskkserv2Encoding::EucReqUtf8Resp
+        );
+        assert_eq!(
+            hybrid_args.yaskkserv2().encoding,
+            UpstreamEncoding::EucJpRequestUtf8Response
+        );
+
+        let euc_args = Args::try_parse_from(["ruskkserv", "--yaskkserv2-encoding=euc"]).unwrap();
+        assert_eq!(
+            euc_args.resolved_yaskkserv2_encoding(),
+            Yaskkserv2Encoding::Euc
+        );
+        assert_eq!(euc_args.yaskkserv2().encoding, UpstreamEncoding::EucJp);
     }
 
     #[test]
