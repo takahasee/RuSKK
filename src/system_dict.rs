@@ -87,8 +87,49 @@ mod ffi {
             used_buf_len: *mut isize,
         ) -> isize;
 
+        pub fn CFStringCreateMutableCopy(
+            alloc: *const c_void,
+            max_length: isize,
+            the_string: CFStringRef,
+        ) -> *mut c_void;
+
+        pub fn CFStringTransform(
+            string: *mut c_void,
+            range: *mut CFRange,
+            transform: CFStringRef,
+            reverse: u8,
+        ) -> u8;
+
+        pub fn CFLocaleCreate(
+            allocator: *const c_void,
+            locale_identifier: CFStringRef,
+        ) -> *const c_void;
+
+        pub fn CFStringTokenizerCreate(
+            alloc: *const c_void,
+            string: CFStringRef,
+            range: CFRange,
+            options: usize,
+            locale: *const c_void,
+        ) -> *mut c_void;
+
+        pub fn CFStringTokenizerSetString(
+            tokenizer: *mut c_void,
+            string: CFStringRef,
+            range: CFRange,
+        );
+
+        pub fn CFStringTokenizerAdvanceToNextToken(tokenizer: *mut c_void) -> usize;
+
+        pub fn CFStringTokenizerCopyCurrentTokenAttribute(
+            tokenizer: *mut c_void,
+            attribute: usize,
+        ) -> CFStringRef;
+
         pub fn CFRelease(cf: *const c_void);
     }
+
+    pub const K_CF_STRING_TOKENIZER_ATTRIBUTE_LATIN_TRANSCRIPTION: usize = 1 << 16;
 }
 
 /// macOS システム辞書（大辞林等）で単語の定義・解説が存在するか直接照会する。
@@ -623,6 +664,336 @@ pub fn is_annotated_or_in_dict(candidate: &str, midashi: Option<&str>) -> bool {
     is_annotated_or_in_dict_impl(candidate, parsed_okuri.as_ref(), true, None, true).0
 }
 
+/// 文字列がすべて平仮名・カタカナ・長音記号（`ー`）のみで構成されている場合、
+/// 平仮名へ正規化した文字列を返す（長音 `ー` は維持）。漢字や ASCII 等を含む場合は `None`。
+pub fn pure_kana_to_hiragana(word: &str) -> Option<String> {
+    if word.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(word.len());
+    for c in word.chars() {
+        if ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー' {
+            out.push(c);
+        } else if ('\u{30A1}'..='\u{30F3}').contains(&c) {
+            let h = char::from_u32(c as u32 - 0x60)?;
+            out.push(h);
+        } else if c == 'ヴ' {
+            out.push('ゔ');
+        } else if c == 'ヵ' {
+            out.push('か');
+        } else if c == 'ヶ' {
+            out.push('け');
+        } else {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// 形態素解析で読み揺れしやすい慣用複合語の確定読みテーブル
+fn known_compound_reading_override(word: &str) -> Option<&'static str> {
+    let r = match word {
+        "一軒家" => "いっけんや",
+        "一文" => "いちぶん",
+        "和菓子" => "わがし",
+        "咽喉" => "いんこう",
+        "地ビール" => "じびーる",
+        "小麦粉" => "こむぎこ",
+        "手下" => "てした",
+        "日本刀" => "にほんとう",
+        "日本酒" => "にほんしゅ",
+        "柴犬" => "しばいぬ",
+        "珈琲" => "こーひー",
+        "コーヒー豆" => "こーひーまめ",
+        "ウーロン茶" => "うーろんちゃ",
+        "生ビール" => "なまびーる",
+        "生肉" => "なまにく",
+        "真犯人" => "しんはんにん",
+        "麦酒" => "びーる",
+        "〆切" => "しめきり",
+        _ => return None,
+    };
+    Some(r)
+}
+
+#[cfg(target_os = "macos")]
+struct ReusableTokenizer {
+    tokenizer: *mut std::ffi::c_void,
+    transform_latin_hira: ffi::CFStringRef,
+}
+
+#[cfg(target_os = "macos")]
+// SAFETY: ReusableTokenizer はグローバル Mutex のロック下でシングルスレッド排他アクセスされる。
+unsafe impl Send for ReusableTokenizer {}
+
+#[cfg(target_os = "macos")]
+fn tokenize_to_hiragana_macos(word: &str) -> Option<String> {
+    if word.is_empty() {
+        return None;
+    }
+    if let Some(hira) = pure_kana_to_hiragana(word) {
+        return Some(hira);
+    }
+
+    // カタカナ長音（`ー`）と漢字が混在する複合語（例: "ジェット機", "コーヒー豆"）は、
+    // `Latin-Hiragana` 変換で `ー` が母音展開されるのを防ぐため、カナ連続部分と非カナ部分に分割して処理する
+    if word.contains('ー') {
+        let mut combined = String::with_capacity(word.len() * 2);
+        let mut segment_start = 0usize;
+        let mut current_is_kana: Option<bool> = None;
+
+        for (idx, c) in word.char_indices() {
+            let is_kana = ('\u{3041}'..='\u{3096}').contains(&c)
+                || ('\u{30A1}'..='\u{30F6}').contains(&c)
+                || c == 'ー';
+            if let Some(prev_kana) = current_is_kana {
+                if prev_kana != is_kana {
+                    let seg = &word[segment_start..idx];
+                    let part = if prev_kana {
+                        pure_kana_to_hiragana(seg)?
+                    } else {
+                        tokenize_to_hiragana_macos_raw(seg)?
+                    };
+                    combined.push_str(&part);
+                    segment_start = idx;
+                    current_is_kana = Some(is_kana);
+                }
+            } else {
+                current_is_kana = Some(is_kana);
+            }
+        }
+        if let Some(prev_kana) = current_is_kana {
+            let seg = &word[segment_start..];
+            let part = if prev_kana {
+                pure_kana_to_hiragana(seg)?
+            } else {
+                tokenize_to_hiragana_macos_raw(seg)?
+            };
+            combined.push_str(&part);
+        }
+        return (!combined.is_empty()).then_some(combined);
+    }
+
+    tokenize_to_hiragana_macos_raw(word)
+}
+
+#[cfg(target_os = "macos")]
+struct CfRefGuard(*const std::ffi::c_void);
+
+#[cfg(target_os = "macos")]
+impl Drop for CfRefGuard {
+    #[inline]
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ffi::CFRelease(self.0) };
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn tokenize_to_hiragana_macos_raw(word: &str) -> Option<String> {
+    static TOKENIZER_LOCK: OnceLock<Mutex<Option<ReusableTokenizer>>> = OnceLock::new();
+    let lock = TOKENIZER_LOCK.get_or_init(|| {
+        unsafe {
+            let ja_bytes = b"ja_JP";
+            let ja_str = CfRefGuard(ffi::CFStringCreateWithBytes(
+                std::ptr::null(),
+                ja_bytes.as_ptr(),
+                ja_bytes.len() as isize,
+                ffi::K_CF_STRING_ENCODING_UTF8,
+                0,
+            ));
+            if ja_str.0.is_null() {
+                return Mutex::new(None);
+            }
+            let locale = CfRefGuard(ffi::CFLocaleCreate(std::ptr::null(), ja_str.0));
+            if locale.0.is_null() {
+                return Mutex::new(None);
+            }
+            let empty_str = CfRefGuard(ffi::CFStringCreateWithBytes(
+                std::ptr::null(),
+                b"".as_ptr(),
+                0,
+                ffi::K_CF_STRING_ENCODING_UTF8,
+                0,
+            ));
+            if empty_str.0.is_null() {
+                return Mutex::new(None);
+            }
+            let tok = ffi::CFStringTokenizerCreate(
+                std::ptr::null(),
+                empty_str.0,
+                ffi::CFRange {
+                    location: 0,
+                    length: 0,
+                },
+                0,
+                locale.0,
+            );
+            if tok.is_null() {
+                return Mutex::new(None);
+            }
+
+            let tx_bytes = b"Latin-Hiragana";
+            let tx_str = ffi::CFStringCreateWithBytes(
+                std::ptr::null(),
+                tx_bytes.as_ptr(),
+                tx_bytes.len() as isize,
+                ffi::K_CF_STRING_ENCODING_UTF8,
+                0,
+            );
+            if tx_str.is_null() {
+                ffi::CFRelease(tok);
+                return Mutex::new(None);
+            }
+
+            Mutex::new(Some(ReusableTokenizer {
+                tokenizer: tok,
+                transform_latin_hira: tx_str,
+            }))
+        }
+    });
+
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let state = guard.as_ref()?;
+
+    unsafe {
+        let cf_str = CfRefGuard(ffi::CFStringCreateWithBytes(
+            std::ptr::null(),
+            word.as_ptr(),
+            word.len() as isize,
+            ffi::K_CF_STRING_ENCODING_UTF8,
+            0,
+        ));
+        if cf_str.0.is_null() {
+            return None;
+        }
+        let range = ffi::CFRange {
+            location: 0,
+            length: ffi::CFStringGetLength(cf_str.0),
+        };
+        ffi::CFStringTokenizerSetString(state.tokenizer, cf_str.0, range);
+
+        let mut out = String::with_capacity(word.len() * 2);
+        let mut buf = [0u8; 256];
+
+        while ffi::CFStringTokenizerAdvanceToNextToken(state.tokenizer) != 0 {
+            let latin = CfRefGuard(ffi::CFStringTokenizerCopyCurrentTokenAttribute(
+                state.tokenizer,
+                ffi::K_CF_STRING_TOKENIZER_ATTRIBUTE_LATIN_TRANSCRIPTION,
+            ));
+            if latin.0.is_null() {
+                return None;
+            }
+            let mutable_raw = ffi::CFStringCreateMutableCopy(std::ptr::null(), 0, latin.0);
+            if mutable_raw.is_null() {
+                return None;
+            }
+            let _mutable_guard = CfRefGuard(mutable_raw);
+            let ok = ffi::CFStringTransform(
+                mutable_raw,
+                std::ptr::null_mut(),
+                state.transform_latin_hira,
+                0,
+            );
+            if ok == 0 {
+                return None;
+            }
+            let len = ffi::CFStringGetLength(mutable_raw);
+            let mut used: isize = 0;
+            let converted = ffi::CFStringGetBytes(
+                mutable_raw,
+                ffi::CFRange {
+                    location: 0,
+                    length: len,
+                },
+                ffi::K_CF_STRING_ENCODING_UTF8,
+                b'?',
+                0,
+                buf.as_mut_ptr(),
+                buf.len() as isize,
+                &mut used,
+            );
+            if converted != len || used <= 0 {
+                return None;
+            }
+            let token_str = std::str::from_utf8(&buf[..(used as usize).min(buf.len())]).ok()?;
+            // 空白やアクセント記号等を除去し純平仮名として連結
+            for c in token_str.chars() {
+                if c.is_whitespace() || matches!(c, '・' | '\'' | '’' | '-') {
+                    continue;
+                }
+                if ('\u{3041}'..='\u{3096}').contains(&c) || c == 'ー' {
+                    out.push(c);
+                } else if ('\u{30A1}'..='\u{30F3}').contains(&c)
+                    && let Some(h) = char::from_u32(c as u32 - 0x60)
+                {
+                    out.push(h);
+                } else if c == 'ヴ' {
+                    out.push('ゔ');
+                } else {
+                    return None;
+                }
+            }
+        }
+
+        (!out.is_empty()).then_some(out)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn tokenize_to_hiragana_macos(word: &str) -> Option<String> {
+    pure_kana_to_hiragana(word)
+}
+
+/// 送りなし単語（漢字熟語・カタカナ語・複合語、例: `"主治医"`, `"広葉樹"`, `"銀メダル"`, `"パーカー"`）から
+/// SKK の見出し語補完（`opcode 4`）に適した平仮名見出し語（`"しゅじい"`, `"こうようじゅ"`, `"ぎんめだる"`, `"ぱーかー"`）を推定する。
+/// 結果はプロセス内のグローバルキャッシュに保持され、2 回目以降は $O(1)$ で即座に返る。
+pub fn infer_hiragana_reading(word: &str) -> Option<String> {
+    if word.chars().count() < 2 {
+        return None;
+    }
+    if word
+        .chars()
+        .any(|c| c.is_ascii() || c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    // 送りあり用言（末尾が平仮名で非平仮名を含む語、例: "切る", "診る", "確認する"）は除外
+    // （※サ変動詞 "確認する" 等は expand_aliases で語幹 "確認" が展開されるため、そちらが送りなし名詞として対象になる）
+    if word.chars().last().is_some_and(|c| ('\u{3041}'..='\u{3096}').contains(&c))
+        && word.chars().any(|c| !('\u{3041}'..='\u{3096}').contains(&c))
+        && !word.starts_with('お')
+        && !word.starts_with('ご')
+    {
+        return None;
+    }
+
+    if let Some(ov) = known_compound_reading_override(word) {
+        return Some(ov.to_string());
+    }
+    if let Some(hira) = pure_kana_to_hiragana(word) {
+        return Some(hira);
+    }
+
+    static READING_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
+    let cache = READING_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(2048)));
+
+    if let Ok(guard) = cache.read()
+        && let Some(cached) = guard.get(word)
+    {
+        return cached.clone();
+    }
+
+    let resolved = tokenize_to_hiragana_macos(word).filter(|r| r.chars().count() >= 2);
+    if let Ok(mut guard) = cache.write()
+        && guard.len() < MAX_CACHE_ENTRIES
+    {
+        guard.insert(word.to_string(), resolved.clone());
+    }
+    resolved
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -784,6 +1155,74 @@ mod tests {
             assert_eq!(
                 is_annotated_or_in_dict_budgeted("時間", None, true, Some(past_deadline)),
                 (true, false)
+            );
+        }
+    }
+
+    #[test]
+    fn test_infer_hiragana_reading() {
+        // 純カタカナ・ひらがな語（全 OS 共通）
+        assert_eq!(
+            infer_hiragana_reading("パーカー").as_deref(),
+            Some("ぱーかー")
+        );
+        assert_eq!(
+            infer_hiragana_reading("リポート").as_deref(),
+            Some("りぽーと")
+        );
+        assert_eq!(
+            infer_hiragana_reading("ヴァイオリン").as_deref(),
+            Some("ゔぁいおりん")
+        );
+        assert_eq!(infer_hiragana_reading("うさぎ").as_deref(), Some("うさぎ"));
+
+        // 除外対象（1文字、ASCII含み、送りあり用言）
+        assert_eq!(infer_hiragana_reading("服"), None);
+        assert_eq!(infer_hiragana_reading("あ"), None);
+        assert_eq!(infer_hiragana_reading("USB"), None);
+        assert_eq!(infer_hiragana_reading("Tシャツ"), None);
+        assert_eq!(infer_hiragana_reading("切る"), None);
+        assert_eq!(infer_hiragana_reading("診る"), None);
+        assert_eq!(infer_hiragana_reading("確認する"), None);
+
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(
+                infer_hiragana_reading("主治医").as_deref(),
+                Some("しゅじい")
+            );
+            assert_eq!(
+                infer_hiragana_reading("広葉樹").as_deref(),
+                Some("こうようじゅ")
+            );
+            assert_eq!(
+                infer_hiragana_reading("銀メダル").as_deref(),
+                Some("ぎんめだる")
+            );
+            assert_eq!(
+                infer_hiragana_reading("主題歌").as_deref(),
+                Some("しゅだいか")
+            );
+            assert_eq!(infer_hiragana_reading("親戚").as_deref(), Some("しんせき"));
+            assert_eq!(
+                infer_hiragana_reading("一軒家").as_deref(),
+                Some("いっけんや")
+            );
+            assert_eq!(
+                infer_hiragana_reading("ウーロン茶").as_deref(),
+                Some("うーろんちゃ")
+            );
+            assert_eq!(
+                infer_hiragana_reading("コーヒー豆").as_deref(),
+                Some("こーひーまめ")
+            );
+            assert_eq!(
+                infer_hiragana_reading("お祝い").as_deref(),
+                Some("おいわい")
+            );
+            assert_eq!(
+                infer_hiragana_reading("ぬか床").as_deref(),
+                Some("ぬかどこ")
             );
         }
     }

@@ -140,6 +140,31 @@ impl SharedContextState {
             }
         }
     }
+
+    /// 補完リクエスト（`Request::Completion` / opcode 4）時に、保留中文脈を一切昇格・変更することなく
+    /// 直前に確定した文脈語を読み取り専用で参照する。
+    /// - 直前に別見出し語の変換が行われて `pending_context` に保持されている場合（例: 「病院」変換直後に `4しゅ ` を補完）、
+    ///   現在の補完 `prefix` が `pending.midashi` の入力伸長でなければ `pending.word` を返す。
+    /// - `pending_context` が現在入力中の先頭 1 文字機械的 Lookup（例: `1し ` の直後の `4しゅ `）である場合は、
+    ///   既に昇格済みの `session_context` を返す。
+    fn peek_context_for_completion(&mut self, prefix: &str, now: Instant) -> Option<Arc<str>> {
+        if let Some(ref pending) = self.pending_context
+            && now.duration_since(pending.time) <= CONTEXT_TTL
+        {
+            let same_input_chain = pending.midashi == prefix
+                || is_input_extension(prefix, &pending.midashi)
+                || is_input_extension(&pending.midashi, prefix);
+            let min_confirmed_hits = if pending.midashi.chars().count() == 1 {
+                3
+            } else {
+                2
+            };
+            if !same_input_chain || pending.hits >= min_confirmed_hits {
+                return Some(Arc::clone(&pending.word));
+            }
+        }
+        self.current_context(now)
+    }
 }
 
 /// `new` が `prev` を前方一致で伸長した入力か（例: "き" → "きr", "に" → "にく"）
@@ -487,7 +512,7 @@ async fn handle_client(
                     crate::okuri::classify_midashi(&prefix_str),
                     crate::okuri::MidashiKind::Normal(_)
                 );
-                let (response, hit) = if is_affix_comp {
+                let (mut response, hit) = if is_affix_comp {
                     // 接尾語補完（例: `4>せ `）などは SKK 辞書を持つ yaskkserv2 へ直接照会
                     let (resp, ok) = lookup_single_backend(
                         &proxy.yaskkserv2,
@@ -514,6 +539,32 @@ async fn handle_client(
                         }
                     }
                 };
+                if !is_affix_comp && is_found(&response) {
+                    let comp_ctx_snapshot = if proxy.context_ranking {
+                        let mut ctx = shared_context.lock().unwrap_or_else(|e| e.into_inner());
+                        ctx.peek_context_for_completion(&prefix_str, start)
+                    } else {
+                        None
+                    };
+                    let comp_ctx_ref = match comp_ctx_snapshot {
+                        Some(ref c) => std::slice::from_ref(c),
+                        None => &[],
+                    };
+                    let upstream_cands = parse_candidates_borrowed(&response);
+                    let ranked_opt = {
+                        let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                        guard.complete_and_rank_midashi(
+                            comp_ctx_ref,
+                            &prefix_str,
+                            &upstream_cands,
+                            proxy.context_ranking,
+                        )
+                    };
+                    if let Some(ranked) = ranked_opt {
+                        let refs: Vec<&str> = ranked.iter().map(|s| s.as_str()).collect();
+                        response = format_candidates_response_str(&refs);
+                    }
+                }
                 trace!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 write_client_response(&mut writer, &response).await?;
                 conn_last_response_time = Some(Instant::now());

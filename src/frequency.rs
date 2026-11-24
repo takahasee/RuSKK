@@ -6,6 +6,17 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
+/// 見出し語補完（`Request::Completion` / opcode 4）用の事前構築インデックス。
+/// `frequencies`（個人の変換履歴）および `context_frequencies`（手動アンカー＋fastText 拡張語彙）から
+/// ロード・リロード時にメモリ上で自動構築される。
+#[derive(Debug, Default, Clone)]
+pub struct CompletionIndex {
+    /// 送りなし見出し語（平仮名） → 基礎優先スコア
+    pub midashi_scores: HashMap<String, u64>,
+    /// 直前確定文脈語（表記・用言・語幹） → (関連見出し語 → 文脈共起ボーナス)
+    pub context_to_midashi: HashMap<String, HashMap<String, u64>>,
+}
+
 /// 読み取り専用の頻度・文脈データに基づいて候補を並び替える。
 /// skkserv プロトコルではユーザーの選択を知る手段がないため、自動学習は行わない。
 /// ユーザーが `~/.ruskkserv-frequency.json` を手動で編集し、seed データを投入する。
@@ -18,6 +29,8 @@ pub struct FrequencyPredictor {
     pub context_frequencies: HashMap<String, HashMap<String, u64>>,
     #[serde(skip)]
     pub storage_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub completion_index: CompletionIndex,
 }
 
 impl FrequencyPredictor {
@@ -26,6 +39,7 @@ impl FrequencyPredictor {
             frequencies: HashMap::new(),
             context_frequencies: HashMap::new(),
             storage_path: None,
+            completion_index: CompletionIndex::default(),
         };
         if let Some(ref path) = storage_path
             && let Err(err) = predictor.load(path)
@@ -47,6 +61,7 @@ impl FrequencyPredictor {
             frequencies: HashMap::new(),
             context_frequencies: HashMap::new(),
             storage_path,
+            completion_index: CompletionIndex::default(),
         }
     }
 
@@ -487,10 +502,381 @@ impl FrequencyPredictor {
     /// 漢字熟語やカタカナ語の途中を切るような接頭辞部分文字列（例: 「漁港 → 漁」「時間 → 時」「包丁 → 包」）は
     /// 通常の変換と接頭語が混同される原因となるため一切生成しない。
     /// これによりランタイムのスコア照合が HashMap::get の O(1) のみで完結する。
+    /// あわせて見出し語補完（opcode 4）用のインデックスも再構築する。
     pub fn expand_aliases(&mut self) {
         expand_map_aliases(&mut self.frequencies);
         expand_context_map_aliases(&mut self.context_frequencies);
+        self.rebuild_completion_index();
     }
+
+    /// `frequencies` および `context_frequencies`（手動アンカー＋fastText 拡張語彙）から、
+    /// 見出し語補完（`Request::Completion` / opcode 4）用の高速インデックスを構築する。
+    pub fn rebuild_completion_index(&mut self) {
+        let mut midashi_scores: HashMap<String, u64> = HashMap::new();
+        let mut context_to_midashi: HashMap<String, HashMap<String, u64>> = HashMap::new();
+        // 候補表記 -> (最も優先度の高い送りなし見出し語, スコア)
+        let mut word_to_reading: HashMap<String, (String, u64)> = HashMap::new();
+
+        // 1. frequencies から送りなし見出し語スコアと (表記 -> 見出し語) 逆引きマップを構築
+        for (midashi, cand_map) in &self.frequencies {
+            if !is_completion_target_midashi(midashi) {
+                continue;
+            }
+            let total_score = cand_map
+                .values()
+                .copied()
+                .fold(0u64, u64::saturating_add);
+            if total_score == 0 {
+                continue;
+            }
+            let base = 100u64.saturating_add(total_score.min(500));
+            let entry = midashi_scores.entry(midashi.clone()).or_insert(0);
+            *entry = (*entry).max(base);
+
+            for (cand, &sc) in cand_map {
+                let clean = clean_candidate(cand);
+                if clean.is_empty() || is_unverified_okuri_fragment(clean) {
+                    continue;
+                }
+                let replace = match word_to_reading.get(clean) {
+                    None => true,
+                    Some((prev_m, prev_sc)) => {
+                        sc > *prev_sc
+                            || (sc == *prev_sc
+                                && (midashi.chars().count() < prev_m.chars().count()
+                                    || (midashi.chars().count() == prev_m.chars().count()
+                                        && midashi < prev_m)))
+                    }
+                };
+                if replace {
+                    word_to_reading.insert(clean.to_string(), (midashi.clone(), sc));
+                }
+            }
+        }
+
+        // 単語表記から送りなし平仮名見出し語を解決するクロージャ（逆引き -> システム形態素解析/純カナ変換）
+        let resolve_reading = |word: &str| -> Option<String> {
+            if let Some((m, _)) = word_to_reading.get(word) {
+                return Some(m.clone());
+            }
+            crate::system_dict::infer_hiragana_reading(word)
+                .filter(|r| is_completion_target_midashi(r))
+        };
+
+        // 2. context_frequencies から文脈名詞・ターゲットの読みを解決し、
+        //    基礎スコア・順方向連想・逆方向連想・同一ターゲット共有クラスタを構築
+        //    target_clusters: ターゲット語 -> Vec<(文脈語, 文脈語の読み[2文字以上のみSome], スコア)>
+        let mut target_clusters: HashMap<String, Vec<(String, Option<String>, u64)>> =
+            HashMap::new();
+
+        for (ctx_word, targets_map) in &self.context_frequencies {
+            if targets_map.is_empty() {
+                continue;
+            }
+            let ctx_reading = resolve_reading(ctx_word);
+            let max_ctx_score = targets_map.values().copied().max().unwrap_or(0);
+
+            if let Some(ref c_read) = ctx_reading {
+                // 手動アンカー (score >= 10) は 70 点、fastText 拡張語 (score 5..=9) は 60..=68 点
+                let ctx_base = 50u64.saturating_add(max_ctx_score.min(20).saturating_mul(2));
+                let entry = midashi_scores.entry(c_read.clone()).or_insert(0);
+                *entry = (*entry).max(ctx_base);
+            }
+
+            for (target_word, &score) in targets_map {
+                if score == 0 {
+                    continue;
+                }
+                // (a) ターゲット側が送りなし名詞・サ変語幹（例: "事項", "包丁", "確認"）の場合:
+                //     基礎補完スコアへの登録 ＋ 順方向文脈連想 (ctx_word -> target_reading)
+                if let Some(t_read) = resolve_reading(target_word) {
+                    let t_base = 50u64.saturating_add(score.min(20).saturating_mul(2));
+                    let entry = midashi_scores.entry(t_read.clone()).or_insert(0);
+                    *entry = (*entry).max(t_base);
+
+                    if ctx_reading.as_deref() != Some(t_read.as_str()) {
+                        let fwd = context_to_midashi
+                            .entry(ctx_word.clone())
+                            .or_default()
+                            .entry(t_read)
+                            .or_insert(0);
+                        *fwd = (*fwd).max(score.saturating_mul(10));
+                    }
+                }
+
+                // (b) 逆方向文脈連想 (target_word -> ctx_reading)
+                if let Some(ref c_read) = ctx_reading {
+                    let rev = context_to_midashi
+                        .entry(target_word.clone())
+                        .or_default()
+                        .entry(c_read.clone())
+                        .or_insert(0);
+                    *rev = (*rev).max(score.saturating_mul(6));
+                }
+
+                // (c) クラスタ連想は終止形ターゲット（末尾が平仮名の用言）を軸に束ねる。
+                //     1 文字文脈語（「木」「服」「肉」「家」等、ctx_reading == None）も発火元として含める。
+                if target_word
+                    .chars()
+                    .last()
+                    .is_some_and(is_hiragana_char)
+                {
+                    target_clusters.entry(target_word.clone()).or_default().push((
+                        ctx_word.clone(),
+                        ctx_reading.clone(),
+                        score,
+                    ));
+                }
+            }
+        }
+
+        // 3. 同一ターゲットを共有する文脈名詞クラスタ間の連想（例: "病院" <-> "主治医" via "診る"、"木" -> "広葉樹" via "伐る"）
+        const MAX_CLUSTER_MEMBERS: usize = 64;
+        for members in target_clusters.values_mut() {
+            if members.len() < 2 {
+                continue;
+            }
+            members.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            members.truncate(MAX_CLUSTER_MEMBERS);
+
+            for i in 0..members.len() {
+                for j in 0..members.len() {
+                    if i == j || members[i].0 == members[j].0 {
+                        continue;
+                    }
+                    let Some(ref reading_b) = members[j].1 else {
+                        continue;
+                    };
+                    if members[i].1.as_deref() == Some(reading_b.as_str()) {
+                        continue;
+                    }
+                    let co_score = members[i].2.min(members[j].2).saturating_mul(4);
+                    let entry = context_to_midashi
+                        .entry(members[i].0.clone())
+                        .or_default()
+                        .entry(reading_b.clone())
+                        .or_insert(0);
+                    *entry = (*entry).max(co_score);
+                }
+            }
+        }
+
+        self.completion_index = CompletionIndex {
+            midashi_scores,
+            context_to_midashi,
+        };
+    }
+
+    /// 見出し語補完（`Request::Completion` / opcode 4）のバックエンド応答候補 `upstream_cands` に対し、
+    /// `frequencies`（個人頻度）および `context_frequencies`（手動アンカー＋fastText 拡張語彙・直前文脈連想）を用いて
+    /// 重要見出し語の先頭注入（`yaskkserv2` の辞書順 64 件上限からの脱落救済）および優先ソートを行う。
+    ///
+    /// 補完インデックス内に `prefix` と前方一致する見出し語が 1 件も存在しない場合は `None` を返し、
+    /// 呼び出し側でバックエンドの元レスポンスをゼロコピーのまま返却できるようにする。
+    pub fn complete_and_rank_midashi<S: AsRef<str>>(
+        &self,
+        context: &[S],
+        prefix: &str,
+        upstream_cands: &[&str],
+        context_ranking: bool,
+    ) -> Option<Vec<String>> {
+        if prefix.is_empty()
+            || upstream_cands.is_empty()
+            || !matches!(
+                crate::okuri::classify_midashi(prefix),
+                crate::okuri::MidashiKind::Normal(_)
+            )
+        {
+            return None;
+        }
+        if self.completion_index.midashi_scores.is_empty()
+            && self.completion_index.context_to_midashi.is_empty()
+        {
+            return None;
+        }
+
+        let single_ctx_map = if context_ranking && context.len() == 1 {
+            self.completion_index
+                .context_to_midashi
+                .get(context[0].as_ref())
+        } else {
+            None
+        };
+        let multi_ctx_maps: Vec<&HashMap<String, u64>> =
+            if context_ranking && context.len() > 1 {
+                context
+                    .iter()
+                    .filter_map(|c| self.completion_index.context_to_midashi.get(c.as_ref()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+        let score_for_midashi = |m: &str| -> u64 {
+            if m == prefix || !m.starts_with(prefix) {
+                return 0;
+            }
+            let base = self
+                .completion_index
+                .midashi_scores
+                .get(m)
+                .copied()
+                .unwrap_or(0);
+            let ctx_bonus: u64 = if let Some(cm) = single_ctx_map {
+                cm.get(m).copied().unwrap_or(0)
+            } else if !multi_ctx_maps.is_empty() {
+                multi_ctx_maps
+                    .iter()
+                    .map(|cm| cm.get(m).copied().unwrap_or(0))
+                    .fold(0u64, u64::saturating_add)
+            } else {
+                0
+            };
+            base.saturating_add(ctx_bonus.saturating_mul(10))
+        };
+
+        // 1. upstream_cands 内に存在する候補のスコアと位置を記録
+        let mut upstream_set: HashSet<&str> = HashSet::with_capacity(upstream_cands.len());
+        let mut scored_candidates: Vec<(String, u64, bool, usize, usize)> = Vec::new();
+        for (idx, &cand) in upstream_cands.iter().enumerate() {
+            upstream_set.insert(cand);
+            let sc = score_for_midashi(cand);
+            if sc > 0 {
+                scored_candidates.push((
+                    cand.to_string(),
+                    sc,
+                    true,
+                    cand.chars().count(),
+                    idx,
+                ));
+            }
+        }
+
+        // 2. upstream_cands から漏れた（yaskkserv2 の 64 件上限等で脱落した）インデックス内の前方一致見出し語を収集
+        let mut extra_scored: Vec<(String, u64, usize)> = Vec::new();
+        let mut seen_extra: HashSet<&str> = HashSet::new();
+
+        for m in self.completion_index.midashi_scores.keys() {
+            if m.starts_with(prefix) && m != prefix && !upstream_set.contains(m.as_str()) {
+                let sc = score_for_midashi(m);
+                if sc > 0 && seen_extra.insert(m.as_str()) {
+                    extra_scored.push((m.clone(), sc, m.chars().count()));
+                }
+            }
+        }
+        if let Some(cm) = single_ctx_map {
+            for m in cm.keys() {
+                if m.starts_with(prefix)
+                    && m != prefix
+                    && !upstream_set.contains(m.as_str())
+                    && seen_extra.insert(m.as_str())
+                {
+                    let sc = score_for_midashi(m);
+                    if sc > 0 {
+                        extra_scored.push((m.clone(), sc, m.chars().count()));
+                    }
+                }
+            }
+        } else {
+            for cm in &multi_ctx_maps {
+                for m in cm.keys() {
+                    if m.starts_with(prefix)
+                        && m != prefix
+                        && !upstream_set.contains(m.as_str())
+                        && seen_extra.insert(m.as_str())
+                    {
+                        let sc = score_for_midashi(m);
+                        if sc > 0 {
+                            extra_scored.push((m.clone(), sc, m.chars().count()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // スコア付き候補が upstream にもインデックスにも 1 件もなければ変更不要
+        if scored_candidates.is_empty() && extra_scored.is_empty() {
+            return None;
+        }
+
+        // upstream に無かった追加候補は上位 MAX_INJECTED_COMPLETIONS 件までに制限
+        const MAX_INJECTED_COMPLETIONS: usize = 16;
+        const MAX_TOTAL_COMPLETIONS: usize = 64;
+
+        extra_scored.sort_unstable_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| a.2.cmp(&b.2))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (m, sc, char_len) in extra_scored.into_iter().take(MAX_INJECTED_COMPLETIONS) {
+            scored_candidates.push((m, sc, false, char_len, usize::MAX));
+        }
+
+        // スコア付き候補全体の整列:
+        // 1. スコア降順
+        // 2. upstream に実在する候補を優先
+        // 3. 文字数の短い基本見出し語を優先
+        // 4. upstream 元の順位 → 辞書順
+        scored_candidates.sort_unstable_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| a.3.cmp(&b.3))
+                .then_with(|| a.4.cmp(&b.4))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut result: Vec<String> =
+            Vec::with_capacity(upstream_cands.len().max(scored_candidates.len()).min(MAX_TOTAL_COMPLETIONS));
+        let mut emitted: HashSet<String> = HashSet::with_capacity(MAX_TOTAL_COMPLETIONS);
+
+        for (m, _, _, _, _) in scored_candidates {
+            if result.len() >= MAX_TOTAL_COMPLETIONS {
+                break;
+            }
+            if emitted.insert(m.clone()) {
+                result.push(m);
+            }
+        }
+
+        for &cand in upstream_cands {
+            if result.len() >= MAX_TOTAL_COMPLETIONS {
+                break;
+            }
+            if !emitted.contains(cand) {
+                emitted.insert(cand.to_string());
+                result.push(cand.to_string());
+            }
+        }
+
+        Some(result)
+    }
+}
+
+/// 見出し語補完（opcode 4）のインデックス対象となる送りなし日本語見出し語か判定する。
+#[inline]
+fn is_completion_target_midashi(midashi: &str) -> bool {
+    if midashi.chars().count() < 2 {
+        return false;
+    }
+    if !matches!(
+        crate::okuri::classify_midashi(midashi),
+        crate::okuri::MidashiKind::Normal(_)
+    ) {
+        return false;
+    }
+    if crate::okuri::parse_okuri_midashi_extended(midashi).is_some() {
+        return false;
+    }
+    let mut has_hiragana = false;
+    for c in midashi.chars() {
+        if c.is_ascii() || c.is_whitespace() || c.is_control() {
+            return false;
+        }
+        if is_hiragana_char(c) {
+            has_hiragana = true;
+        }
+    }
+    has_hiragana
 }
 
 /// 辞書ファイル読込の最大許容サイズ（128 MiB）。
@@ -1434,5 +1820,97 @@ mod tests {
         assert!(predictor.has_context_rules("服"));
         assert!(predictor.has_context_rules("確認"));
         assert!(!predictor.has_context_rules("未登録語"));
+    }
+
+    #[test]
+    fn test_completion_index_and_ranking_with_fasttext_and_frequencies() {
+        let mut predictor = FrequencyPredictor::new(None);
+        // 1. 個人頻度 (frequencies) の登録
+        predictor.frequencies.insert("かいしゃ".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("会社".to_string(), 3);
+            m
+        });
+        predictor.frequencies.insert("こんかい".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("今回".to_string(), 2);
+            m
+        });
+
+        // 2. 文脈共起 (context_frequencies): 手動アンカー (10) + fastText 生成スコア (6)
+        for (ctx, target, sc) in [
+            ("病院", "診る", 10u64),
+            ("主治医", "診る", 6),
+            ("木", "伐る", 10),
+            ("広葉樹", "伐る", 6),
+            ("主題歌", "歌う", 6),
+            ("リポート", "書く", 6),
+            ("確認する", "事項", 10),
+        ] {
+            predictor
+                .context_frequencies
+                .entry(ctx.to_string())
+                .or_default()
+                .insert(target.to_string(), sc);
+        }
+        predictor.expand_aliases();
+
+        // (a) yaskkserv2 の五十音順 64 件上限で脱落していた個人頻出語「かいしゃ」が先頭に注入されること
+        let upstream_kai = ["かい", "かい>", "かいあおやぎえき", "かいあかねぴ"];
+        let comp_kai = predictor
+            .complete_and_rank_midashi(&[] as &[&str], "かい", &upstream_kai, true)
+            .expect("should augment kai completions");
+        assert_eq!(comp_kai[0], "かいしゃ");
+        assert!(comp_kai.contains(&"かいあおやぎえき".to_string()));
+
+        // (b) 純カナの fastText 語「リポート」(りぽーと) も先頭に昇格すること
+        let upstream_ripo = ["りぽー", "りぽーたー", "りぽーと"];
+        let comp_ripo = predictor
+            .complete_and_rank_midashi(&[] as &[&str], "りぽー", &upstream_ripo, true)
+            .expect("should rank ripo completions");
+        assert_eq!(comp_ripo[0], "りぽーと");
+
+        #[cfg(target_os = "macos")]
+        {
+            // (c) yaskkserv2 で 64 位に埋もれていた fastText 拡張語「こうようじゅ」(広葉樹) が 1 位に昇格すること
+            let upstream_kouyou = [
+                "こうよう",
+                "こうよう>",
+                "こうようあおやぎ",
+                "こうよういん",
+                "こうようじゅ",
+            ];
+            let comp_kouyou = predictor
+                .complete_and_rank_midashi(&[] as &[&str], "こうよう", &upstream_kouyou, true)
+                .expect("should rank kouyou completions");
+            assert_eq!(comp_kouyou[0], "こうようじゅ");
+
+            // (d) 直前文脈が「病院」（または「診る」「診」）のとき、2文字プレフィックス「しゅ」で
+            //     同一「診る」クラスタの「しゅじい」(主治医) が無関係な「しゅだいか」(主題歌) を抑えて第1候補になること
+            let upstream_shu = ["しゅ", "しゅー", "しゅだいか", "しゅじい"];
+            let comp_shu_medical = predictor
+                .complete_and_rank_midashi(&["病院"], "しゅ", &upstream_shu, true)
+                .expect("should rank shu with medical context");
+            assert_eq!(comp_shu_medical[0], "しゅじい");
+
+            let comp_shu_verb = predictor
+                .complete_and_rank_midashi(&["診"], "しゅ", &upstream_shu, true)
+                .expect("should rank shu with verb stem context");
+            assert_eq!(comp_shu_verb[0], "しゅじい");
+
+            // (d2) 1文字文脈語「木」からも同一「伐る」クラスタの「こうようじゅ」(広葉樹) が文脈昇格すること
+            let upstream_kou = ["こう", "こうぎ", "こうか"];
+            let comp_kou_tree = predictor
+                .complete_and_rank_midashi(&["木"], "こう", &upstream_kou, true)
+                .expect("should inject kouyouju from single-char tree context");
+            assert_eq!(comp_kou_tree[0], "こうようじゅ");
+
+            // (e) 順方向連想: 直前文脈「確認」（「確認する」の語幹）のとき、「じ」の補完で「じこう」(事項) が第1候補になること
+            let upstream_ji = ["じ", "じー", "じあ"];
+            let comp_ji = predictor
+                .complete_and_rank_midashi(&["確認"], "じ", &upstream_ji, true)
+                .expect("should inject jikou from kakunin context");
+            assert_eq!(comp_ji[0], "じこう");
+        }
     }
 }

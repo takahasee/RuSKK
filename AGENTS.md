@@ -30,11 +30,12 @@
 - 補完リクエスト（opcode 4）は文脈追跡の対象外（保留中文脈を昇格・更新しない）としているため、サーバー側で文脈を参照しても macSKK 側で勝手な自動確定（`addFixedText`）が起きる心配は一切ありません。
 - **SIGHUP ホットリロード**: `ruskkserv` プロセスが SIGHUP を受信すると、`~/.ruskkserv-frequency.json` を再起動なしで即座に再読み込みする（`src/main.rs: reload_on_sighup()`）。`import-user-dict --send-reload` 実行後に自動で predictor が更新される。
 
-### ③ 補完フォワード機能（`Request::Completion` / opcode 4）
-- **仕様 (`src/proxy.rs`)**:
-  - macSKK からの補完リクエスト（opcode 4）を Primary (`azoo-key-skkserv`) / Fallback (`yaskkserv2`) へ照会し、返却された見出し語補完（`1/.../\n`）を macSKK へ返却します。
-  - 補完は入力途中の推測であるため、文脈連動の確定判定（`pending_context` の昇格・更新）は行いません。
-  - macSKK のローカル辞書（ユーザー辞書や静的辞書）が空の場合でも、RuSKKserv（azooKey）から見出し補完がシームレスに提供されます。
+### ③ 補完フォワード＆文脈・頻度連動見出し補完機能（`Request::Completion` / opcode 4）
+- **仕様 (`src/proxy.rs`, `src/frequency.rs`, `src/system_dict.rs`)**:
+  - macSKK からの補完リクエスト（opcode 4）をバックエンド参照順（既定 `yaskkserv2` 先 → ミス・200ms 超過時 `azoo-key-skkserv`、接頭語・接尾語は `yaskkserv2` 直接）へ照会し、返却された見出し語補完（`1/.../\n`）に対し `CompletionIndex`（`frequencies` の個人頻度見出し語および `context_frequencies` の手動アンカー＋fastText 拡張語彙から `infer_hiragana_reading` で解決した平仮名見出し語・順逆方向・同一ターゲット共有クラスタ連想）を用いて先頭注入・優先整列して返却します。
+  - これにより、`yaskkserv2` の辞書順先頭 64 件上限から脱落しやすい実用見出し語（`かいしゃ`, `こんかい`, `しんせき` 等）や下位に埋もれていた fastText 拡張複合語（`こうようじゅ`, `しゅじい`, `ぎんめだる` 等）が第1候補へ昇格し、さらに直前確定文脈（`peek_context_for_completion` による読み取り専用参照）と同じ意味クラスタの見出し語（例: 「病院」確定後の `4しゅ ` → `しゅじい`）が文脈昇格します。
+  - 補完は入力途中の推測であるため、文脈連動の確定判定（`pending_context` の昇格・更新）は一切行いません。
+  - macSKK のローカル辞書（ユーザー辞書や静的辞書）が空の場合でも、RuSKKserv から見出し補完がシームレスに提供されます。
 - **macSKK 側の補完最適設定（プラン A: 誤爆ゼロ・ストレスフリー構成）**:
   - `completionConfirmationTimeLimit -int 86400000`（24 Hours）でホームポジション打鍵（`ASDFGHJKL`）による勝手な誤確定・文字漏れ（「すずきせいじゅんあ」等）を 100% 根絶。
   - `fixedCompletionByPeriod -int 0` により、AZIK の句点打鍵との衝突を根絶。
@@ -189,7 +190,7 @@
 
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # ユニットテスト & 結合テスト（全103件合格）
+cargo test             # ユニットテスト & 結合テスト（全106件合格）
 cargo clippy           # 警告 0 件確認済み
 ./scripts/install-launchd.sh status  # 稼働状況確認
 ```

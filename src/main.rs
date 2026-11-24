@@ -191,19 +191,41 @@ async fn reload_on_sighup(
     loop {
         sighup.recv().await;
         info!("received SIGHUP — reloading predictor and clearing lookup cache");
-        lookup_cache.clear();
-        let mut guard = predictor.write().unwrap_or_else(|e| e.into_inner());
         if let Some(ref p) = path {
-            match guard.load(p) {
-                Ok(()) => info!(path = ?p, "predictor reloaded successfully"),
-                Err(e) => tracing::warn!(error = %e, "predictor reload failed"),
-            }
-            if guard.ensure_default_context_presets() {
-                tracing::warn!(
-                    "context_frequencies is empty after reload — using built-in default presets"
-                );
+            let reload_path = p.clone();
+            // ファイル読込および CompletionIndex 再構築をロック外のブロッキングスレッドで実施し、
+            // リロード中にクライアントの変換・補完リクエストが停止するのを防ぐ
+            let reloaded = tokio::task::spawn_blocking(move || {
+                let mut next = FrequencyPredictor::new_unloaded(Some(reload_path.clone()));
+                next.load(&reload_path)?;
+                let used_default_presets = next.ensure_default_context_presets();
+                Ok::<(FrequencyPredictor, bool), anyhow::Error>((next, used_default_presets))
+            })
+            .await;
+
+            match reloaded {
+                Ok(Ok((next, used_default_presets))) => {
+                    {
+                        let mut guard = predictor.write().unwrap_or_else(|e| e.into_inner());
+                        *guard = next;
+                    }
+                    lookup_cache.clear();
+                    info!(path = ?p, "predictor reloaded successfully");
+                    if used_default_presets {
+                        tracing::warn!(
+                            "context_frequencies is empty after reload — using built-in default presets"
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "predictor reload failed");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "predictor reload task failed");
+                }
             }
         } else {
+            lookup_cache.clear();
             tracing::warn!("SIGHUP received but no history_path configured — skipping reload");
         }
     }

@@ -3334,3 +3334,131 @@ async fn test_proxy_context_ranking_tracks_registered_non_kanji_context() {
     proxy_handle.abort();
     yaskk_handle.abort();
 }
+
+/// 見出し語補完（opcode 4）において：
+/// 1. `yaskkserv2` の辞書順 64 件上限から脱落した `frequencies` 登録見出し語（`かいしゃ`）が先頭に注入されること
+/// 2. 直前確定文脈（`病院`）と同一ターゲット（`診る`）を共有する fastText 拡張語（`主治医` -> `しゅじい`）が、
+///    文脈を一切汚染することなく `4しゅ ` の第1補完候補に昇格すること
+#[tokio::test]
+async fn test_proxy_completion_ranks_and_injects_frequency_and_fasttext_context() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("4かい ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/かい/かい>/かいあおやぎえき/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1びょういん ".as_bytes()) {
+                        let _ = stream.write_all("1/病院/\n".as_bytes()).await;
+                    } else if req.starts_with("4しゅ ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/しゅ/しゅー/しゅだいか/しゅじい/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1みr ".as_bytes()) {
+                        let _ = stream.write_all("1/見/観/診/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.frequencies.insert("かいしゃ".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("会社".to_string(), 3);
+        m
+    });
+    for (ctx, target, sc) in [
+        ("病院", "診る", 10u64),
+        ("主治医", "診る", 6),
+        ("主題歌", "歌う", 6),
+    ] {
+        predictor
+            .context_frequencies
+            .entry(ctx.to_string())
+            .or_default()
+            .insert(target.to_string(), sc);
+    }
+    predictor.expand_aliases();
+
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(20),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 「4かい 」補完で、yaskkserv2 のレスポンスから漏れていた個人頻度語「かいしゃ」が先頭に注入されること
+    client.write_all("4かい \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&buf[..n]),
+        "1/かいしゃ/かい/かい>/かいあおやぎえき/\n"
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        // 2. 「病院」を変換し、直後に「4しゅ 」を補完すると、同一「診る」クラスタの「しゅじい」（主治医）が
+        //    「しゅだいか」（主題歌）を抑えて第1候補に昇格すること
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.write_all("1びょういん \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/病院/\n");
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.write_all("4しゅ \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&buf[..n]),
+            "1/しゅじい/しゅだいか/しゅ/しゅー/\n"
+        );
+
+        // 3. 補完リクエストは保留中文脈を汚染しないため、続けて「1みr 」を変換すると「病院」の文脈で「診」が第1候補になること
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        client.write_all("1みr \n".as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/診/見/観/\n");
+    }
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}
