@@ -167,6 +167,10 @@ do_install() {
   mkdir -p -m 700 "$LOG_DIR"
   chmod 700 "$LOG_DIR"
   mkdir -p -m 700 "$(dirname "$YASKKSERV2_GOOGLE_CACHE")"
+  chmod 700 "$(dirname "$YASKKSERV2_GOOGLE_CACHE")"
+  if [ -f "$YASKKSERV2_GOOGLE_CACHE" ]; then
+    chmod 600 "$YASKKSERV2_GOOGLE_CACHE"
+  fi
   chmod +x "$WAIT_SCRIPT" "${ROOT}/scripts/build-importer-app.sh"
 
   # 旧 skk-proxy 関連の登録をクリーンアップ

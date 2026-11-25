@@ -46,7 +46,7 @@
 - 互換性: 読み取り専用の JSON ファイルとして扱われ、RuSKKserv プロセスからは書き込まれません。ユーザーが任意のエディタで編集して再起動することで反映されます。
 - **ホットリロード**: SIGHUP シグナルを受信すると再起動不要で即座に再読み込みされます（`import-user-dict --send-reload` および `init-seed --send-reload` が自動的に SIGHUP を送信）。
 - 組み込みプリセット: `data/default-seed.json`（`ruskkserv init-seed` で既存データを維持したままマージ可能）。
-  - `context_frequencies` は基本 751 キー / 850 ペア（159 ターゲット候補）、送り仮名語幹展開後 783 キー。MIT License との整合を保つため完全手動作成アンカー（スコア `10`）のみを同梱し、`cc.ja.300.vec`（CC BY-SA 3.0）や `SKK-JISYO.L`（GPL v2+）に由来する自動拡張データは同梱しない。着る/切る/伐る/斬る、計る/測る/量る/図る/謀る/諮る、観る/診る/看る/見る、乗る/載る、撮る/採る/捕る/取る、建てる/立てる、建つ/立つ/断つ/絶つ/経つ/裁つ、書く/描く/掻く/欠く、造る/創る/作る、飲む/打つ/撃つ/討つ、買う/飼う、変える/換える/替える/代える、止める/留める/泊める、上げる/挙げる/揚げる、咲く/裂く/割く、指す/刺す/差す/挿す、張る/貼る、閉める/締める/絞める、引く/弾く/挽く、点ける/付ける/着ける/漬ける/就く/着く/突く、聞く/聴く/効く、移す/写す/映す、履く/吐く/掃く、泣く/鳴く、伸ばす/延ばす、確認する/変更する/修正する/削除する/追加する等、日常・ビジネス・法律・医療・料理・IT・農業・教育・音楽・スポーツ・自然など幅広いドメインをカバー。
+  - `context_frequencies` は基本 751 キー / 849 ペア（159 ターゲット候補）、送り仮名語幹展開後 783 キー。MIT License との整合を保つため完全手動作成アンカー（スコア `10`）のみを同梱し、`cc.ja.300.vec`（CC BY-SA 3.0）や `SKK-JISYO.L`（GPL v2+）に由来する自動拡張データは同梱しない。着る/切る/伐る/斬る、計る/測る/量る/図る/謀る/諮る、観る/診る/看る/見る、乗る/載る、撮る/採る/捕る/取る、建てる/立てる、建つ/立つ/断つ/絶つ/経つ/裁つ、書く/描く/掻く/欠く、造る/創る/作る、飲む/打つ/撃つ/討つ、買う/飼う、変える/換える/替える/代える、止める/留める/泊める、上げる/挙げる/揚げる、咲く/裂く/割く、指す/刺す/差す/挿す、張る/貼る、閉める/締める/絞める、引く/弾く/挽く、点ける/付ける/着ける/漬ける/就く/着く/突く、聞く/聴く/効く、移す/写す/映す、履く/吐く/掃く、泣く/鳴く、伸ばす/延ばす、確認する/変更する/修正する/削除する/追加する等、日常・ビジネス・法律・医療・料理・IT・農業・教育・音楽・スポーツ・自然など幅広いドメインをカバー。
 - **fastText 自動拡張 (`src/fasttext.rs`, `ruskkserv init-seed --fasttext`)**:
   - ユーザーがローカル環境で各自取得した fastText テキストベクトル（`.vec`、ヘッダ有無両対応、次元上限 4,096、1 行 256 KiB 有界読取、不正 UTF-8 行スキップ）と任意の SKK 辞書（`--dict`、UTF-8 / EUC-JP 自動対応）を用いて `~/.ruskkserv-frequency.json` の `context_frequencies` を自動拡充するための外部 C++ ライブラリ不要の純 Rust 2 パス・ストリーミングツール機能。
   - スコア `10` 以上のペアのみをアンカーとして扱い（自動生成スコア `5`〜`9` による再実行時の連鎖ドリフトを防止）、アンカーベクトルの共有内積＋多義動詞対応スコアリング（最近傍アンカー `max1` 主軸＋`max2.max(centroid_sim)` 裏付け＋`self_vec` 補助）とターゲットごとの有界 Top-K ヒープ（`BinaryHeap`）で省メモリに上位候補を抽出する。既定では 2 候補以上が競合する同音異義グループのみを対象とし（`--include-non-competing` 指定で単独ターゲットも拡張可能）、グループ内マージン（`--min-margin`）および最小類似度（`--min-similarity`）で曖昧語を除外してマージする（異読みグループ間は互いに足切りしない）。`--dict` 併用時は英語見出し由来の未発動カタカナ語および第2候補以下の純カタカナ語を `vocab` から除外し、`[...]` を持たない通常送りあり行（`しm /染/占/` 等）の語幹・送りキー索引からも同音異義グループを補完する。`init-seed --fasttext` 再実行時（`--force` なし）は個人の `frequencies` と手動アンカー（`>= 10`）を保持したまま旧自動生成エントリ（`< 10`）をクリアして再構築し、`--output` に別ファイルを指定した場合は `--send-reload` による無関係な SIGHUP をスキップする。
@@ -164,7 +164,8 @@
 - **セキュリティ・堅牢性強化 (`launchd/`, `scripts/`, `src/`)**:
   - `yaskkserv2` plist に `--listen-address 127.0.0.1 --no-daemonize` を追加し全 I/F 公開と 10 秒リスポーンループを解消。本番 `RUST_LOG` 既定を `info` 化し入力本文ログは `trace!` + `?` エスケープに変更、`LOG_DIR` (`0700`)・ログと seed ファイル (`0600` アトミック保存 `save()`)・`/usr/bin/pkill -u <uid>`・`escape_plist_sed`・同時接続上限 `64` / 無通信タイムアウト `600s`・リクエストスマグリング拒否 & `BufReader` 余剰バイト破棄・`saturating_*` を導入。
 - **パフォーマンス／冗長処理削減**:
-  - 送りあり並列＋`yaskkserv2` 並列マージ、`DEFAULT_MAX_POOL_SIZE = 12`、`LookupCache` 借用キー照合 (`LookupKeyRef`) & `Arc` 共有、`SystemDictCache` FIFO 退去・単一 `read`・`block_in_place`・単一有界 prewarm ワーカー (`enqueue_prewarm`)、`decode_euc_response_to_utf8`・`encode_euc_jp_cow`・ハイブリッド $O(N)$ 重複排除を適用。
+  - 送りあり並列＋`yaskkserv2` 並列マージ、`DEFAULT_MAX_POOL_SIZE = 12`、`LookupCache` 借用キー照合 (`LookupKeyRef`) / `insert_by_ref` & `Arc` 共有、`Backend.pool` の `std::sync::Mutex` 化、`SystemDictCache` / `ReadingCache` FIFO 退去・単一 `read`・`block_in_place`・単一有界 prewarm ワーカー (`enqueue_prewarm`)、`CompletionIndex` 二分探索 (`sorted_midashi`) & 借用返却、`decode_euc_response_to_utf8`・`encode_euc_jp_cow`・ハイブリッド $O(N)$ 重複排除を適用。
+  - 補完 (`Request::Completion`) 直後の高速 `Lookup` で文脈が誤スキップされないよう `conn_last_lookup_time` による Lookup 限定のバースト判定へ改善し、`fasttext.rs` `--dict` 語彙抽出を第1候補限定に厳格化。
 
 ---
 

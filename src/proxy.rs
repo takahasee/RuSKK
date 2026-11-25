@@ -282,7 +282,7 @@ async fn handle_client(
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = Vec::with_capacity(128);
-    let mut conn_last_response_time: Option<Instant> = None;
+    let mut conn_last_lookup_time: Option<Instant> = None;
 
     loop {
         line.clear();
@@ -341,17 +341,14 @@ async fn handle_client(
                 const VERSION_RESP: &[u8] =
                     concat!("ruskkserv/", env!("CARGO_PKG_VERSION"), " ").as_bytes();
                 write_client_response(&mut writer, VERSION_RESP).await?;
-                conn_last_response_time = Some(Instant::now());
             }
             Request::Host => {
                 let host = format!("ruskkserv/{}: ", proxy.listen);
                 write_client_response(&mut writer, host.as_bytes()).await?;
-                conn_last_response_time = Some(Instant::now());
             }
             Request::Lookup(midashi) => {
                 if midashi.is_empty() {
                     write_client_response(&mut writer, b"4\n").await?;
-                    conn_last_response_time = Some(Instant::now());
                     continue;
                 }
 
@@ -360,10 +357,11 @@ async fn handle_client(
                 let is_affix = !matches!(midashi_kind, crate::okuri::MidashiKind::Normal(_));
                 let now = Instant::now();
 
-                // 同一 TCP コネクション内での直前レスポンスからの経過時間を判定。
-                // 50ms 未満の超高速な連続送信は、macSKK の補完候補展開に伴う機械的連射スキャンであるため、
+                // 同一 TCP コネクション内での直前 Lookup レスポンスからの経過時間を判定。
+                // 50ms 未満の超高速な連続 Lookup は、macSKK の補完候補展開に伴う機械的連射スキャンであるため、
                 // 文脈確定（pending_context の昇格および更新）の対象外として保護する。
-                let is_completion_burst = conn_last_response_time
+                // （※ Request::Completion 応答時刻は更新しないため、補完直後の高速 Space 変換は通常通り文脈が効く）
+                let is_completion_burst = conn_last_lookup_time
                     .map(|t| now.duration_since(t) < Duration::from_millis(50))
                     .unwrap_or(false);
 
@@ -414,7 +412,7 @@ async fn handle_client(
                         ctx.on_lookup_result(&midashi_str, Arc::clone(top), now);
                     }
                     write_client_response(&mut writer, &cached.response).await?;
-                    conn_last_response_time = Some(Instant::now());
+                    conn_last_lookup_time = Some(Instant::now());
                     continue;
                 }
 
@@ -436,8 +434,9 @@ async fn handle_client(
                     let resp_arc: Arc<[u8]> = Arc::from(resp_to_send);
                     trace!(?peer, kind = ?midashi_kind, resp = ?String::from_utf8_lossy(&resp_arc), "sending affix response to client");
                     if is_found(&resp_arc) {
-                        proxy.lookup_cache.insert(
-                            crate::cache::LookupKey::new(ctx_key, &midashi_str),
+                        proxy.lookup_cache.insert_by_ref(
+                            ctx_key,
+                            &midashi_str,
                             crate::cache::CachedLookup {
                                 response: Arc::clone(&resp_arc),
                                 top_candidate: None,
@@ -445,7 +444,7 @@ async fn handle_client(
                         );
                     }
                     write_client_response(&mut writer, &resp_arc).await?;
-                    conn_last_response_time = Some(Instant::now());
+                    conn_last_lookup_time = Some(Instant::now());
                     continue;
                 }
 
@@ -486,8 +485,9 @@ async fn handle_client(
 
                 let resp_arc: Arc<[u8]> = Arc::from(outcome.response);
                 if !outcome.skip_cache && is_found(&resp_arc) {
-                    proxy.lookup_cache.insert(
-                        crate::cache::LookupKey::new(ctx_key, &midashi_str),
+                    proxy.lookup_cache.insert_by_ref(
+                        ctx_key,
+                        &midashi_str,
                         crate::cache::CachedLookup {
                             response: Arc::clone(&resp_arc),
                             top_candidate: outcome.top_candidate,
@@ -497,12 +497,11 @@ async fn handle_client(
 
                 trace!(?peer, resp = ?String::from_utf8_lossy(&resp_arc), "sending response to client");
                 write_client_response(&mut writer, &resp_arc).await?;
-                conn_last_response_time = Some(Instant::now());
+                conn_last_lookup_time = Some(Instant::now());
             }
             Request::Completion(prefix) => {
                 if prefix.is_empty() {
                     write_client_response(&mut writer, b"4\n").await?;
-                    conn_last_response_time = Some(Instant::now());
                     continue;
                 }
                 let start = Instant::now();
@@ -551,23 +550,23 @@ async fn handle_client(
                         None => &[],
                     };
                     let upstream_cands = parse_candidates_borrowed(&response);
-                    let ranked_opt = {
+                    let new_response_opt = {
                         let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
-                        guard.complete_and_rank_midashi(
-                            comp_ctx_ref,
-                            &prefix_str,
-                            &upstream_cands,
-                            proxy.context_ranking,
-                        )
+                        guard
+                            .complete_and_rank_midashi(
+                                comp_ctx_ref,
+                                &prefix_str,
+                                &upstream_cands,
+                                proxy.context_ranking,
+                            )
+                            .map(|ranked| format_candidates_response_str(&ranked))
                     };
-                    if let Some(ranked) = ranked_opt {
-                        let refs: Vec<&str> = ranked.iter().map(|s| s.as_str()).collect();
-                        response = format_candidates_response_str(&refs);
+                    if let Some(new_response) = new_response_opt {
+                        response = new_response;
                     }
                 }
                 trace!(?peer, ?hit, resp = ?String::from_utf8_lossy(&response), "completion upstream response");
                 write_client_response(&mut writer, &response).await?;
-                conn_last_response_time = Some(Instant::now());
             }
         }
     }

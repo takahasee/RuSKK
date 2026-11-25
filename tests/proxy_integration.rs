@@ -3462,3 +3462,121 @@ async fn test_proxy_completion_ranks_and_injects_frequency_and_fasttext_context(
     proxy_handle.abort();
     yaskk_handle.abort();
 }
+
+/// 補完（opcode 4）応答から 50ms 未満に手動の `Lookup`（Space 押下）が続いた場合でも、
+/// `is_completion_burst` と誤判定せず直前確定文脈の昇格および新規文脈の記録が正しく行われることを検証するテスト。
+#[tokio::test]
+async fn test_proxy_completion_immediately_followed_by_fast_lookup_preserves_context() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1びょういん ".as_bytes()) {
+                        let _ = stream.write_all("1/病院/\n".as_bytes()).await;
+                    } else if req.starts_with("4み ".as_bytes()) {
+                        let _ = stream.write_all("1/み/みみ/\n".as_bytes()).await;
+                    } else if req.starts_with("1みr ".as_bytes()) {
+                        let _ = stream.write_all("1/見/観/診/\n".as_bytes()).await;
+                    } else if req.starts_with("4に ".as_bytes()) {
+                        let _ = stream.write_all("1/に/にく/\n".as_bytes()).await;
+                    } else if req.starts_with("1にく ".as_bytes()) {
+                        let _ = stream.write_all("1/肉/\n".as_bytes()).await;
+                    } else if req.starts_with("1きr ".as_bytes()) {
+                        let _ = stream.write_all("1/着/切/伐/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.context_frequencies.insert("病院".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("診る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("肉".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("切る".to_string(), 10);
+        m
+    });
+    predictor.expand_aliases();
+
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(predictor));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(20),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 「病院」を変換
+    client.write_all("1びょういん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/病院/\n");
+
+    // 2. 補完 `4み ` の直後 5ms (< 50ms) で `1みr ` が届いても、「病院」文脈が昇格して「診」が第1候補になること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("4み \n".as_bytes()).await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    client.write_all("1みr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/診/見/観/\n");
+
+    // 3. 同様に、補完 `4に ` の直後 5ms (< 50ms) で `1にく ` を変換しても「肉」が新規文脈として記録され、次の `1きr ` で「切」が第1候補になること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("4に \n".as_bytes()).await.unwrap();
+    let _ = client.read(&mut buf).await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    client.write_all("1にく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/肉/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/切/着/伐/\n");
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}

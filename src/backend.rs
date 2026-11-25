@@ -1,11 +1,10 @@
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
@@ -88,7 +87,7 @@ impl Backend {
     /// 戻り値の bool はプール由来の再利用接続（true）か新規接続（false）かを示す。
     async fn acquire_conn(&self) -> Result<(BufReader<TcpStream>, bool), BackendError> {
         {
-            let mut guard = self.pool.lock().await;
+            let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(stream) = guard.pop() {
                 return Ok((stream, true));
             }
@@ -107,7 +106,7 @@ impl Backend {
             );
             return;
         }
-        let mut guard = self.pool.lock().await;
+        let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         if guard.len() < self.max_pool_size {
             guard.push(stream);
         }
@@ -115,7 +114,7 @@ impl Backend {
 
     /// 接続プールをクリアする
     pub async fn clear_pool(&self) {
-        let mut guard = self.pool.lock().await;
+        let mut guard = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         guard.clear();
     }
 

@@ -929,10 +929,9 @@ fn load_skk_dict_vocab_and_groups(
                     }
                 }
             }
-            let has_kanji = cand.chars().any(crate::okuri::is_kanji);
-            // 英語見出しや第2候補以下の純カタカナ語は実入力で発動しにくいため除外し、
-            // 日本語見出しの漢字候補または第1候補の語彙のみを文脈語候補に含める
-            if jp_okuri_nashi && (idx == 0 || has_kanji) && is_valid_context_word(&cand) {
+            // skkserv プロトコルでは第1候補のみが文脈追跡されるため、
+            // 英語見出しおよび第2候補以下を除外し、日本語送りなし見出しの第1候補のみを文脈語候補に含める
+            if jp_okuri_nashi && idx == 0 && is_valid_context_word(&cand) {
                 vocab.insert(cand);
             }
         }
@@ -1553,8 +1552,8 @@ mod tests {
 
     #[test]
     fn test_dict_vocab_filters_english_midashi_and_extracts_bare_okuri_groups() {
-        // 1. 英単語見出し（cardigan /カーディガン/）と第2候補以下の純カタカナは vocab から除外されること
-        // 2. 日本語見出しの第1候補（ぱーかー /パーカー/）や漢字候補（ようふく /衣服/洋服/）は残ること
+        // 1. 英単語見出し（cardigan /カーディガン/）と第2候補以下（カッター・衣服）は vocab から除外されること
+        // 2. 日本語見出しの第1候補（ぱーかー /パーカー/, ようふく /洋服/）のみが残ること
         // 3. `[...]` を持たない標準 SKK-JISYO 送りあり行（`しm /染/占/`）から同音グループが抽出され、
         //    異なる送り語尾（「染まる」vs「染める」等）が混線しないこと
         let entries: &[(&str, &[f32])] = &[
@@ -1562,8 +1561,9 @@ mod tests {
             ("シャツ", &[0.98, 0.0, 0.1, 0.0]),
             ("パーカー", &[0.96, 0.0, 0.05, 0.0]),
             ("カーディガン", &[0.99, 0.0, 0.02, 0.0]), // 英語見出しにしかないため除外
-            ("カッター", &[0.97, 0.0, 0.02, 0.0]),     // 第2候補の純カタカナのため除外
-            ("衣服", &[0.95, 0.0, 0.05, 0.0]),         // 第2候補でも漢字ありなので保持
+            ("カッター", &[0.97, 0.0, 0.02, 0.0]),     // 第2候補のため除外
+            ("衣服", &[0.95, 0.0, 0.05, 0.0]),         // 第2候補のため除外
+            ("洋服", &[0.95, 0.0, 0.05, 0.0]),         // 日本語見出しの第1候補のため保持
             ("肉", &[0.0, 1.0, 0.0, 0.0]),
             ("紙", &[0.0, 0.98, 0.1, 0.0]),
             ("布地", &[0.0, 0.0, 1.0, 0.0]),
@@ -1582,6 +1582,7 @@ mod tests {
         writeln!(dict_file, "ぱーかー /パーカー/").unwrap();
         writeln!(dict_file, "しゃつ /シャツ/カッター/").unwrap();
         writeln!(dict_file, "いふく /服/衣服/").unwrap();
+        writeln!(dict_file, "ようふく /洋服/").unwrap();
         writeln!(dict_file, "あいまいご /曖昧語/").unwrap();
 
         let mut ctx: HashMap<String, HashMap<String, u64>> = HashMap::new();
@@ -1611,7 +1612,8 @@ mod tests {
 
         expand_context_with_fasttext(&mut ctx, &opts).unwrap();
         assert!(ctx.contains_key("パーカー"));
-        assert!(ctx.contains_key("衣服"));
+        assert!(ctx.contains_key("洋服"));
+        assert!(!ctx.contains_key("衣服"));
         assert!(!ctx.contains_key("カーディガン"));
         assert!(!ctx.contains_key("カッター"));
         assert!(!ctx.contains_key("曖昧語"));

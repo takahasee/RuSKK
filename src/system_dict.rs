@@ -946,6 +946,55 @@ fn tokenize_to_hiragana_macos(word: &str) -> Option<String> {
     pure_kana_to_hiragana(word)
 }
 
+struct ReadingCacheInner {
+    map: HashMap<Arc<str>, Option<Arc<str>>>,
+    order: VecDeque<Arc<str>>,
+}
+
+struct ReadingCache {
+    capacity: usize,
+    cache: RwLock<ReadingCacheInner>,
+}
+
+impl ReadingCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            cache: RwLock::new(ReadingCacheInner {
+                map: HashMap::with_capacity(capacity.min(2048)),
+                order: VecDeque::with_capacity(capacity.min(2048)),
+            }),
+        }
+    }
+
+    fn get(&self, word: &str) -> Option<Option<String>> {
+        let guard = self.cache.read().ok()?;
+        guard
+            .map
+            .get(word)
+            .map(|opt| opt.as_deref().map(str::to_string))
+    }
+
+    fn insert(&self, word: &str, value: Option<&str>) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.cache.write()
+            && !guard.map.contains_key(word)
+        {
+            while guard.map.len() >= self.capacity
+                && let Some(oldest) = guard.order.pop_front()
+            {
+                guard.map.remove(&oldest);
+            }
+            let key: Arc<str> = Arc::from(word);
+            let val = value.map(Arc::from);
+            guard.order.push_back(Arc::clone(&key));
+            guard.map.insert(key, val);
+        }
+    }
+}
+
 /// 送りなし単語（漢字熟語・カタカナ語・複合語、例: `"主治医"`, `"広葉樹"`, `"銀メダル"`, `"パーカー"`）から
 /// SKK の見出し語補完（`opcode 4`）に適した平仮名見出し語（`"しゅじい"`, `"こうようじゅ"`, `"ぎんめだる"`, `"ぱーかー"`）を推定する。
 /// 結果はプロセス内のグローバルキャッシュに保持され、2 回目以降は $O(1)$ で即座に返る。
@@ -976,21 +1025,15 @@ pub fn infer_hiragana_reading(word: &str) -> Option<String> {
         return Some(hira);
     }
 
-    static READING_CACHE: OnceLock<RwLock<HashMap<String, Option<String>>>> = OnceLock::new();
-    let cache = READING_CACHE.get_or_init(|| RwLock::new(HashMap::with_capacity(2048)));
+    static READING_CACHE: OnceLock<ReadingCache> = OnceLock::new();
+    let cache = READING_CACHE.get_or_init(|| ReadingCache::new(MAX_CACHE_ENTRIES));
 
-    if let Ok(guard) = cache.read()
-        && let Some(cached) = guard.get(word)
-    {
-        return cached.clone();
+    if let Some(cached) = cache.get(word) {
+        return cached;
     }
 
     let resolved = tokenize_to_hiragana_macos(word).filter(|r| r.chars().count() >= 2);
-    if let Ok(mut guard) = cache.write()
-        && guard.len() < MAX_CACHE_ENTRIES
-    {
-        guard.insert(word.to_string(), resolved.clone());
-    }
+    cache.insert(word, resolved.as_deref());
     resolved
 }
 
@@ -1175,6 +1218,17 @@ mod tests {
             Some("ゔぁいおりん")
         );
         assert_eq!(infer_hiragana_reading("うさぎ").as_deref(), Some("うさぎ"));
+
+        // ReadingCache の FIFO 退去検証（容量 2 で 3 件目挿入時に最古キーが退去される）
+        let rc = ReadingCache::new(2);
+        rc.insert("A", Some("えー"));
+        rc.insert("B", None);
+        assert_eq!(rc.get("A"), Some(Some("えー".to_string())));
+        assert_eq!(rc.get("B"), Some(None));
+        rc.insert("C", Some("しー"));
+        assert_eq!(rc.get("A"), None);
+        assert_eq!(rc.get("B"), Some(None));
+        assert_eq!(rc.get("C"), Some(Some("しー".to_string())));
 
         // 除外対象（1文字、ASCII含み、送りあり用言）
         assert_eq!(infer_hiragana_reading("服"), None);

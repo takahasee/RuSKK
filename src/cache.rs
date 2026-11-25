@@ -142,6 +142,30 @@ impl LookupCache {
         }
     }
 
+    /// 借用キーでキャッシュにエントリを挿入する（既存キー上書き時はヒープ確保ゼロ）
+    pub fn insert_by_ref(&self, context: Option<&str>, midashi: &str, value: CachedLookup) {
+        if self.capacity == 0 {
+            return;
+        }
+        if let Ok(mut guard) = self.inner.write() {
+            let key_ref: &(dyn LookupKeyRef + '_) = &(context, midashi);
+            if let Some(existing) = guard.map.get_mut(key_ref) {
+                *existing = value;
+                return;
+            }
+
+            if guard.map.len() >= self.capacity
+                && let Some(oldest) = guard.order.pop_front()
+            {
+                guard.map.remove(&oldest);
+            }
+
+            let arc_key = Arc::new(LookupKey::new(context, midashi));
+            guard.order.push_back(Arc::clone(&arc_key));
+            guard.map.insert(arc_key, value);
+        }
+    }
+
     /// SIGHUP リロード時やユーザー辞書更新時にキャッシュを全消去する
     pub fn clear(&self) {
         if let Ok(mut guard) = self.inner.write() {
@@ -226,8 +250,30 @@ mod tests {
 
         // capacity == 0 では挿入されないこと
         let zero_cache = LookupCache::new(0);
-        zero_cache.insert(k1.clone(), v1);
+        zero_cache.insert(k1.clone(), v1.clone());
         assert_eq!(zero_cache.len(), 0);
         assert!(zero_cache.get(&k1).is_none());
+
+        // insert_by_ref の新規挿入および既存上書きテスト
+        let ref_cache = LookupCache::new(2);
+        ref_cache.insert_by_ref(Some("肉"), "きr", v1);
+        assert_eq!(ref_cache.len(), 1);
+        assert_eq!(
+            ref_cache.get_by_ref(Some("肉"), "きr").unwrap().top_candidate.as_deref(),
+            Some("切")
+        );
+        ref_cache.insert_by_ref(
+            Some("肉"),
+            "きr",
+            CachedLookup {
+                response: Arc::from("1/切/伐/\n".as_bytes()),
+                top_candidate: Some(Arc::from("切")),
+            },
+        );
+        assert_eq!(ref_cache.len(), 1);
+        assert_eq!(
+            ref_cache.get_by_ref(Some("肉"), "きr").unwrap().response.as_ref(),
+            "1/切/伐/\n".as_bytes()
+        );
     }
 }

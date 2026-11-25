@@ -13,6 +13,8 @@ use tracing::debug;
 pub struct CompletionIndex {
     /// 送りなし見出し語（平仮名） → 基礎優先スコア
     pub midashi_scores: HashMap<String, u64>,
+    /// `midashi_scores` のキーを UTF-8 辞書順でソートした前方一致二分探索用リスト
+    pub sorted_midashi: Vec<String>,
     /// 直前確定文脈語（表記・用言・語幹） → (関連見出し語 → 文脈共起ボーナス)
     pub context_to_midashi: HashMap<String, HashMap<String, u64>>,
 }
@@ -661,8 +663,12 @@ impl FrequencyPredictor {
             }
         }
 
+        let mut sorted_midashi: Vec<String> = midashi_scores.keys().cloned().collect();
+        sorted_midashi.sort_unstable();
+
         self.completion_index = CompletionIndex {
             midashi_scores,
+            sorted_midashi,
             context_to_midashi,
         };
     }
@@ -673,13 +679,13 @@ impl FrequencyPredictor {
     ///
     /// 補完インデックス内に `prefix` と前方一致する見出し語が 1 件も存在しない場合は `None` を返し、
     /// 呼び出し側でバックエンドの元レスポンスをゼロコピーのまま返却できるようにする。
-    pub fn complete_and_rank_midashi<S: AsRef<str>>(
-        &self,
+    pub fn complete_and_rank_midashi<'a, S: AsRef<str>>(
+        &'a self,
         context: &[S],
         prefix: &str,
-        upstream_cands: &[&str],
+        upstream_cands: &[&'a str],
         context_ranking: bool,
-    ) -> Option<Vec<String>> {
+    ) -> Option<Vec<&'a str>> {
         if prefix.is_empty()
             || upstream_cands.is_empty()
             || !matches!(
@@ -736,58 +742,63 @@ impl FrequencyPredictor {
         };
 
         // 1. upstream_cands 内に存在する候補のスコアと位置を記録
-        let mut upstream_set: HashSet<&str> = HashSet::with_capacity(upstream_cands.len());
-        let mut scored_candidates: Vec<(String, u64, bool, usize, usize)> = Vec::new();
+        let mut upstream_set: HashSet<&'a str> = HashSet::with_capacity(upstream_cands.len());
+        let mut scored_candidates: Vec<(&'a str, u64, bool, usize, usize)> = Vec::new();
         for (idx, &cand) in upstream_cands.iter().enumerate() {
             upstream_set.insert(cand);
             let sc = score_for_midashi(cand);
             if sc > 0 {
-                scored_candidates.push((
-                    cand.to_string(),
-                    sc,
-                    true,
-                    cand.chars().count(),
-                    idx,
-                ));
+                scored_candidates.push((cand, sc, true, cand.chars().count(), idx));
             }
         }
 
         // 2. upstream_cands から漏れた（yaskkserv2 の 64 件上限等で脱落した）インデックス内の前方一致見出し語を収集
-        let mut extra_scored: Vec<(String, u64, usize)> = Vec::new();
-        let mut seen_extra: HashSet<&str> = HashSet::new();
+        //    ソート済み配列への二分探索（partition_point）により O(log M + K) で前方一致範囲のみを走査する
+        let mut extra_scored: Vec<(&'a str, u64, usize)> = Vec::new();
+        let mut seen_extra: HashSet<&'a str> = HashSet::new();
 
-        for m in self.completion_index.midashi_scores.keys() {
-            if m.starts_with(prefix) && m != prefix && !upstream_set.contains(m.as_str()) {
-                let sc = score_for_midashi(m);
-                if sc > 0 && seen_extra.insert(m.as_str()) {
-                    extra_scored.push((m.clone(), sc, m.chars().count()));
+        let start = self
+            .completion_index
+            .sorted_midashi
+            .partition_point(|m| m.as_str() < prefix);
+        for m in &self.completion_index.sorted_midashi[start..] {
+            if !m.starts_with(prefix) {
+                break;
+            }
+            let m_str = m.as_str();
+            if m_str != prefix && !upstream_set.contains(m_str) {
+                let sc = score_for_midashi(m_str);
+                if sc > 0 && seen_extra.insert(m_str) {
+                    extra_scored.push((m_str, sc, m_str.chars().count()));
                 }
             }
         }
         if let Some(cm) = single_ctx_map {
             for m in cm.keys() {
-                if m.starts_with(prefix)
-                    && m != prefix
-                    && !upstream_set.contains(m.as_str())
-                    && seen_extra.insert(m.as_str())
+                let m_str = m.as_str();
+                if m_str.starts_with(prefix)
+                    && m_str != prefix
+                    && !upstream_set.contains(m_str)
+                    && seen_extra.insert(m_str)
                 {
-                    let sc = score_for_midashi(m);
+                    let sc = score_for_midashi(m_str);
                     if sc > 0 {
-                        extra_scored.push((m.clone(), sc, m.chars().count()));
+                        extra_scored.push((m_str, sc, m_str.chars().count()));
                     }
                 }
             }
         } else {
             for cm in &multi_ctx_maps {
                 for m in cm.keys() {
-                    if m.starts_with(prefix)
-                        && m != prefix
-                        && !upstream_set.contains(m.as_str())
-                        && seen_extra.insert(m.as_str())
+                    let m_str = m.as_str();
+                    if m_str.starts_with(prefix)
+                        && m_str != prefix
+                        && !upstream_set.contains(m_str)
+                        && seen_extra.insert(m_str)
                     {
-                        let sc = score_for_midashi(m);
+                        let sc = score_for_midashi(m_str);
                         if sc > 0 {
-                            extra_scored.push((m.clone(), sc, m.chars().count()));
+                            extra_scored.push((m_str, sc, m_str.chars().count()));
                         }
                     }
                 }
@@ -806,7 +817,7 @@ impl FrequencyPredictor {
         extra_scored.sort_unstable_by(|a, b| {
             b.1.cmp(&a.1)
                 .then_with(|| a.2.cmp(&b.2))
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         });
         for (m, sc, char_len) in extra_scored.into_iter().take(MAX_INJECTED_COMPLETIONS) {
             scored_candidates.push((m, sc, false, char_len, usize::MAX));
@@ -822,18 +833,18 @@ impl FrequencyPredictor {
                 .then_with(|| b.2.cmp(&a.2))
                 .then_with(|| a.3.cmp(&b.3))
                 .then_with(|| a.4.cmp(&b.4))
-                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.0.cmp(b.0))
         });
 
-        let mut result: Vec<String> =
+        let mut result: Vec<&'a str> =
             Vec::with_capacity(upstream_cands.len().max(scored_candidates.len()).min(MAX_TOTAL_COMPLETIONS));
-        let mut emitted: HashSet<String> = HashSet::with_capacity(MAX_TOTAL_COMPLETIONS);
+        let mut emitted: HashSet<&'a str> = HashSet::with_capacity(MAX_TOTAL_COMPLETIONS);
 
         for (m, _, _, _, _) in scored_candidates {
             if result.len() >= MAX_TOTAL_COMPLETIONS {
                 break;
             }
-            if emitted.insert(m.clone()) {
+            if emitted.insert(m) {
                 result.push(m);
             }
         }
@@ -842,9 +853,8 @@ impl FrequencyPredictor {
             if result.len() >= MAX_TOTAL_COMPLETIONS {
                 break;
             }
-            if !emitted.contains(cand) {
-                emitted.insert(cand.to_string());
-                result.push(cand.to_string());
+            if emitted.insert(cand) {
+                result.push(cand);
             }
         }
 
@@ -1349,10 +1359,26 @@ mod tests {
                 .unwrap_or(0),
             10
         );
-        // 手動作成アンカープリセット（751 キー / 850 ペア、送り仮名語幹展開後 783 キー）および主要同音グループが含まれ、
+        // 手動作成アンカープリセット（751 キー / 849 ペア、送り仮名語幹展開後 783 キー）および主要同音グループが含まれ、
         // fastText 自動生成スコア（< 10）が混入していないことを検証する
         assert_eq!(raw_saved.context_frequencies.len(), 751);
         assert_eq!(reloaded.context_frequencies.len(), 783);
+        assert_eq!(
+            reloaded
+                .context_frequencies
+                .get("写真")
+                .and_then(|m| m.get("撮"))
+                .copied(),
+            Some(10)
+        );
+        assert_eq!(
+            reloaded
+                .context_frequencies
+                .get("写真")
+                .and_then(|m| m.get("取"))
+                .copied(),
+            None
+        );
         assert!(
             raw_saved
                 .context_frequencies
@@ -1861,7 +1887,7 @@ mod tests {
             .complete_and_rank_midashi(&[] as &[&str], "かい", &upstream_kai, true)
             .expect("should augment kai completions");
         assert_eq!(comp_kai[0], "かいしゃ");
-        assert!(comp_kai.contains(&"かいあおやぎえき".to_string()));
+        assert!(comp_kai.contains(&"かいあおやぎえき"));
 
         // (b) 純カナの fastText 語「リポート」(りぽーと) も先頭に昇格すること
         let upstream_ripo = ["りぽー", "りぽーたー", "りぽーと"];
