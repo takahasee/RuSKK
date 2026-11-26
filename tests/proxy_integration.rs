@@ -3699,3 +3699,144 @@ async fn test_proxy_strict_okuri_nashi_excludes_okuri_ari_duplicates_with_zero_f
     proxy_handle.abort();
     yaskk_handle.abort();
 }
+
+#[tokio::test]
+async fn test_proxy_lookup_cache_coalesces_non_matching_context_entries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let kaigi_backend_count = Arc::new(AtomicUsize::new(0));
+    let kaigi_count_clone = Arc::clone(&kaigi_backend_count);
+    let kir_backend_count = Arc::new(AtomicUsize::new(0));
+    let kir_count_clone = Arc::clone(&kir_backend_count);
+
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            let kaigi_count = Arc::clone(&kaigi_count_clone);
+            let kir_count = Arc::clone(&kir_count_clone);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    if req.contains("ふく") {
+                        let _ = stream.write_all("1/服/\n".as_bytes()).await;
+                    } else if req.contains("じかん") {
+                        let _ = stream.write_all("1/時間/\n".as_bytes()).await;
+                    } else if req.contains("かいぎ") {
+                        kaigi_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all("1/会議/懐疑/\n".as_bytes()).await;
+                    } else if req.contains("きr") {
+                        kir_count.fetch_add(1, Ordering::SeqCst);
+                        let _ = stream.write_all("1/切/着/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let mut predictor = FrequencyPredictor::new(None);
+    predictor.context_frequencies.insert("服".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("着る".to_string(), 10);
+        m
+    });
+    predictor.context_frequencies.insert("時間".to_string(), {
+        let mut m = HashMap::new();
+        m.insert("計る".to_string(), 10);
+        m
+    });
+    predictor.expand_aliases();
+    let shared_predictor: SharedPredictor = Arc::new(std::sync::RwLock::new(predictor));
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(20),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(500),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Arc::clone(&lookup_cache),
+        okuri_expansion: false,
+        context_ranking: true,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    // 1. 登録済み文脈語「服」の後に無関係な「かいぎ」を変換 -> バックエンド1回呼び出し後、(None, "かいぎ") へ集約保存されること
+    client.write_all("1ふく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1かいぎ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/会議/懐疑/\n");
+    assert_eq!(kaigi_backend_count.load(Ordering::SeqCst), 1);
+    assert!(lookup_cache.get_by_ref(None, "かいぎ").is_some());
+    assert!(lookup_cache.get_by_ref(Some("服"), "かいぎ").is_none());
+
+    // 2. 別の登録済み文脈語「時間」の後に再度「かいぎ」を変換 -> 全候補非該当のため (None, "かいぎ") を再利用しバックエンドを呼ばないこと
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1じかん \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/時間/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1かいぎ \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/会議/懐疑/\n");
+    assert_eq!(kaigi_backend_count.load(Ordering::SeqCst), 1);
+    assert!(lookup_cache.get_by_ref(Some("時間"), "かいぎ").is_none());
+
+    // 3. まず「きr」を文脈なし（直前は「会議」＝未登録文脈語）で変換し (None, "きr") に保存したあと、
+    //    「服」確定後に「きr」を変換したときは文脈一致候補「着」が存在するため (None, "きr") を誤再利用せず文脈昇格すること
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/切/着/\n");
+    assert_eq!(kir_backend_count.load(Ordering::SeqCst), 1);
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1ふく \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/服/\n");
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    client.write_all("1きr \n".as_bytes()).await.unwrap();
+    let n = client.read(&mut buf).await.unwrap();
+    assert_eq!(String::from_utf8_lossy(&buf[..n]), "1/着/切/\n");
+    assert_eq!(kir_backend_count.load(Ordering::SeqCst), 2);
+    assert!(lookup_cache.get_by_ref(Some("服"), "きr").is_some());
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}

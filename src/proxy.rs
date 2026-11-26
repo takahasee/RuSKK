@@ -402,7 +402,25 @@ async fn handle_client(
 
                 // 【ゼロレイテンシ・キャッシュ参照】
                 // 過去に同一文脈・同一見出し語で変換済みの場合は、キー確保・TCP 往復・辞書判定・整列を完全バイパスし即答
-                if let Some(cached) = proxy.lookup_cache.get_by_ref(ctx_key, &midashi_str) {
+                // （文脈語ありでも `(None, midashi)` キャッシュの全候補が非該当なら文脈無関係として安全に再利用する）
+                let cached_hit = proxy
+                    .lookup_cache
+                    .get_by_ref(ctx_key, &midashi_str)
+                    .or_else(|| {
+                        let ctx_str = ctx_key?;
+                        let no_ctx = proxy.lookup_cache.get_by_ref(None, &midashi_str)?;
+                        if !has_multiple_candidates(&no_ctx.response) {
+                            return Some(no_ctx);
+                        }
+                        let cands = parse_candidates_borrowed(&no_ctx.response);
+                        let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
+                        if !guard.any_candidate_matches_context(ctx_str, cands.iter().copied()) {
+                            Some(no_ctx)
+                        } else {
+                            None
+                        }
+                    });
+                if let Some(cached) = cached_hit {
                     trace!(midashi = ?midashi_str, "lookup cache hit");
                     if proxy.context_ranking
                         && !is_completion_burst
@@ -485,8 +503,13 @@ async fn handle_client(
 
                 let resp_arc: Arc<[u8]> = Arc::from(outcome.response);
                 if !outcome.skip_cache && is_found(&resp_arc) {
+                    let effective_ctx_key = if outcome.context_matched {
+                        ctx_key
+                    } else {
+                        None
+                    };
                     proxy.lookup_cache.insert_by_ref(
-                        ctx_key,
+                        effective_ctx_key,
                         &midashi_str,
                         crate::cache::CachedLookup {
                             response: Arc::clone(&resp_arc),
@@ -589,6 +612,8 @@ struct LookupOutcome {
     /// クレンジング済み文脈対象候補（漢字を含む語、または `context_frequencies` 登録済みの非漢字語）
     top_candidate: Option<Arc<str>>,
     skip_cache: bool,
+    /// ランキング時に 1 候補以上へ直前文脈スコアが一致・反映されたか
+    context_matched: bool,
 }
 
 #[inline]
@@ -626,6 +651,7 @@ fn rank_candidates_to_response(
             response: b"4\n".to_vec(),
             top_candidate: None,
             skip_cache: false,
+            context_matched: false,
         };
     }
 
@@ -641,7 +667,7 @@ fn rank_candidates_to_response(
             overall_deadline,
             FFI_DEADLINE_MARGIN,
         );
-        let (ranked, had_skipped) = rank_with_budget_and_prewarm(
+        let (ranked, had_skipped, context_matched) = rank_with_budget_and_prewarm(
             &proxy.predictor,
             ctx_ref,
             rank_midashi,
@@ -654,6 +680,7 @@ fn rank_candidates_to_response(
             response: format_candidates_response_str(&ranked),
             top_candidate,
             skip_cache: had_skipped || first_cold_skipped,
+            context_matched,
         }
     } else {
         if first_cold_skipped
@@ -670,6 +697,7 @@ fn rank_candidates_to_response(
             response: format_candidates_response_str(cands),
             top_candidate,
             skip_cache: first_cold_skipped,
+            context_matched: false,
         }
     }
 }
@@ -762,6 +790,7 @@ async fn finalize_raw_response(
             response,
             top_candidate: None,
             skip_cache: false,
+            context_matched: false,
         };
     }
 
@@ -772,6 +801,7 @@ async fn finalize_raw_response(
                 response,
                 top_candidate: None,
                 skip_cache: false,
+                context_matched: false,
             };
         }
         return rank_candidates_to_response(
@@ -831,6 +861,7 @@ async fn finalize_raw_response(
         response,
         top_candidate,
         skip_cache: first_cold_skipped,
+        context_matched: false,
     }
 }
 
@@ -1097,6 +1128,7 @@ async fn handle_lookup_yaskkserv2_first(
             response,
             top_candidate: None,
             skip_cache: false,
+            context_matched: false,
         };
     }
 
@@ -1201,6 +1233,7 @@ async fn handle_lookup_azookey_first(
             response,
             top_candidate: None,
             skip_cache: false,
+            context_matched: false,
         };
     }
 
@@ -1474,10 +1507,10 @@ fn rank_with_budget_and_prewarm<'a, S: AsRef<str>>(
     candidates: &[&'a str],
     annotation_priority: bool,
     ffi_deadline: std::time::Instant,
-) -> (Vec<&'a str>, bool) {
-    let (ranked, skipped_cold) = {
+) -> (Vec<&'a str>, bool, bool) {
+    let (ranked, skipped_cold, context_matched) = {
         let guard = predictor.read().unwrap_or_else(|e| e.into_inner());
-        guard.rank_candidates_borrowed_with_deadline(
+        guard.rank_candidates_borrowed_detailed(
             context,
             midashi,
             candidates,
@@ -1494,7 +1527,7 @@ fn rank_with_budget_and_prewarm<'a, S: AsRef<str>>(
                 .map(|cand| (cand.to_string(), Some(midashi_owned.clone()))),
         );
     }
-    (ranked, had_skipped)
+    (ranked, had_skipped, context_matched)
 }
 
 fn interpret_backend_result(

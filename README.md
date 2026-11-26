@@ -38,7 +38,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  yaskkserv2 (:1179, デフォルト�
    - ユーザー辞書の学習順序を冪等に取り込むインポートコマンド（`import-user-dict`）と SIGHUP ホットリロードを完備。
 6. **並行クエリプール・インメモリキャッシュ・初回変換耐性・Apple Silicon 最適化**:
    - **接続プール & 並行クエリ・初回変換耐性**: 容量 12 本のノンブロッキング接続プール（失効接続一括破棄＋余剰バッファ残留接続の破棄リカバリ対応）を導入し、送りあり活用展開＋yaskkserv2 並列照会、先頭バックエンド 200ms 超過時の並列ヘッジフォールバック、同期システム辞書 FFI のデッドライン（850ms）内制御＋`block_in_place` 隔離＋単一有界プリウォームワーカー（最大 256 件）に対応。
-   - **インメモリ変換キャッシュ (`LookupCache`)**: 容量 4,096 件の高速キャッシュ（`LookupKeyRef` 借用キー照合・`Arc` 共有によるヒット時ゼロコピー・直前確定文脈分離・SIGHUP 自動クリア対応）により、過去に変換した単語や頻出語を **0.1ms 未満（ナノ秒オーダー）** で即答。
+   - **インメモリ変換キャッシュ (`LookupCache`)**: 容量 4,096 件の高速キャッシュ（`LookupKeyRef` 借用キー照合・`Arc` 共有によるヒット時ゼロコピー・直前確定文脈分離＋全候補非該当時の共通キャッシュ再利用・SIGHUP 自動クリア対応）により、過去に変換した単語や頻出語を **0.1ms 未満（ナノ秒オーダー）** で即答。
    - **ゼロコピー & Apple Silicon 最適化**: パースの借用スライス化、EUC-JP 一括 SIMD デコード（`decode_euc_response_to_utf8` / 2バイト UTF-8 衝突回避）、`encode_euc_jp_cow`、ハイブリッド $O(N)$ 重複排除、Apple Silicon 128バイト キャッシュライン整合（`#[repr(align(128))]`）、`memchr` NEON ベクトル走査、Full LTO、`mimalloc` を完備。
 7. **セキュリティと運用の堅牢性**:
    - `yaskkserv2` を `--listen-address 127.0.0.1 --no-daemonize` でループバック限定・フォアグラウンド管理にし、意図しない外部公開とリスポーンループを根絶。
@@ -52,7 +52,7 @@ macSKK  →  RuSKKserv (:1178, UTF-8)  →  yaskkserv2 (:1179, デフォルト�
 ### 1. ビルド & テスト
 ```sh
 cargo build --release  # ./target/release/ruskkserv
-cargo test             # 全 109 件のユニット・結合テスト合格を確認
+cargo test             # 全 111 件のユニット・結合テスト合格を確認
 ```
 
 ### 2. LaunchAgent による常駐運用

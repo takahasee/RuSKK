@@ -178,13 +178,19 @@ impl FrequencyPredictor {
         Ok(())
     }
 
-    /// context_frequencies が空の場合（seed ファイルが存在しない・文脈データ未登録など）に、
+    /// context_frequencies に正のスコアを持つ有効な文脈ルールが存在しない場合
+    /// （seed ファイルが存在しない・空マップや 0 のみなど）に、
     /// 組み込みプリセットをメモリ上で適用する（ファイルには書き込まない）。
     /// 適用した場合は true を返す。
     pub fn ensure_default_context_presets(&mut self) -> bool {
-        if !self.context_frequencies.is_empty() {
+        if self
+            .context_frequencies
+            .values()
+            .any(|m| m.values().any(|&v| v > 0))
+        {
             return false;
         }
+        self.context_frequencies.clear();
         self.merge_default_presets().is_ok()
     }
 
@@ -299,10 +305,10 @@ impl FrequencyPredictor {
         Ok(())
     }
 
-    /// context_frequencies から文脈マップを取得する。
+    /// context_frequencies から文脈マップを取得する（空マップは None として扱う）。
     /// expand_aliases() によりロード時にエイリアスが展開済みのため、O(1) の HashMap::get のみで完結する。
     fn get_context_map<'a>(&'a self, ctx: &str) -> Option<&'a HashMap<String, u64>> {
-        self.context_frequencies.get(ctx)
+        self.context_frequencies.get(ctx).filter(|m| !m.is_empty())
     }
 
     /// 指定した直前確定単語 `ctx` に対する文脈共起ルールが存在するか返す。
@@ -311,15 +317,29 @@ impl FrequencyPredictor {
         self.get_context_map(ctx).is_some()
     }
 
-    /// frequencies から見出し語マップを取得する。
+    /// 指定された文脈語 `ctx` の共起ルールに、候補イテレータ内のいずれかの候補が一致するか判定する（ゼロアロケーション）。
+    #[inline]
+    pub fn any_candidate_matches_context<'a, I>(&self, ctx: &str, candidates: I) -> bool
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let Some(ctx_map) = self.get_context_map(ctx) else {
+            return false;
+        };
+        candidates
+            .into_iter()
+            .any(|cand| get_score(ctx_map, clean_candidate(cand)) > 0)
+    }
+
+    /// frequencies から見出し語マップを取得する（空マップは None として扱う）。
     /// ASCII 大文字を含む場合（例: "てだR"）は小文字化（"てだr"）でも検索を試行する。
     fn get_freq_map<'a>(&'a self, midashi: &str) -> Option<&'a HashMap<String, u64>> {
-        if let Some(map) = self.frequencies.get(midashi) {
+        if let Some(map) = self.frequencies.get(midashi).filter(|m| !m.is_empty()) {
             return Some(map);
         }
         if midashi.bytes().any(|b| b.is_ascii_uppercase()) {
             let lower = midashi.to_ascii_lowercase();
-            return self.frequencies.get(&lower);
+            return self.frequencies.get(&lower).filter(|m| !m.is_empty());
         }
         None
     }
@@ -396,8 +416,28 @@ impl FrequencyPredictor {
         annotation_priority: bool,
         ffi_deadline: Option<std::time::Instant>,
     ) -> (Vec<&'a str>, Vec<&'a str>) {
+        let (ranked, skipped_cold, _) = self.rank_candidates_borrowed_detailed(
+            context,
+            midashi,
+            candidates,
+            annotation_priority,
+            ffi_deadline,
+        );
+        (ranked, skipped_cold)
+    }
+
+    /// `ffi_deadline` を上限としてシステム辞書 FFI 照会を制御しながら候補を並び替え、
+    /// `(整列済み候補, コールドスキップ候補, 文脈スコアが1件以上一致したか)` を返す。
+    pub fn rank_candidates_borrowed_detailed<'a, S: AsRef<str>>(
+        &self,
+        context: &[S],
+        midashi: &str,
+        candidates: &[&'a str],
+        annotation_priority: bool,
+        ffi_deadline: Option<std::time::Instant>,
+    ) -> (Vec<&'a str>, Vec<&'a str>, bool) {
         if candidates.len() <= 1 {
-            return (candidates.to_vec(), Vec::new());
+            return (candidates.to_vec(), Vec::new(), false);
         }
 
         let freq_map = self.get_freq_map(midashi);
@@ -427,7 +467,7 @@ impl FrequencyPredictor {
         );
         let effective_annotation_priority = annotation_priority && !is_affix;
         if !has_freq && !has_context && !effective_annotation_priority {
-            return (candidates.to_vec(), Vec::new());
+            return (candidates.to_vec(), Vec::new(), false);
         }
 
         const ANNOTATION_BONUS: u64 = 100;
@@ -442,6 +482,7 @@ impl FrequencyPredictor {
 
         let mut skipped_cold: Vec<&'a str> = Vec::new();
         let mut indexed_cands: Vec<(usize, &'a str, u64)> = Vec::with_capacity(candidates.len());
+        let mut context_matched = false;
 
         for (idx, &cand) in candidates.iter().enumerate() {
             let clean = clean_candidate(cand);
@@ -449,10 +490,16 @@ impl FrequencyPredictor {
             let context_score: u64 = if let Some(m) = single_ctx_map {
                 get_score(m, clean)
             } else if !multi_ctx_maps.is_empty() {
-                multi_ctx_maps.iter().map(|m| get_score(m, clean)).sum()
+                multi_ctx_maps
+                    .iter()
+                    .map(|m| get_score(m, clean))
+                    .fold(0u64, u64::saturating_add)
             } else {
                 0
             };
+            if context_score > 0 {
+                context_matched = true;
+            }
 
             let annotation_score: u64 = if effective_annotation_priority {
                 // 上位12件かつ ffi_deadline 内のみ未キャッシュ時のシステム辞書 FFI 照会を許可し、
@@ -478,7 +525,7 @@ impl FrequencyPredictor {
                 } else {
                     0
                 };
-                dict_bonus + shape_bonus
+                dict_bonus.saturating_add(shape_bonus)
             } else {
                 0
             };
@@ -490,7 +537,7 @@ impl FrequencyPredictor {
         }
 
         if indexed_cands.iter().all(|(_, _, score)| *score == 0) {
-            return (candidates.to_vec(), skipped_cold);
+            return (candidates.to_vec(), skipped_cold, false);
         }
 
         indexed_cands.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
@@ -498,16 +545,20 @@ impl FrequencyPredictor {
         (
             indexed_cands.into_iter().map(|(_, cand, _)| cand).collect(),
             skipped_cold,
+            context_matched,
         )
     }
 
     /// seed ロード時に frequencies / context_frequencies の各マップに対して、
+    /// スコア 0 エントリおよび空マップを正規化除去したうえで、
     /// 送りあり変換の語幹と終止形を繋ぐエイリアス（「切 ↔ 切る」「確認 ↔ 確認する」等）のみを展開する。
     /// 漢字熟語やカタカナ語の途中を切るような接頭辞部分文字列（例: 「漁港 → 漁」「時間 → 時」「包丁 → 包」）は
     /// 通常の変換と接頭語が混同される原因となるため一切生成しない。
     /// これによりランタイムのスコア照合が HashMap::get の O(1) のみで完結する。
     /// あわせて見出し語補完（opcode 4）用のインデックスも再構築する。
     pub fn expand_aliases(&mut self) {
+        prune_zero_and_empty_maps(&mut self.frequencies);
+        prune_zero_and_empty_maps(&mut self.context_frequencies);
         expand_map_aliases(&mut self.frequencies);
         expand_context_map_aliases(&mut self.context_frequencies);
         self.rebuild_completion_index();
@@ -958,6 +1009,15 @@ pub(crate) fn okuri_stem_aliases(word: &str) -> Vec<&str> {
         }
     }
     stems
+}
+
+/// スコア 0 のエントリおよび空となった内側マップを除去する。
+/// ロード時・プリセット適用後にメモリ上のデータを正規化し、無効なルールが文脈判定やキャッシュを汚染するのを防ぐ。
+fn prune_zero_and_empty_maps(map: &mut HashMap<String, HashMap<String, u64>>) {
+    map.retain(|_, inner| {
+        inner.retain(|_, &mut score| score > 0);
+        !inner.is_empty()
+    });
 }
 
 /// frequencies マップの内部マップに送りあり語幹エイリアスを展開する。
@@ -1940,5 +2000,84 @@ mod tests {
                 .expect("should inject jikou from kakunin context");
             assert_eq!(comp_ji[0], "じこう");
         }
+    }
+
+    #[test]
+    fn test_empty_and_zero_context_maps_normalization_and_multi_ctx_saturation() {
+        let mut predictor = FrequencyPredictor::new(None);
+        predictor
+            .context_frequencies
+            .insert("空マップ".to_string(), HashMap::new());
+        predictor.context_frequencies.insert("ゼロのみ".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("候補".to_string(), 0);
+            m
+        });
+        predictor
+            .frequencies
+            .insert("から".to_string(), HashMap::new());
+        predictor.frequencies.insert("てすと".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("テスト".to_string(), 0);
+            m
+        });
+
+        // 未正規化状態でも空マップを None として扱い、should_rank が過剰発火しないこと
+        assert!(!predictor.has_context_rules("空マップ"));
+        assert!(!predictor.should_rank(&["空マップ"], "ほげ"));
+        assert!(!predictor.should_rank(&[] as &[&str], "から"));
+
+        // 有効な正のスコアが存在しない場合は空・ゼロマップを置換してデフォルトプリセットを適用すること
+        assert!(predictor.ensure_default_context_presets());
+        assert!(!predictor.has_context_rules("空マップ"));
+        assert!(!predictor.has_context_rules("ゼロのみ"));
+        assert!(predictor.has_context_rules("肉"));
+        // expand_aliases() により frequencies 側のスコア 0 エントリも除去されていること
+        assert!(!predictor.should_rank(&[] as &[&str], "てすと"));
+
+        // 手動設定で 0 エントリのみを入れて expand_aliases() を呼ぶと除去されること
+        let mut p2 = FrequencyPredictor::new(None);
+        p2.context_frequencies.insert("無".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("零".to_string(), 0);
+            m
+        });
+        p2.expand_aliases();
+        assert!(!p2.has_context_rules("無"));
+        assert!(p2.context_frequencies.is_empty());
+
+        // 複数文脈の u64::MAX 加算でもオーバーフローパニックせず context_matched が正しく判定されること
+        p2.context_frequencies.insert("文脈A".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("標的".to_string(), u64::MAX);
+            m
+        });
+        p2.context_frequencies.insert("文脈B".to_string(), {
+            let mut m = HashMap::new();
+            m.insert("標的".to_string(), u64::MAX);
+            m
+        });
+        p2.expand_aliases();
+        assert!(p2.any_candidate_matches_context("文脈A", ["他", "標的;注釈"]));
+        assert!(!p2.any_candidate_matches_context("文脈A", ["会議", "懐疑"]));
+
+        let (ranked, _, matched) = p2.rank_candidates_borrowed_detailed(
+            &["文脈A", "文脈B"],
+            "てき",
+            &["他", "標的"],
+            false,
+            None,
+        );
+        assert_eq!(ranked[0], "標的");
+        assert!(matched);
+
+        let (_, _, not_matched) = p2.rank_candidates_borrowed_detailed(
+            &["文脈A"],
+            "かいぎ",
+            &["会議", "懐疑"],
+            false,
+            None,
+        );
+        assert!(!not_matched);
     }
 }
