@@ -140,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
     let predictor = Arc::new(RwLock::new(initial_predictor));
 
     let lookup_cache = Arc::new(ruskkserv::cache::LookupCache::default());
+    ruskkserv::config::set_strict_okuri_enabled(args.is_strict_okuri_enabled());
 
     let proxy = Proxy {
         listen: args.listen.to_string(),

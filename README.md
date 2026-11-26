@@ -157,6 +157,9 @@ macOS のシステム国語辞典（大辞林等）に項目が存在する単�
 
 > **ロールバック**: 注釈・システム辞書優先を無効化したい場合は、CLI 引数 `--annotation-priority=false` または環境変数 `RUSKKSERV_ANNOTATION_PRIORITY=0` で即座に元の動作へ戻せます（CLI 引数が優先されます）。
 
+* **送りなし／送りありの厳密分離（Strict Okuri）**:
+  送りなし見出し（例: `おおもり`）の辞書エントリに混入している送りあり重複候補（例: `大盛り`）を、`yaskkserv2` 側の対応する送りあり見出し（例: `おおもr` → `大盛`）の漢字骨格と照合して自動除外します（除外後に候補が 0 件になる `うちあわせ` → `打ち合わせ/打合せ` 等、および `お母さん`・`お握り`・`食べ物`・`丸の内`・`天ぷら`・`赤みそ`・`或る`・`斯く` 等は保持）。無効化する場合は `--strict-okuri=false` または `RUSKKSERV_STRICT_OKURI=0` を指定します。
+
 ### ④ リアルタイム見出し補完（`Request::Completion` / opcode 4）と文脈・頻度連動ソート
 
 タイピング中に macSKK から送信される補完要求（opcode 4）も設定された参照順（デフォルト `yaskkserv2` 先 → 200ms 超過・ミス時 `azoo-key-skkserv`、`4>せ` 等の接頭語・接尾語補完は `yaskkserv2` 直接照会）に従って照会したうえで、メモリ上の補完インデックス（`CompletionIndex`）によって強化・並び替えて高速返却します。
@@ -297,6 +300,8 @@ Options:
           直前確定単語に基づく文脈共起並び替えを行うか（環境変数 RUSKKSERV_CONTEXT_RANKING でも制御可能） [default: true] [possible values: true, false]
       --annotation-priority [<ANNOTATION_PRIORITY>]
           システム辞書（大辞林等）に項目がある単語および SKK 注釈付き単語を最優先するか（環境変数 RUSKKSERV_ANNOTATION_PRIORITY でも制御可能） [default: true] [possible values: true, false]
+      --strict-okuri [<STRICT_OKURI>]
+          送りなし見出しの候補に混入した送りあり重複候補（例: おおもり→大盛り）を除外するか（環境変数 RUSKKSERV_STRICT_OKURI でも制御可能） [default: true] [possible values: true, false]
   -h, --help
           Print help
   -V, --version

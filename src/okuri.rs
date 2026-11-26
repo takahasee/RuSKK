@@ -590,6 +590,116 @@ pub fn is_kanji(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' | '\u{F900}'..='\u{FAFF}')
 }
 
+/// 平仮名1文字（長音記号 'ー' 等を除く）かどうかを判定する。
+#[inline]
+pub fn is_hiragana(c: char) -> bool {
+    matches!(c, 'ぁ'..='ゖ')
+}
+
+/// 2文字以上の純粋な平仮名見出し（接頭語・接尾語ではなく、末尾が送り仮名キーに対応するもの）かを判定する。
+pub fn is_japanese_okuri_nashi_midashi(midashi: &str) -> bool {
+    if !matches!(classify_midashi(midashi), MidashiKind::Normal(_)) {
+        return false;
+    }
+    let mut count = 0usize;
+    let mut last_c = None;
+    for c in midashi.chars() {
+        if !is_hiragana(c) {
+            return false;
+        }
+        count += 1;
+        last_c = Some(c);
+    }
+    count >= 2 && last_c.is_some_and(|c| kana_to_okuri_key(c).is_some())
+}
+
+/// 「お」「ご」で始まり直後に漢字が続く丁寧接頭辞付き名詞（例: お母さん、お握り、お肉、お祭り）かを判定する。
+#[inline]
+pub fn is_polite_kanji_prefix(clean: &str) -> bool {
+    let mut chars = clean.chars();
+    matches!(chars.next(), Some('お' | 'ご')) && chars.next().is_some_and(is_kanji)
+}
+
+/// 送りありと同形だが連体詞・副詞・文語表現として送りなし変換でも必ず保持すべき語かを判定する。
+#[inline]
+pub fn is_preserved_classical_or_adverb(clean: &str) -> bool {
+    matches!(
+        clean,
+        "斯く" | "或る" | "去る" | "来る" | "明くる" | "所謂" | "新た" | "必ず" | "後ろ" | "五つ" | "専ら" | "自ら" | "即ち"
+    )
+}
+
+/// 送りなし変換において、送り仮名混入のない純粋な候補（名詞・記号・カナ・漢字末尾語・丁寧接頭辞付き名詞）かを判定する。
+pub fn is_pure_okuri_nashi_candidate(clean: &str) -> bool {
+    if clean.is_empty() {
+        return false;
+    }
+    if !clean.chars().any(is_kanji) {
+        return true;
+    }
+    if clean.chars().last().is_some_and(|c| !is_hiragana(c)) {
+        return true;
+    }
+    is_polite_kanji_prefix(clean)
+}
+
+/// 文字列から漢字（`is_kanji`）のみを順序通りに抽出した骨格文字列を返す。
+pub fn extract_kanji_skeleton(s: &str) -> String {
+    s.chars().filter(|&c| is_kanji(c)).collect()
+}
+
+/// 送りなし見出しの候補群に「純粋な送りなし候補」と「末尾平仮名付きの重複 suspect 候補」の両方が含まれる場合、
+/// 送りあり見出し照会用の `(見出し末尾の平仮名, 送りあり見出し文字列)` を返す。
+pub fn okuri_nashi_probe_target(midashi: &str, cands: &[&str]) -> Option<(char, String)> {
+    if !is_japanese_okuri_nashi_midashi(midashi) {
+        return None;
+    }
+    let last_c = midashi.chars().last()?;
+    let okuri_key = kana_to_okuri_key(last_c)?;
+
+    let mut has_pure = false;
+    let mut has_suspect = false;
+    for &raw in cands {
+        let clean = raw.split(';').next().unwrap_or(raw);
+        if is_pure_okuri_nashi_candidate(clean) || is_preserved_classical_or_adverb(clean) {
+            has_pure = true;
+        } else if clean.ends_with(last_c) {
+            has_suspect = true;
+        }
+        if has_pure && has_suspect {
+            let stem_len = midashi.len() - last_c.len_utf8();
+            let mut ari_midashi = String::with_capacity(stem_len + 1);
+            ari_midashi.push_str(&midashi[..stem_len]);
+            ari_midashi.push(okuri_key);
+            return Some((last_c, ari_midashi));
+        }
+    }
+    None
+}
+
+/// 候補 `clean` が送りあり見出しの語幹集合・漢字骨格集合と一致する送りあり重複候補かを判定する。
+pub fn candidate_matches_okuri_ari_stems(
+    clean: &str,
+    last_c: char,
+    ari_stems: &std::collections::HashSet<String>,
+    ari_skeletons: &std::collections::HashSet<String>,
+) -> bool {
+    if is_pure_okuri_nashi_candidate(clean) || is_preserved_classical_or_adverb(clean) {
+        return false;
+    }
+    if !clean.ends_with(last_c) {
+        return false;
+    }
+    if let Some(stem) = clean.strip_suffix(last_c)
+        && !stem.is_empty()
+        && ari_stems.contains(stem)
+    {
+        return true;
+    }
+    let skel = extract_kanji_skeleton(clean);
+    !skel.is_empty() && ari_skeletons.contains(&skel)
+}
+
 /// 抽出された語幹候補が正当か（部分変換の残骸や無意味な平仮名末尾でないか）を判定する。
 /// - 短語幹（かな長 1文字、例: "かk" -> "書", "きr" -> "切"）: 漢字を1文字以上含むこと。
 /// - 複合語幹（かな長 2文字以上、例: "てだr", "みおk", "うけいr"）:
@@ -1046,5 +1156,59 @@ mod tests {
                 "mismatch for midashi={midashi:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_strict_okuri_helpers_classify_candidates_accurately() {
+        assert!(is_japanese_okuri_nashi_midashi("おおもり"));
+        assert!(is_japanese_okuri_nashi_midashi("わりびき"));
+        assert!(!is_japanese_okuri_nashi_midashi("おおもr"));
+        assert!(!is_japanese_okuri_nashi_midashi("き"));
+        assert!(!is_japanese_okuri_nashi_midashi(">てき"));
+        assert!(!is_japanese_okuri_nashi_midashi("さい>"));
+        assert!(!is_japanese_okuri_nashi_midashi("てすとー"));
+
+        assert!(is_pure_okuri_nashi_candidate("大森;人名&地名"));
+        assert!(is_pure_okuri_nashi_candidate("大盛"));
+        assert!(is_pure_okuri_nashi_candidate("食べ物"));
+        assert!(is_pure_okuri_nashi_candidate("丸の内"));
+        assert!(is_pure_okuri_nashi_candidate("お母さん"));
+        assert!(is_pure_okuri_nashi_candidate("お握り"));
+        assert!(is_pure_okuri_nashi_candidate("お祭り"));
+        assert!(is_pure_okuri_nashi_candidate("ある"));
+        assert!(!is_pure_okuri_nashi_candidate("大盛り"));
+        assert!(!is_pure_okuri_nashi_candidate("割引き"));
+        assert!(!is_pure_okuri_nashi_candidate("割り引き"));
+        assert!(!is_pure_okuri_nashi_candidate("天ぷら"));
+
+        assert!(is_preserved_classical_or_adverb("斯く"));
+        assert!(is_preserved_classical_or_adverb("或る"));
+        assert!(is_preserved_classical_or_adverb("必ず"));
+        assert!(is_preserved_classical_or_adverb("新た"));
+        assert!(is_preserved_classical_or_adverb("後ろ"));
+        assert!(is_preserved_classical_or_adverb("五つ"));
+
+        assert_eq!(extract_kanji_skeleton("大盛り"), "大盛");
+        assert_eq!(extract_kanji_skeleton("割り引き"), "割引");
+        assert_eq!(extract_kanji_skeleton("大森"), "大森");
+
+        // おおもり: 純粋候補(大森)とsuspect(大盛り)の混在 -> おおもr プローブ対象
+        let probe = okuri_nashi_probe_target("おおもり", &["大盛り", "大盛", "大森;人名"])
+            .expect("should detect probe target");
+        assert_eq!(probe, ('り', "おおもr".to_string()));
+
+        // うちあわせ: 純粋候補が0件 -> プローブ不要（全てそのまま残す）
+        assert_eq!(
+            okuri_nashi_probe_target("うちあわせ", &["打ち合わせ", "打合せ"]),
+            None
+        );
+
+        let mut stems = std::collections::HashSet::new();
+        stems.insert("大盛".to_string());
+        let mut skels = std::collections::HashSet::new();
+        skels.insert("大盛".to_string());
+        assert!(candidate_matches_okuri_ari_stems("大盛り", 'り', &stems, &skels));
+        assert!(!candidate_matches_okuri_ari_stems("大森", 'り', &stems, &skels));
+        assert!(!candidate_matches_okuri_ari_stems("大盛", 'り', &stems, &skels));
     }
 }

@@ -3580,3 +3580,122 @@ async fn test_proxy_completion_immediately_followed_by_fast_lookup_preserves_con
     proxy_handle.abort();
     yaskk_handle.abort();
 }
+
+#[tokio::test]
+async fn test_proxy_strict_okuri_nashi_excludes_okuri_ari_duplicates_with_zero_fallback() {
+    let yaskk_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let yaskk_addr = yaskk_listener.local_addr().unwrap();
+    let yaskk_handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = yaskk_listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 512];
+                while let Ok(n) = stream.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    let req = &buf[..n];
+                    if req.starts_with("1おおもり ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/大盛り/大盛/大森;人名&地名/相森/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1おおもr ".as_bytes()) {
+                        let _ = stream.write_all("1/大盛/\n".as_bytes()).await;
+                    } else if req.starts_with("1やまもり ".as_bytes()) {
+                        let _ = stream.write_all("1/山盛り/山守/\n".as_bytes()).await;
+                    } else if req.starts_with("1やまもr ".as_bytes()) {
+                        let _ = stream.write_all("1/山盛/\n".as_bytes()).await;
+                    } else if req.starts_with("1わりびき ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/割引/割引き/割り引き/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1わりびk ".as_bytes()) {
+                        let _ = stream.write_all("1/割引/\n".as_bytes()).await;
+                    } else if req.starts_with("1うちあわせ ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/打ち合わせ/打合せ/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1うちあわs ".as_bytes()) {
+                        let _ = stream.write_all("1/打ち合わ/打合わ/\n".as_bytes()).await;
+                    } else if req.starts_with("1おかあさん ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/お母さん/おっ母さん/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1てんぷら ".as_bytes()) {
+                        let _ = stream.write_all("1/天ぷら/天麩羅/\n".as_bytes()).await;
+                    } else if req.starts_with("1かならず ".as_bytes()) {
+                        let _ = stream.write_all("1/必ず/必らず/\n".as_bytes()).await;
+                    } else if req.starts_with("1ある ".as_bytes()) {
+                        let _ = stream
+                            .write_all("1/或る/有る/在る/ある/\n".as_bytes())
+                            .await;
+                    } else if req.starts_with("1あr ".as_bytes()) {
+                        let _ = stream.write_all("1/有/在/或/\n".as_bytes()).await;
+                    } else {
+                        let _ = stream.write_all(b"4\n").await;
+                    }
+                }
+            });
+        }
+    });
+
+    let shared_predictor: SharedPredictor = Arc::new(RwLock::new(FrequencyPredictor::new(None)));
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    drop(proxy_listener);
+
+    let proxy = Proxy {
+        listen: proxy_addr.to_string(),
+        azookey: Backend::new(
+            "mock-azookey-down",
+            "127.0.0.1:1".parse().unwrap(),
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(20),
+        ),
+        yaskkserv2: Backend::new(
+            "mock-yaskkserv2",
+            yaskk_addr,
+            UpstreamEncoding::Utf8,
+            Duration::from_millis(200),
+        ),
+        backend_order: BackendOrder::Yaskkserv2First,
+        predictor: shared_predictor,
+        lookup_cache: Default::default(),
+        okuri_expansion: true,
+        context_ranking: false,
+        annotation_priority: false,
+    };
+
+    let proxy_handle = tokio::spawn(async move {
+        let _ = proxy.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut client = TcpStream::connect(proxy_addr).await.unwrap();
+    let mut buf = [0u8; 512];
+
+    let cases = [
+        ("1おおもり \n", "1/大盛/大森;人名&地名/相森/\n"),
+        ("1おおもr \n", "1/大盛/\n"),
+        ("1やまもり \n", "1/山守/\n"),
+        ("1わりびき \n", "1/割引/\n"),
+        ("1うちあわせ \n", "1/打ち合わせ/打合せ/\n"),
+        ("1おかあさん \n", "1/お母さん/おっ母さん/\n"),
+        ("1てんぷら \n", "1/天ぷら/天麩羅/\n"),
+        ("1かならず \n", "1/必ず/必らず/\n"),
+        ("1ある \n", "1/或る/ある/\n"),
+    ];
+
+    for (query, expected) in cases {
+        client.write_all(query.as_bytes()).await.unwrap();
+        let n = client.read(&mut buf).await.unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&buf[..n]),
+            expected,
+            "query={query:?}"
+        );
+    }
+
+    drop(client);
+    proxy_handle.abort();
+    yaskk_handle.abort();
+}

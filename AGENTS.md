@@ -134,6 +134,9 @@
   - **CLI**: `ruskkserv --annotation-priority=false`
   - **環境変数**: `RUSKKSERV_ANNOTATION_PRIORITY=0`
   - **LaunchAgent**: `launchd/config.env` で `RUSKKSERV_ANNOTATION_PRIORITY=0` を指定し `./scripts/install-launchd.sh install`。
+- **送りなし変換からの送りあり重複除外 (`Strict Okuri`, `src/okuri.rs`, `src/proxy.rs`)**:
+  - 送りなし見出し（例: `おおもり`）に混入した送りあり重複候補（`大盛り` 等）を、`yaskkserv2` の送りあり見出し（`おおもr` 等）の語幹・漢字骨格と照合して除外する（除外結果が 0 件になる場合は `うちあわせ` → `打ち合わせ/打合せ` のように元候補を保持）。
+  - **ロールバック**: `--strict-okuri=false` / `RUSKKSERV_STRICT_OKURI=0`（`launchd/config.env` 設定可）。
 
 ### ⑪ SKK 仕様に基づく通常変換・接頭語（`midashi>`）・接尾語（`>midashi`）の厳密分離
 - **メカニズム (`src/okuri.rs`, `src/proxy.rs`, `src/frequency.rs`)**:

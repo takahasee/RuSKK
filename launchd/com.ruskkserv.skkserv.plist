@@ -28,6 +28,8 @@
         <string>@RUSKKSERV_CONTEXT_RANKING@</string>
         <key>RUSKKSERV_ANNOTATION_PRIORITY</key>
         <string>@RUSKKSERV_ANNOTATION_PRIORITY@</string>
+        <key>RUSKKSERV_STRICT_OKURI</key>
+        <string>@RUSKKSERV_STRICT_OKURI@</string>
         <key>RUSKKSERV_BACKEND_ORDER</key>
         <string>@RUSKKSERV_BACKEND_ORDER@</string>
         <key>RUSKKSERV_YASKKSERV2_ENCODING</key>

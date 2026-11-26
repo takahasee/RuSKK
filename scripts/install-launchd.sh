@@ -63,6 +63,7 @@ load_config() {
   RUSKKSERV_OKURI_EXPANSION="${RUSKKSERV_OKURI_EXPANSION:-1}"
   RUSKKSERV_CONTEXT_RANKING="${RUSKKSERV_CONTEXT_RANKING:-1}"
   RUSKKSERV_ANNOTATION_PRIORITY="${RUSKKSERV_ANNOTATION_PRIORITY:-1}"
+  RUSKKSERV_STRICT_OKURI="${RUSKKSERV_STRICT_OKURI:-1}"
   RUSKKSERV_BACKEND_ORDER="${RUSKKSERV_BACKEND_ORDER:-yaskkserv2-first}"
   RUSKKSERV_YASKKSERV2_ENCODING="${RUSKKSERV_YASKKSERV2_ENCODING:-euc}"
   case "$RUSKKSERV_YASKKSERV2_ENCODING" in
@@ -119,6 +120,7 @@ render_plist() {
   esc_okuri="$(escape_plist_sed "$RUSKKSERV_OKURI_EXPANSION")"
   esc_context="$(escape_plist_sed "$RUSKKSERV_CONTEXT_RANKING")"
   esc_annotation="$(escape_plist_sed "$RUSKKSERV_ANNOTATION_PRIORITY")"
+  esc_strict_okuri="$(escape_plist_sed "$RUSKKSERV_STRICT_OKURI")"
   esc_backend_order="$(escape_plist_sed "$RUSKKSERV_BACKEND_ORDER")"
   esc_yaskkserv2_encoding="$(escape_plist_sed "$RUSKKSERV_YASKKSERV2_ENCODING")"
   esc_log_level="$(escape_plist_sed "$RUSKKSERV_LOG_LEVEL")"
@@ -144,6 +146,7 @@ render_plist() {
     -e "s|@RUSKKSERV_OKURI_EXPANSION@|${esc_okuri}|g" \
     -e "s|@RUSKKSERV_CONTEXT_RANKING@|${esc_context}|g" \
     -e "s|@RUSKKSERV_ANNOTATION_PRIORITY@|${esc_annotation}|g" \
+    -e "s|@RUSKKSERV_STRICT_OKURI@|${esc_strict_okuri}|g" \
     -e "s|@RUSKKSERV_BACKEND_ORDER@|${esc_backend_order}|g" \
     -e "s|@RUSKKSERV_YASKKSERV2_ENCODING@|${esc_yaskkserv2_encoding}|g" \
     -e "s|@RUSKKSERV_LOG_LEVEL@|${esc_log_level}|g" \

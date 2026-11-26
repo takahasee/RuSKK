@@ -674,9 +674,81 @@ fn rank_candidates_to_response(
     }
 }
 
+/// 送りなし見出しの変換候補に混入した送りあり重複候補（例: `おおもり` の `大盛り`）を除外する。
+/// 除外後に候補が 0 件になる場合は、変換不能を防ぐため元の候補をそのまま維持する。
+async fn filter_okuri_nashi_candidates<'a>(
+    proxy: &Proxy,
+    midashi: &str,
+    cands: Vec<&'a str>,
+    remaining: Duration,
+) -> Vec<&'a str> {
+    if !crate::config::is_strict_okuri_enabled() || cands.len() <= 1 {
+        return cands;
+    }
+    let Some((last_c, ari_midashi)) = crate::okuri::okuri_nashi_probe_target(midashi, &cands)
+    else {
+        return cands;
+    };
+
+    let probe_timeout = proxy
+        .yaskkserv2
+        .timeout
+        .min(Duration::from_millis(40))
+        .min(remaining);
+    if probe_timeout.is_zero() {
+        return cands;
+    }
+
+    let req = Request::Lookup(ari_midashi.as_bytes());
+    let Ok(resp) = proxy
+        .yaskkserv2
+        .query_with_timeout(&req, probe_timeout)
+        .await
+    else {
+        return cands;
+    };
+    if !is_found(&resp) {
+        return cands;
+    }
+
+    let ari_cands = crate::encoding::parse_candidates_unpacked_borrowed(&resp);
+    if ari_cands.is_empty() {
+        return cands;
+    }
+
+    let mut ari_stems = std::collections::HashSet::with_capacity(ari_cands.len());
+    let mut ari_skeletons = std::collections::HashSet::with_capacity(ari_cands.len());
+    for raw in ari_cands {
+        let clean = crate::frequency::clean_candidate(raw);
+        if !clean.is_empty() {
+            ari_stems.insert(clean.to_string());
+            let skel = crate::okuri::extract_kanji_skeleton(clean);
+            if !skel.is_empty() {
+                ari_skeletons.insert(skel);
+            }
+        }
+    }
+
+    let kept: Vec<&'a str> = cands
+        .iter()
+        .copied()
+        .filter(|&raw| {
+            let clean = crate::frequency::clean_candidate(raw);
+            !crate::okuri::candidate_matches_okuri_ari_stems(
+                clean,
+                last_c,
+                &ari_stems,
+                &ari_skeletons,
+            )
+        })
+        .collect();
+
+    if kept.is_empty() { cands } else { kept }
+}
+
 /// 生レスポンスバイト列から、角括弧ブロック展開または通常パースを行い、ランキング・整形結果を返す。
 #[allow(clippy::too_many_arguments)]
-fn finalize_raw_response(
+async fn finalize_raw_response(
     proxy: &Proxy,
     ctx_ref: &[Arc<str>],
     lookup_start: Instant,
@@ -713,24 +785,32 @@ fn finalize_raw_response(
         );
     }
 
+    let strict_candidate = crate::config::is_strict_okuri_enabled()
+        && crate::okuri::is_japanese_okuri_nashi_midashi(rank_midashi);
     let should_rank = has_multiple_candidates(&response)
         && (proxy.annotation_priority || {
             let guard = proxy.predictor.read().unwrap_or_else(|e| e.into_inner());
             guard.should_rank(ctx_ref, rank_midashi)
         });
 
-    if should_rank {
+    if has_multiple_candidates(&response) && (should_rank || strict_candidate) {
         let cands = parse_candidates_borrowed(&response);
         if !cands.is_empty() {
-            return rank_candidates_to_response(
-                proxy,
-                ctx_ref,
-                lookup_start,
-                overall_deadline,
-                rank_midashi,
-                &cands,
-                first_cold_skipped,
-            );
+            let orig_len = cands.len();
+            let remaining = overall_deadline.saturating_sub(lookup_start.elapsed());
+            let filtered =
+                filter_okuri_nashi_candidates(proxy, rank_midashi, cands, remaining).await;
+            if should_rank || filtered.len() < orig_len {
+                return rank_candidates_to_response(
+                    proxy,
+                    ctx_ref,
+                    lookup_start,
+                    overall_deadline,
+                    rank_midashi,
+                    &filtered,
+                    first_cold_skipped,
+                );
+            }
         }
     }
 
@@ -1045,6 +1125,7 @@ async fn handle_lookup_yaskkserv2_first(
         response,
         false,
     )
+    .await
 }
 
 /// `BackendOrder::AzookeyFirst`（従来順・ロールバックモード）の通常変換パス
@@ -1202,13 +1283,16 @@ async fn handle_lookup_azookey_first(
             .unwrap_or_else(|| parse_candidates_borrowed(&response));
         let fb_cands = crate::encoding::parse_candidates_unpacked_borrowed(fb_buf);
         append_unique_by_clean(&mut merged, fb_cands);
+        let remaining = overall_deadline.saturating_sub(lookup_start.elapsed());
+        let filtered =
+            filter_okuri_nashi_candidates(proxy, midashi_str, merged, remaining).await;
         return rank_candidates_to_response(
             proxy,
             ctx_ref,
             lookup_start,
             overall_deadline,
             midashi_str,
-            &merged,
+            &filtered,
             first_cold_skipped,
         );
     }
@@ -1222,6 +1306,7 @@ async fn handle_lookup_azookey_first(
         response,
         first_cold_skipped,
     )
+    .await
 }
 
 /// `dst` に既にある候補と `clean_candidate` ベースで重複しないものだけを `src` から末尾へ追加する。

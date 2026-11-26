@@ -470,7 +470,9 @@ impl FrequencyPredictor {
                 }
                 let dict_bonus = if in_dict { ANNOTATION_BONUS } else { 0 };
                 let shape_bonus = if !is_okuri
-                    && (in_dict || !is_unverified_okuri_fragment(clean))
+                    && (crate::okuri::is_pure_okuri_nashi_candidate(clean)
+                        || crate::okuri::is_preserved_classical_or_adverb(clean)
+                        || !is_unverified_okuri_fragment(clean))
                 {
                     OKURI_NASHI_CLEAN_BONUS
                 } else {

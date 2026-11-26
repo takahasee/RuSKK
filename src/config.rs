@@ -87,6 +87,15 @@ pub struct Args {
     )]
     pub annotation_priority: Option<bool>,
 
+    /// 送りなし見出しの候補に混入した送りあり重複候補（例: おおもり→大盛り）を除外するか（環境変数 RUSKKSERV_STRICT_OKURI でも制御可能） [default: true]
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    pub strict_okuri: Option<bool>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -208,6 +217,25 @@ impl Args {
         self.annotation_priority
             .unwrap_or_else(|| parse_bool_env("RUSKKSERV_ANNOTATION_PRIORITY", true))
     }
+
+    pub fn is_strict_okuri_enabled(&self) -> bool {
+        self.strict_okuri
+            .unwrap_or_else(|| parse_bool_env("RUSKKSERV_STRICT_OKURI", true))
+    }
+}
+
+static STRICT_OKURI_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+/// 送りなし見出しからの送りあり重複候補除外（Strict Okuri）のプロセス全体デフォルトを設定する。
+pub fn set_strict_okuri_enabled(enabled: bool) {
+    STRICT_OKURI_ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 送りなし見出しからの送りあり重複候補除外（Strict Okuri）が有効かどうかを返す。
+#[inline]
+pub fn is_strict_okuri_enabled() -> bool {
+    STRICT_OKURI_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn parse_bool_env(var: &str, default: bool) -> bool {
@@ -236,9 +264,11 @@ mod tests {
         assert_eq!(default_args.okuri_expansion, None);
         assert_eq!(default_args.context_ranking, None);
         assert_eq!(default_args.annotation_priority, None);
+        assert_eq!(default_args.strict_okuri, None);
         assert!(default_args.is_okuri_expansion_enabled());
         assert!(default_args.is_context_ranking_enabled());
         assert!(default_args.is_annotation_priority_enabled());
+        assert!(default_args.is_strict_okuri_enabled());
 
         // =false 指定で個別にロールバックできること（CLI 最優先）
         let disabled_args = Args::try_parse_from([
@@ -246,14 +276,17 @@ mod tests {
             "--okuri-expansion=false",
             "--context-ranking=false",
             "--annotation-priority=false",
+            "--strict-okuri=false",
         ])
         .unwrap();
         assert_eq!(disabled_args.okuri_expansion, Some(false));
         assert_eq!(disabled_args.context_ranking, Some(false));
         assert_eq!(disabled_args.annotation_priority, Some(false));
+        assert_eq!(disabled_args.strict_okuri, Some(false));
         assert!(!disabled_args.is_okuri_expansion_enabled());
         assert!(!disabled_args.is_context_ranking_enabled());
         assert!(!disabled_args.is_annotation_priority_enabled());
+        assert!(!disabled_args.is_strict_okuri_enabled());
 
         // 値なしフラグ単体指定でも true として解釈されること
         let bare_flags = Args::try_parse_from([
@@ -261,14 +294,17 @@ mod tests {
             "--okuri-expansion",
             "--context-ranking",
             "--annotation-priority",
+            "--strict-okuri",
         ])
         .unwrap();
         assert_eq!(bare_flags.okuri_expansion, Some(true));
         assert_eq!(bare_flags.context_ranking, Some(true));
         assert_eq!(bare_flags.annotation_priority, Some(true));
+        assert_eq!(bare_flags.strict_okuri, Some(true));
         assert!(bare_flags.is_okuri_expansion_enabled());
         assert!(bare_flags.is_context_ranking_enabled());
         assert!(bare_flags.is_annotation_priority_enabled());
+        assert!(bare_flags.is_strict_okuri_enabled());
 
         // デフォルトの listen アドレスが 127.0.0.1:1178 で、不正なホスト名は起動時に拒否されること
         assert_eq!(default_args.listen, "127.0.0.1:1178".parse::<SocketAddr>().unwrap());
